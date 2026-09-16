@@ -219,6 +219,38 @@ private:
     /// `sensor.status` 的负载构造（也被 `targets.list` 复用为 data.coverage）。
     nlohmann::json sensorStatusLocked();
 
+    // ---- 步 8–9（P5）：打击方案 / 引导方案 ----
+    //
+    // 两条贯穿这段代码的口径：
+    //   ① **几何权威只有两处**：场景数据 `<scenarioDir>/strike-geometry.json`（IP 点/评估航线，
+    //      按 §10.1-Q4 变体 A：规则包/引擎输出里只有 `attackStart.key` / `assessRoute.key` 两个
+    //      **键引用**）与 entity-ledger 台账（已登记平台的**真实坐标**）。带不出出处的一律留空
+    //      并在 `notes` 里点名，MUST NOT 造坐标（Q5：`stk-s2-*` 没有几何键，就如实标 resolved=false）。
+    //   ② **时刻全部有算式**：`t0` 取 phase-engine 台账里当前阶段（T5）的 `enteredAt`；
+    //      到达/打击/评估一律给 `basis{formula,inputs,source}`，由脚本独立复算（MUST NOT 编时刻）。
+
+    /// 场景几何文件的只读快照（**进程内缓存一次**：几何在一次运行里不变）。
+    /// 读不到 → `{loaded:false, note, attackStarts:[], assessRoutes:[]}`（**不抛**）。
+    /// 要求已持 `mtx_`。
+    const nlohmann::json& strikeGeometryLocked() const;
+
+    /// 打击方案（`side:"strike"`）的几何标注：把候选模板的 `attackStart.key`/`assessRoute.key`
+    /// 解析成场景几何的**原样条目**。没有键 / 键在几何里查不到 → `resolved=false` + `reason`
+    /// （**只标注、不丢**：丢不丢由引擎的 `includeInapplicable` 决定）。要求已持 `mtx_`。
+    nlohmann::json strikeGeometryOfLocked(const nlohmann::json& templateRaw) const;
+
+    /// 从 scoring 的 `templatesPack().raw` 里取某个模板的**原样条目**（M5 的
+    /// `coordination`/`coordinationLabel`/`plannedFinish`/`attackStart`/`assessRoute` 都在里面 ——
+    /// 引擎没有 typed 字段，宿主也不从候选里"拼"这些字段）。取不到 → 空对象。
+    /// 要求已持 `mtx_`。
+    nlohmann::json templateRawOfLocked(const std::string& templateKey) const;
+
+    /// 步 9：引导方案的组装（IP 点 + 评估航线 + 引导连线 + 时间轴四项）。
+    /// 入参 `planId` 必须是**刚被采纳/确认**的那套打击方案（前置由本函数判，返 1003）。
+    /// 所有几何来自 `strikeGeometryLocked()` 或台账；所有时刻都带 `basis`。要求已持 `mtx_`。
+    nlohmann::json buildGuidancePlanLocked(const std::string& planId, const nlohmann::json& params,
+                                           int& code);
+
     Engines& engines_;
     Registry& reg_;
     const HostConfig& cfg_;
@@ -248,6 +280,9 @@ private:
     std::string phase_;   // "" = 未进入任务
     std::string missionId_;
     int64_t enteredAtMs_ = 0;
+    /// **任务下达时刻**（flow.enter 建任务那一刻）—— 时间轴 t0 的锚点（§10.1-Q1 裁决）。
+    /// 与 enteredAtMs_ 分开：后者是"当前阶段进入时刻"，每推进一个阶段都会变。
+    int64_t missionStartMs_ = 0;
     /// 上次重采能力快照的时刻（`/api/state` 按 5 s 节流重采；见 flow.cc 的 stateJson 注释）
     int64_t lastCapabilityMs_ = 0;
 
@@ -304,6 +339,32 @@ private:
     mutable std::mutex mediaMtx_;
     mutable nlohmann::json mediaCache_ = nlohmann::json::object();
     mutable bool mediaCached_ = false;
+
+    // ---- 步 8–9（P5）：打击方案状态 + 场景几何缓存 ----
+    //
+    // `strikePlanScore_` 存的是**引擎刚给过的原样结果**（推荐 id / 推荐百分比），用途与
+    // `lastPlanRecommendation_` 一模一样（`strike.adopt` 的 deviated 标注 + 幂等判断）。
+    // ★ MUST NOT 在这里重算分数（数值只有一个来源 = `ScoreResult`）。
+    bool hasStrikeScore_ = false;
+    std::string lastStrikeRecommendation_;
+    int lastStrikeRecommendedPercent_ = 0;
+    std::string adoptedStrikePlanId_;
+    std::string confirmedStrikePlanId_;
+    /// 最近一次 `strike.plans` 的**原样**负载（`/api/state` 也给一份，前端刚挂载时不必等命令）
+    nlohmann::json lastStrikePlans_ = nlohmann::json::object();
+    /// 最近一次 `guidance.plan` 的时间轴（步 9 屏幕上要显示，`/api/state` 复用）
+    nlohmann::json lastGuidance_ = nlohmann::json::object();
+    /// 步 9 的显示模式覆盖结果（`view.mode` 的引擎回执原样；未覆盖 = 空）
+    nlohmann::json strikeModeOverride_ = nlohmann::json::object();
+
+    /// 场景几何缓存（`<scenarioDir>/strike-geometry.json`；一次运行读一次）
+    mutable nlohmann::json strikeGeometry_ = nlohmann::json::object();
+    mutable bool strikeGeometryLoaded_ = false;
+
+    /// 已登记平台：deviceId → entityId（`alloc.assign` 登记成功时逐台记下）。
+    /// 用途只有一个：步 9 的引导连线要取**台账里那台平台**的坐标（引擎仍是台账的唯一权威），
+    /// 而不是让宿主从 deployment.json 另取一份（那样"台账里的位置"永远进不了界面）。
+    std::map<std::string, std::string> entityIdOfDevice_;
 };
 
 }  // namespace ma

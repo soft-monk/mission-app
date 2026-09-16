@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstdio>
 #include <filesystem>
 #include <sstream>
 #include <thread>
@@ -56,6 +58,98 @@ int intOr(const json& j, const char* key, int dflt) {
     const auto it = j.find(key);
     if (it == j.end() || !it->is_number_integer()) return dflt;
     return it->get<int>();
+}
+
+// ============================================================================
+// 步 8–9（P5）共用工具：**只做形状翻译与算式展开**
+// ============================================================================
+//
+// ★ 这两条函数的措辞就是本段的纪律：
+//   · `timeText`：时刻的**展示形态**（+08:00）。不改数值、不做时区业务判断。
+//   · `distanceM`：两点大圆距离（米）。它只服务"到达段"的算式 —— **不是**地图投影、
+//     **不是**航路规划（`geo-data` 才是几何引擎；这里只是把"平台→IP 点"的直线距离算出来，
+//     让时间轴上每一分钟都能被脚本复算）。半径取 WGS84 平均半径（与 `sensor-model` 同口径）。
+constexpr double kEarthRadiusM = 6371008.8;
+
+double rad(double deg) { return deg * 3.14159265358979323846 / 180.0; }
+
+double distanceM(double lng1, double lat1, double lng2, double lat2) {
+    const double dLat = rad(lat2 - lat1);
+    const double dLng = rad(lng2 - lng1);
+    const double a = std::sin(dLat / 2) * std::sin(dLat / 2) +
+                     std::cos(rad(lat1)) * std::cos(rad(lat2)) * std::sin(dLng / 2) *
+                         std::sin(dLng / 2);
+    const double c = 2 * std::atan2(std::sqrt(a), std::sqrt(1 - a));
+    return kEarthRadiusM * c;
+}
+
+/// 一串航点的折线总长（米）。相邻点逐个大圆距离求和 —— 与 `distanceM` 同一口径。
+double polylineLengthM(const std::vector<std::pair<double, double>>& pts) {
+    double sum = 0.0;
+    for (std::size_t i = 1; i < pts.size(); ++i) {
+        sum += distanceM(pts[i - 1].first, pts[i - 1].second, pts[i].first, pts[i].second);
+    }
+    return sum;
+}
+
+/// epoch ms → "YYYY-MM-DD HH:MM:SS+08:00"（**只做展示**：数值本身仍是 ms）。
+///
+/// 为什么是 +08:00 固定偏移而不是本地时区：场景数据 `task-areas.json` 的 `startAt`
+/// 是 `"2026-09-16 15:14"`（北京时），t0 与它必须能被人眼直接对上（时区换算不是宿主该做的事，
+/// 换个时区跑这条时间轴就会对不上数据源）。
+std::string timeText(int64_t ms) {
+    if (ms == 0) return {};
+    const int64_t kOffset = 8 * 3600;  // +08:00
+    int64_t sec = ms / 1000 + kOffset;
+    int64_t days = sec / 86400;
+    int64_t rem = sec % 86400;
+    if (rem < 0) {
+        rem += 86400;
+        --days;
+    }
+    // civil_from_days（Howard Hinnant 的算法；只用到 1970..2400 这一段）
+    int64_t z = days + 719468;
+    const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    const int64_t doe = z - era * 146097;
+    const int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const int64_t y = yoe + era * 400;
+    const int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const int64_t mp = (5 * doy + 2) / 153;
+    const int64_t d = doy - (153 * mp + 2) / 5 + 1;
+    const int64_t m = mp < 10 ? mp + 3 : mp - 9;
+    const int64_t yy = m <= 2 ? y + 1 : y;
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%04lld-%02lld-%02lldT%02lld:%02lld:%02lld+08:00",
+                  static_cast<long long>(yy), static_cast<long long>(m),
+                  static_cast<long long>(d), static_cast<long long>(rem / 3600),
+                  static_cast<long long>((rem % 3600) / 60), static_cast<long long>(rem % 60));
+    return std::string(buf);
+}
+
+/// `"YYYY-MM-DD HH:MM"`（场景数据的写法）→ epoch ms（+08:00 口径）。解析不了 → 0（不猜）。
+int64_t parseSceneTimeMs(const std::string& text) {
+    int Y = 0, M = 0, D = 0, h = 0, mi = 0;
+    if (std::sscanf(text.c_str(), "%d-%d-%d %d:%d", &Y, &M, &D, &h, &mi) != 5) return 0;
+    if (Y < 1970 || M < 1 || M > 12 || D < 1 || D > 31) return 0;
+    // days_from_civil（同上算法的逆）
+    const int64_t y = Y - (M <= 2 ? 1 : 0);
+    const int64_t era = (y >= 0 ? y : y - 399) / 400;
+    const int64_t yoe = y - era * 400;
+    const int64_t doy = (153 * (M + (M > 2 ? -3 : 9)) + 2) / 5 + D - 1;
+    const int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    const int64_t days = era * 146097 + doe - 719468;
+    return ((days * 24 + h) * 60 + mi) * 60000 - 8 * 3600 * 1000;  // 减掉 +08:00 偏移
+}
+
+/// 一个带算式的时刻段。`formula` 是人可读的算式、`inputs` 是**算式里的每一个输入**
+/// （值 + 出处），这样脚本可以独立复算并与 `atMs` 比对（不一致就红）。
+nlohmann::json basisJson(const std::string& formula, const nlohmann::json& inputs,
+                         const std::string& source) {
+    nlohmann::json b = nlohmann::json::object();
+    b["formula"] = formula;
+    b["inputs"] = inputs;
+    b["source"] = source;
+    return b;
 }
 
 }  // namespace
@@ -460,9 +554,21 @@ nlohmann::json FlowEngine::stateJson() {
     out["step"] = step_;
     out["stepKey"] = s ? s->key : "";
     out["stepTitle"] = s ? s->title : "";
-    out["phase"] = phase_;
+    // 阶段与"当前阶段进入时刻"一律**现读引擎台账**（`phaseContext`）：这两个字段是"实时状态"，
+    // 不能只报宿主缓存的旧值 —— 缓存会在"复位后重建任务/引擎返回 0"等路径上变陈旧，
+    // 症状是前端显示上一个任务的阶段与时刻（踩过：t0 比 enteredAt 还晚）。
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        const PhaseView pv = phaseViewLocked();
+        out["phase"] = pv.phaseKey.empty() ? phase_ : pv.phaseKey;
+        // ★ 引擎没给 enteredAt 时**如实报 null**，不要拿宿主缓存顶替 —— 缓存可能来自上一个任务，
+        //   症状是"当前阶段进入时刻早于任务下达时刻"（自相矛盾的时间，排障时最误导人）。
+        out["enteredAt"] = pv.enteredAt != 0 ? nlohmann::json(pv.enteredAt) : nlohmann::json(nullptr);
+        out["enteredAtKnown"] = pv.enteredAt != 0;
+        out["phaseFromEngine"] = pv.fromEngine;
+        out["missionStartMs"] = missionStartMs_;   // 时间轴 t0 的锚点（任务下达时刻）
+    }
     out["missionId"] = missionId_;
-    out["enteredAt"] = enteredAtMs_;
 
     // ---- 启动加载（进度源 + 最近一次模块体检结论）----
     nlohmann::json boot = nlohmann::json::object();
@@ -567,6 +673,33 @@ nlohmann::json FlowEngine::stateJson() {
         } catch (const std::exception& e) {
             out["capabilities"] = {{"error", e.what()}};
         }
+    }
+
+    // ---- 步 8–9（P5）：打击方案 / 引导方案（**引擎与场景的原样读数**）----
+    //
+    // 三样东西放这里（都只是"最近一次命令的结果"，不重算）：
+    //   · strikes   = 最近一次 `strike.plans` 的原样负载（含 M5 字段与几何标注）
+    //   · adoption  = 采纳/确认状态（宿主侧指针；引擎里的三态用 scoring 的 `plans()` 查）
+    //   · guidance  = 最近一次 `guidance.plan` 的原样负载（IP 点 + 引导连线 + 时间轴）
+    // 前端刚挂载时不必等命令就能画出步 8/9 的屏幕。
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        nlohmann::json strike = nlohmann::json::object();
+        strike["plans"] = lastStrikePlans_;
+        strike["plansAvailable"] = !lastStrikePlans_.empty();
+        strike["adoptedPlanId"] = adoptedStrikePlanId_;
+        strike["confirmedPlanId"] = confirmedStrikePlanId_;
+        strike["recommendedId"] = lastStrikeRecommendation_;
+        strike["recommendedPercent"] = lastStrikeRecommendedPercent_;
+        strike["hasRecommendation"] = hasStrikeScore_;
+        strike["modeOverride"] = strikeModeOverride_;
+        strike["guidance"] = lastGuidance_;
+        strike["guidanceAvailable"] = !lastGuidance_.empty();
+        out["strike"] = std::move(strike);
+        // 已登记平台（引导连线的起点来源）：deviceId → entityId
+        nlohmann::json reg = nlohmann::json::object();
+        for (const auto& kv : entityIdOfDevice_) reg[kv.first] = kv.second;
+        out["platformEntities"] = reg;
     }
     return out;
 }
@@ -948,6 +1081,7 @@ void FlowEngine::resetMissionLocked() {
     missionId_.clear();
     phase_.clear();
     enteredAtMs_ = 0;
+    missionStartMs_ = 0;   // 任务下达时刻（t0 的锚点）随任务一起清
     adoptedPlanId_.clear();
     confirmedPlanId_.clear();
     hasPlanScore_ = false;
@@ -965,6 +1099,17 @@ void FlowEngine::resetMissionLocked() {
     topologyMissionId_.clear();
     topologyLinkTo_.clear();
     simAutoStarted_ = false;
+    // 步 8–9（P5）：打击侧状态与"已登记平台"映射跟着任务走（台账按 missionId 隔离，
+    // 旧任务里的 entityId 在新任务里查不到 —— 留着只会让引导连线指到别的任务）。
+    hasStrikeScore_ = false;
+    lastStrikeRecommendation_.clear();
+    lastStrikeRecommendedPercent_ = 0;
+    adoptedStrikePlanId_.clear();
+    confirmedStrikePlanId_.clear();
+    lastStrikePlans_ = nlohmann::json::object();
+    lastGuidance_ = nlohmann::json::object();
+    strikeModeOverride_ = nlohmann::json::object();
+    entityIdOfDevice_.clear();
 }
 
 FlowEngine::PhaseView FlowEngine::phaseViewLocked() const {    PhaseView v;
@@ -1924,6 +2069,716 @@ nlohmann::json FlowEngine::sensorStatusLocked() {
     return out;
 }
 
+// ============================================================================
+// 步 8–9（P5）：打击方案几何标注 / 引导方案（IP 点 + 引导连线 + 时间轴）
+// ============================================================================
+//
+// 【几何权威】只有两处，别的都不算：
+//   ① 场景数据 `<scenarioDir>/strike-geometry.json`：IP 点（`attackStarts[]`，含 lng/lat/altM）
+//      与评估航线（`assessRoutes[].waypoints[]`，`[lng,lat]`）。规则包/引擎输出里**只有键**
+//      （`attackStart.key` / `assessRoute.key`）—— 这正是 §10.1-Q4 的变体 A：**MUST NOT 双写几何**。
+//   ② entity-ledger 台账：**已登记平台**的真实坐标（`getEntity(entityId)` 的 lng/lat/alt）。
+//      `alloc.assign` 登记成功时宿主把 deviceId→entityId 记下来（`entityIdOfDevice_`），
+//      引导连线就用这一份 —— 而不是从 deployment.json 再取第二份坐标（台账才是唯一权威）。
+// 带不出出处的字段一律**留空 + notes 点名**；Q5 的 `stk-s2-*`（场景二）没有几何键 →
+// `geometry.resolved=false`，宿主 MUST NOT 造坐标、也 MUST NOT 静默丢弃（丢不丢由引擎的
+// `includeInapplicable` 决定）。
+
+const nlohmann::json& FlowEngine::strikeGeometryLocked() const {
+    if (strikeGeometryLoaded_) return strikeGeometry_;
+    strikeGeometryLoaded_ = true;
+    strikeGeometry_ = nlohmann::json::object();
+    nlohmann::json notes = nlohmann::json::array();
+
+    // 路径来源：`HostConfig::resolveScenarioDir()`（= `<dataDir>/scenario-1`，与 scenario-data
+    // 装载的是同一个目录）。**不从源码里写坐标**：几何的唯一来源是这个文件。
+    const std::filesystem::path p =
+        std::filesystem::path(cfg_.resolveScenarioDir()) / "strike-geometry.json";
+    std::string text;
+    if (!readTextFile(p.string(), text)) {
+        strikeGeometry_["loaded"] = false;
+        strikeGeometry_["path"] = p.string();
+        strikeGeometry_["note"] = "几何文件读不到（IP 点/评估航线的坐标权威缺失）";
+        strikeGeometry_["attackStarts"] = nlohmann::json::array();
+        strikeGeometry_["assessRoutes"] = nlohmann::json::array();
+        strikeGeometry_["notes"] = notes;
+        return strikeGeometry_;
+    }
+    try {
+        nlohmann::json doc = nlohmann::json::parse(text);
+        strikeGeometry_["loaded"] = true;
+        strikeGeometry_["path"] = p.string();
+        strikeGeometry_["schemaVersion"] = doc.value("schemaVersion", std::string());
+        strikeGeometry_["note"] = doc.value("note", std::string());  // 文件自己的说明（原样）
+        strikeGeometry_["attackStarts"] =
+            doc.contains("attackStarts") && doc["attackStarts"].is_array() ? doc["attackStarts"]
+                                                                          : nlohmann::json::array();
+        strikeGeometry_["assessRoutes"] =
+            doc.contains("assessRoutes") && doc["assessRoutes"].is_array() ? doc["assessRoutes"]
+                                                                          : nlohmann::json::array();
+    } catch (const std::exception& e) {
+        strikeGeometry_["loaded"] = false;
+        strikeGeometry_["path"] = p.string();
+        strikeGeometry_["note"] = std::string("几何文件 JSON 解析失败：") + e.what();
+        strikeGeometry_["attackStarts"] = nlohmann::json::array();
+        strikeGeometry_["assessRoutes"] = nlohmann::json::array();
+    }
+    strikeGeometry_["notes"] = notes;
+    return strikeGeometry_;
+}
+
+nlohmann::json FlowEngine::templateRawOfLocked(const std::string& templateKey) const {
+#if MA_WITH_SCORING
+    if (engines_.scoringEngine && !templateKey.empty()) {
+        // 【引擎】scoring::ScoringEngine::templatesPack()（scoring.h:813）→ `TemplatesPack::raw`
+        //   （scoring.h:235）。M5 的四个字段（coordination/coordinationLabel/plannedFinish/
+        //   attackStart/assessRoute）**没有 typed 字段**、不进 `Candidate`（score.cc:453-468），
+        //   引擎只在 raw 里原样保留整包（policies.cc:404）—— 所以这是读到它们的**唯一**入口，
+        //   宿主 MUST NOT 自己拼业务文案。
+        const scoring::TemplatesPack pack = engines_.scoringEngine->templatesPack();
+        const auto it = pack.raw.find("items");
+        if (it != pack.raw.end() && it->is_array()) {
+            for (const auto& row : *it) {
+                if (!row.is_object()) continue;
+                if (row.value("key", std::string()) == templateKey) return row;
+            }
+        }
+    }
+#else
+    (void)templateKey;
+#endif
+    return nlohmann::json::object();
+}
+
+nlohmann::json FlowEngine::strikeGeometryOfLocked(const nlohmann::json& templateRaw) const {
+    const nlohmann::json& geo = strikeGeometryLocked();
+    nlohmann::json out = nlohmann::json::object();
+
+    // ---- IP 点（攻击起点）----
+    const std::string ipKey = templateRaw.contains("attackStart") && templateRaw["attackStart"].is_object()
+                                  ? templateRaw["attackStart"].value("key", std::string())
+                                  : std::string();
+    const std::string routeKey =
+        templateRaw.contains("assessRoute") && templateRaw["assessRoute"].is_object()
+            ? templateRaw["assessRoute"].value("key", std::string())
+            : std::string();
+
+    if (ipKey.empty() && routeKey.empty()) {
+        // Q5：场景二的三条模板**不写几何键**（不在数据里占位）。这里如实标注，不补、不编。
+        out["resolved"] = false;
+        out["reason"] = "模板未声明 attackStart.key / assessRoute.key（该场景的几何未配置）";
+        out["attackStart"] = nullptr;
+        out["assessRoute"] = nullptr;
+        return out;
+    }
+
+    nlohmann::json ip = nullptr;
+    if (!ipKey.empty() && geo.contains("attackStarts") && geo["attackStarts"].is_array()) {
+        for (const auto& row : geo["attackStarts"]) {
+            if (row.is_object() && row.value("key", std::string()) == ipKey) {
+                ip = row;  // **原样条目**（含 lng/lat/altM）
+                break;
+            }
+        }
+    }
+    nlohmann::json route = nullptr;
+    if (!routeKey.empty() && geo.contains("assessRoutes") && geo["assessRoutes"].is_array()) {
+        for (const auto& row : geo["assessRoutes"]) {
+            if (row.is_object() && row.value("key", std::string()) == routeKey) {
+                route = row;
+                break;
+            }
+        }
+    }
+
+    // 评估航线航点归一成 `{lng,lat}` + 原样 `[lng,lat]` 两种形态（场景文件里是二元数组）
+    nlohmann::json wp = nlohmann::json::array();
+    nlohmann::json wpRaw = nlohmann::json::array();
+    if (route.is_object() && route.contains("waypoints") && route["waypoints"].is_array()) {
+        for (const auto& p : route["waypoints"]) {
+            if (!p.is_array() || p.size() < 2) continue;
+            wp.push_back({{"lng", p[0]}, {"lat", p[1]}});
+            wpRaw.push_back(p);
+        }
+    }
+
+    nlohmann::json reasons = nlohmann::json::array();
+    if (ipKey.empty()) {
+        reasons.push_back("模板未声明 attackStart.key");
+    } else if (ip.is_null()) {
+        reasons.push_back("几何文件里没有 attackStart.key=" + ipKey +
+                          "（几何权威在场景数据；规则包只有键引用）");
+    }
+    if (routeKey.empty()) {
+        reasons.push_back("模板未声明 assessRoute.key");
+    } else if (route.is_null()) {
+        reasons.push_back("几何文件里没有 assessRoute.key=" + routeKey);
+    }
+
+    out["resolved"] = reasons.empty();
+    out["key"] = ipKey;
+    out["routeKey"] = routeKey;
+    if (ip.is_object()) {
+        out["attackStart"] = ip;
+        out["attackStart"]["source"] = "scenario-data/strike-geometry.json attackStarts[]（键引用：" +
+                                       ipKey + "）";
+    } else {
+        out["attackStart"] = nullptr;
+    }
+    if (route.is_object()) {
+        out["assessRoute"] = {{"key", route.value("key", std::string())},
+                              {"name", route.value("name", std::string())},
+                              {"waypoints", wp},
+                              {"waypointsRaw", wpRaw},
+                              {"source", "scenario-data/strike-geometry.json assessRoutes[]（键引用：" +
+                                             routeKey + "）"}};
+    } else {
+        out["assessRoute"] = nullptr;
+    }
+    out["reasons"] = reasons;
+    return out;
+}
+
+nlohmann::json FlowEngine::buildGuidancePlanLocked(const std::string& planId,
+                                                   const nlohmann::json& params, int& code) {
+    code = 0;
+    (void)params;  // 目前无入参（时刻与几何都有固定出处）；保留形参以便后续加过滤条件
+    nlohmann::json d = nlohmann::json::object();
+    nlohmann::json notes = nlohmann::json::array();
+    d["planId"] = planId;
+    d["missionId"] = missionId_;
+    d["scene"] = scenarioKeyOf(engines_);
+
+    // ---- 前置：方案必须已被采纳/确认（与 alloc.* 同一套语义）----
+    if (adoptedStrikePlanId_ != planId && confirmedStrikePlanId_ != planId) {
+        code = 1003;
+        d["message"] = "打击方案前置未满足：先 strike.adopt → strike.confirm";
+        d["adopted"] = adoptedStrikePlanId_;
+        d["confirmed"] = confirmedStrikePlanId_;
+        return d;
+    }
+
+    const nlohmann::json tpl = templateRawOfLocked(planId);
+    if (tpl.empty()) {
+        code = 1005;
+        d["message"] = "scoring 的 templatesPack().raw 里没有模板：" + planId +
+                       "（规则包未装载？）";
+        return d;
+    }
+    // M5 字段**原样**带出（宿主不拼文案）
+    d["template"] = tpl;
+
+    const nlohmann::json geo = strikeGeometryOfLocked(tpl);
+    d["geometry"] = geo;
+    const nlohmann::json& geoDoc = strikeGeometryLocked();
+    d["geometrySource"] = {{"path", geoDoc.value("path", std::string())},
+                           {"loaded", geoDoc.value("loaded", false)},
+                           {"attackStarts", geoDoc.contains("attackStarts") ? geoDoc["attackStarts"].size() : 0},
+                           {"assessRoutes", geoDoc.contains("assessRoutes") ? geoDoc["assessRoutes"].size() : 0}};
+    if (!geo.value("resolved", false)) {
+        for (const auto& r : geo.value("reasons", nlohmann::json::array())) {
+            notes.push_back(r.get<std::string>());
+        }
+        notes.push_back("该方案的几何未配置 → IP 点/评估航线/引导连线留空（MUST NOT 造坐标）；"
+                        "时间轴里凡需要几何的段一并留空并写明原因");
+    }
+
+    // ---- ① IP 点 ----
+    nlohmann::json ipOut = nullptr;
+    double ipLng = 0.0, ipLat = 0.0, ipAlt = 0.0;
+    bool hasIp = false;
+    if (geo.contains("attackStart") && geo["attackStart"].is_object()) {
+        const nlohmann::json& ip = geo["attackStart"];
+        ipLng = ip.value("lng", 0.0);
+        ipLat = ip.value("lat", 0.0);
+        ipAlt = ip.value("altM", 0.0);
+        hasIp = true;
+        ipOut = ip;  // 原样（key/name/lng/lat/altM/source）
+    }
+    d["ipPoint"] = ipOut;
+
+    // ---- ② 评估航线 ----
+    d["assessRoute"] = (geo.contains("assessRoute") && geo["assessRoute"].is_object())
+                           ? geo["assessRoute"]
+                           : nlohmann::json(nullptr);
+    nlohmann::json routeSummary = nlohmann::json::object();
+    std::vector<std::pair<double, double>> routePts;
+    if (geo.contains("assessRoute") && geo["assessRoute"].is_object() &&
+        geo["assessRoute"].contains("waypoints")) {
+        for (const auto& p : geo["assessRoute"]["waypoints"]) {
+            routePts.emplace_back(p.value("lng", 0.0), p.value("lat", 0.0));
+        }
+    }
+    const double routeLenM = polylineLengthM(routePts);
+    routeSummary["waypointCount"] = static_cast<int>(routePts.size());
+    routeSummary["lengthM"] = routeLenM;
+    routeSummary["lengthBasis"] =
+        "相邻航点大圆距离之和（WGS84 平均半径 6371008.8 m）；来源 = strike-geometry.json "
+        "assessRoutes[].waypoints[]";
+    d["assessRouteSummary"] = routeSummary;
+
+    // ---- ③ 引导连线（起点 = 台账里已登记平台的**真实坐标**；走哪条集群由 clusters[] 决定）----
+    //
+    // 集群匹配口径与 `alloc.assign` **逐字相同**：方案 `clusters[]` 里的字符串 ↔ 场景编组
+    // 显示名（deployment.json groups[].name）精确匹配。A15：键引用对不上就是**数据缺陷**，
+    // 宿主 MUST NOT 用位置序/自造映射表兜底 —— 对不上就如实标 resolved=false 并点名。
+    nlohmann::json lines = nlohmann::json::array();
+    nlohmann::json groups = nlohmann::json::array();
+    nlohmann::json knownGroups = nlohmann::json::array();
+    // 一台"台账可用"的平台：场景行（型号/速度）+ **台账坐标**（到达段与连线段的唯一几何来源）
+    struct LeadPlatform {
+        const PlatformRow* row = nullptr;
+        std::string entityId;
+        double lng = 0.0;
+        double lat = 0.0;
+        double altM = 0.0;
+    };
+    // 到达段/评估段要用的"台账可用平台"（见下面的 LeadPlatform）
+    std::vector<LeadPlatform> candidates;
+    double speedSum = 0.0;
+    int speedCount = 0;
+#if MA_WITH_SIM_SOURCE && MA_WITH_INGEST
+    const std::vector<std::pair<std::string, std::string>> sceneGroups = scenarioGroupsOf(engines_);
+    const std::vector<PlatformRow> allPlatforms = platformsOf(engines_);
+#else
+    const std::vector<std::pair<std::string, std::string>> sceneGroups;
+    const std::vector<PlatformRow> allPlatforms;
+#endif
+    for (const auto& g : sceneGroups) knownGroups.push_back(g.second);
+
+    const std::vector<std::string> planClusters =
+        tpl.contains("clusters") && tpl["clusters"].is_array()
+            ? tpl["clusters"].get<std::vector<std::string>>()
+            : std::vector<std::string>{};
+    int clusterResolved = 0;
+    int membersTotal = 0;
+    // `/api/state` 用的平台实体映射（装配期不存在；这里只读）
+    nlohmann::json regMap = nlohmann::json::object();
+    for (const auto& kv : entityIdOfDevice_) regMap[kv.first] = kv.second;
+
+#if MA_WITH_LEDGER
+    std::vector<entity_ledger::EntityRecord> ledgerRows;
+    if (engines_.entityLedger && !missionId_.empty()) {
+        ledgerRows = engines_.entityLedger->listEntities(entity_ledger::EntityQuery{missionId_});
+    }
+#endif
+    // 一个集群的解析（同名匹配 → 逐台进台账取坐标 → 连线段）。
+    // 抽成 lambda 是因为下面要**换一份集群清单再试一次**（见 dataDefect 那段）。
+    auto resolveClusters = [&](const std::vector<std::string>& clusterNames, const char* clusterSource) {
+        nlohmann::json outGroups = nlohmann::json::array();
+        nlohmann::json outLines = nlohmann::json::array();
+        int resolved = 0;
+        int members = 0;
+        double sum = 0.0;
+        int cnt = 0;
+        std::vector<LeadPlatform> leads;
+        for (const auto& pc : clusterNames) {
+            nlohmann::json g = nlohmann::json::object();
+            g["planCluster"] = pc;
+            g["clusterSource"] = clusterSource;
+            std::string groupKey;
+            for (const auto& sg : sceneGroups) {
+                if (sg.second == pc) {
+                    groupKey = sg.first;
+                    break;
+                }
+            }
+            if (groupKey.empty()) {
+                g["resolved"] = false;
+                g["reason"] =
+                    "方案声明的集群名在场景编组（deployment.json groups[].name）里没有同名项 → "
+                    "不编入任何平台，也不猜位置（A15：键引用不一致是数据缺陷，宿主不自造映射）";
+                g["members"] = nlohmann::json::array();
+                g["leader"] = nullptr;
+                outGroups.push_back(g);
+                continue;
+            }
+            g["resolved"] = true;
+            g["groupKey"] = groupKey;
+            nlohmann::json mem = nlohmann::json::array();
+            for (const auto& p : allPlatforms) {
+                if (p.groupKey != groupKey) continue;
+                ++members;
+                nlohmann::json m = nlohmann::json::object();
+                m["deviceId"] = p.deviceId;
+                m["model"] = p.model;
+                m["station"] = {{"lng", p.lng}, {"lat", p.lat}, {"altM", p.alt}};
+                m["speedMps"] = p.speed;
+                // 台账里的那一台（引擎是台账的唯一权威）：有就用台账坐标，没有就留空 + 点名
+                bool hasLedger = false;
+#if MA_WITH_LEDGER
+                const auto eit = entityIdOfDevice_.find(p.deviceId);
+                const std::string wantId = eit == entityIdOfDevice_.end() ? std::string() : eit->second;
+                const entity_ledger::EntityRecord* rec = nullptr;
+                for (const auto& r : ledgerRows) {
+                    if (!wantId.empty() && r.id == wantId) {
+                        rec = &r;
+                        break;
+                    }
+                }
+                if (rec != nullptr) {
+                    m["entityId"] = rec->id;
+                    m["no"] = rec->no;
+                    m["typeKey"] = rec->typeKey;
+                    m["dynamicState"] = rec->dynamicState;
+                    m["position"] = {{"lng", rec->lng}, {"lat", rec->lat}, {"altM", rec->alt}};
+                    m["positionSource"] = "entity-ledger 台账（listEntities 的 lng/lat/alt；"
+                                          "登记于 alloc.assign）";
+                    hasLedger = true;
+                    sum += p.speed;
+                    ++cnt;
+                }
+#endif
+                if (!hasLedger) {
+                    m["entityId"] = nullptr;
+                    m["position"] = nullptr;
+                    m["positionSource"] = nullptr;
+                    m["reason"] =
+                        "台账里没有这台平台的已登记实体（未 alloc.assign 或登记被引擎拒）→ 连线起点留空";
+                }
+                // 引导连线：该平台 → IP 点（直线大圆，长度附在段上供脚本复算）
+                if (hasIp && hasLedger) {
+                    const double len = distanceM(m["position"]["lng"].get<double>(),
+                                                 m["position"]["lat"].get<double>(), ipLng, ipLat);
+                    outLines.push_back(
+                        {{"groupId", groupKey},
+                         {"from", {{"kind", "platform"},
+                                   {"entityId", m["entityId"]},
+                                   {"deviceId", p.deviceId},
+                                   {"lng", m["position"]["lng"]},
+                                   {"lat", m["position"]["lat"]},
+                                   {"altM", m["position"]["altM"]},
+                                   {"source", "entity-ledger 台账（alloc.assign 登记）"}}},
+                         {"to", {{"kind", "ip-point"},
+                                 {"key", geo["attackStart"].value("key", std::string())},
+                                 {"name", geo["attackStart"].value("name", std::string())},
+                                 {"lng", ipLng},
+                                 {"lat", ipLat},
+                                 {"altM", ipAlt}}},
+                         {"lengthM", len},
+                         {"lengthBasis", "平台→IP 点大圆距离（WGS84 平均半径 6371008.8 m）"}});
+                }
+                mem.push_back(std::move(m));
+            }
+            ++resolved;
+            // 参与时间轴推算的平台：**第一台台账可用的**（到达段就用它；逐台算式见 lines[]）
+            for (const auto& p : allPlatforms) {
+                if (p.groupKey != groupKey) continue;
+                const auto eit = entityIdOfDevice_.find(p.deviceId);
+                if (eit == entityIdOfDevice_.end()) continue;
+                bool inLedger = false;
+                for (const auto& r : ledgerRows) {
+                    if (r.id == eit->second) {
+                        inLedger = true;
+                        break;
+                    }
+                }
+                if (inLedger) {
+                    // ★ 到达段的 d 必须与引导连线**同一份坐标**（台账那份），否则两处会漂移：
+                    //   到达算式里的 d_m 由脚本按 lines[].from 的大圆复算，两处必须是同一个来源。
+                    for (const auto& r : ledgerRows) {
+                        if (r.id == eit->second) {
+                            leads.push_back({&p, r.id, r.lng, r.lat, r.alt});
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+            g["members"] = std::move(mem);
+            g["leader"] = nullptr;
+            outGroups.push_back(g);
+        }
+        return std::make_tuple(outGroups, outLines, resolved, members, sum, cnt, leads);
+    };
+
+    auto [groupsA, linesA, resolvedA, membersA, sumA, cntA, leadsA] =
+        resolveClusters(planClusters, "plan");
+    groups = std::move(groupsA);
+    lines = std::move(linesA);
+    clusterResolved = resolvedA;
+    membersTotal = membersA;
+    speedSum = sumA;
+    speedCount = cntA;
+    candidates = leadsA;
+    std::string clusterSource = "plan";
+
+    // ---- 数据缺陷时的**如实回退**（不是"猜位置"）----
+    //
+    // 场景一的打击模板 clusters[] 写的是"集群 1..6"（资源侧的口语名），而 deployment.json 的
+    // 编组显示名是"前出侦察集群/侧翼侦察集群/…" —— **两套词汇对不上**（A15：数据缺陷，宿主
+    // MUST NOT 自造映射表）。这时如果本次任务里**已经确认过一套编组方案**（`adoptedPlanId_`，
+    // 它的 clusters[] 就是场景编组显示名 → `alloc.assign` 已按它登记了平台实体），就用那一套
+    // 去取台账坐标，并在回执里**逐字写明**：`clusterSource=confirmed-group-plan` +
+    // `dataDefect`（谁对不上、期望什么）。几何仍然只有一个出处 —— 台账，绝不编坐标。
+    if (clusterResolved == 0 && !planClusters.empty() && !adoptedPlanId_.empty()) {
+        const nlohmann::json gTpl = templateRawOfLocked(adoptedPlanId_);
+        const std::vector<std::string> gClusters =
+            gTpl.contains("clusters") && gTpl["clusters"].is_array()
+                ? gTpl["clusters"].get<std::vector<std::string>>()
+                : std::vector<std::string>{};
+        if (!gClusters.empty()) {
+            auto [groupsB, linesB, resolvedB, membersB, sumB, cntB, leadsB] =
+                resolveClusters(gClusters, "confirmed-group-plan");
+            if (resolvedB > 0) {
+                groups = std::move(groupsB);
+                lines = std::move(linesB);
+                clusterResolved = resolvedB;
+                membersTotal = membersB;
+                speedSum = sumB;
+                speedCount = cntB;
+                candidates = leadsB;
+                clusterSource = "confirmed-group-plan";
+                d["dataDefect"] = {
+                    {"field", "planTemplates.json items[<strike>].clusters[]"},
+                    {"declared", planClusters},
+                    {"expected", knownGroups},
+                    {"detail", "打击模板的集群名与场景编组显示名（deployment.json groups[].name）"
+                               "没有同名项 —— 键引用不一致（A15：属数据缺陷，宿主 MUST NOT 自造"
+                               "映射表或按位置序兜底）"},
+                    {"usedInstead", {{"clusterSource", "confirmed-group-plan"},
+                                     {"planId", adoptedPlanId_},
+                                     {"clusters", gClusters},
+                                     {"why", "该编组方案已被采纳且 alloc.assign 已按它把平台登记"
+                                             "进台账 → 连线起点仍是**台账里的真实坐标**"}}}};
+                notes.push_back("打击模板的 clusters[] 与场景编组显示名对不上 → 引导连线改用**已确认的"
+                                "编组方案**（" + adoptedPlanId_ + "）的集群与台账坐标；"
+                                "见 dataDefect（数据缺陷如实上报，未编造任何位置）");
+            }
+        }
+    }
+    d["guidance"] = {{"groups", groups},
+                     {"lines", lines},
+                     {"clusterSource", clusterSource},
+                     {"clustersDeclared", static_cast<int>(planClusters.size())},
+                     {"clustersMatched", clusterResolved},
+                     {"membersTotal", membersTotal},
+                     {"linesTotal", static_cast<int>(lines.size())},
+                     {"matchRule", "方案 clusters[] ↔ 场景编组显示名（deployment.json groups[].name）"
+                                   "精确匹配 —— 与 alloc.assign 同一口径；连线起点坐标一律取自 "
+                                   "entity-ledger 台账（alloc.assign 登记的实体）"}};
+    d["knownScenarioGroups"] = knownGroups;
+    d["platformEntities"] = regMap;
+    if (clusterResolved < static_cast<int>(planClusters.size()) && clusterSource == "plan") {
+        notes.push_back("有 " + std::to_string(static_cast<int>(planClusters.size()) - clusterResolved) +
+                        " 条方案集群在场景编组里没有同名项 → 引导连线留空（规则包/数据键引用不一致，"
+                        "属数据缺陷；宿主 MUST NOT 用位置序兜底，见实施方案 A15）");
+    }
+    if (lines.empty() && hasIp) {
+        notes.push_back("引导连线为空：IP 点有几何，但参与该方案的平台在台账里没有可用的登记坐标"
+                        "（先跑 alloc.plans→adopt→confirm→assign 把平台登记进台账）");
+    }
+
+    // ---- ④ 时间轴四项（t0 / 到达 / 打击 / 评估）----
+    //
+    // `t0` = **phase-engine 台账里当前阶段（本步是 T5）的 `enteredAt`** —— 任务进入该阶段的时刻。
+    // 引擎没给（未装配/查不到）→ 留空并在 notes 点名，MUST NOT 用挂钟顶上。
+    const PhaseView pv = phaseViewLocked();
+    // t0 = **任务下达时刻**（§10.1-Q1 裁决：「预计完成时间」是相对 t0 的分钟，锚点 = 任务下达）。
+    //
+    // 口径：任务下达 = `flow.enter` 建任务那一刻（宿主在 createMission 成功时记下 missionStartMs_），
+    // **不是**当前阶段的 enteredAt —— 用后者的话，每推进一个阶段"打击时刻"就往后滑一次，
+    // 而"预计完成时间 48 分钟"是方案自身的属性，不该随操作漂移。
+    // 取不到下达时刻（例如老任务/复位后未重进任务）时回落当前阶段的 enteredAt，并在 `basis` 里写明回落。
+    const bool t0FromMission = missionStartMs_ > 0;
+    const int64_t t0 = t0FromMission ? missionStartMs_ : pv.enteredAt;
+    const double t0Min = static_cast<double>(t0) / 60000.0;
+
+    const nlohmann::json planned = tpl.contains("plannedFinish") && tpl["plannedFinish"].is_object()
+                                       ? tpl["plannedFinish"]
+                                       : nlohmann::json::object();
+    const std::string pfBasis = planned.value("basis", std::string());
+    const int pfMinutes = planned.value("minutes", 0);
+    const bool hasPlanMinutes = (pfBasis == "from-t0" && pfMinutes > 0);
+
+    // 速度：台账里参与该方案的平台的实测速度均值（deployment.json aircraft[].speedMps）。
+    const double avgSpeed = speedCount > 0 ? speedSum / speedCount : 0.0;
+
+    // 到达：平台 → IP 点（取**第一个已解析集群里台账可用的那台**；坐标与连线段同一个来源）
+    const LeadPlatform* lead = candidates.empty() ? nullptr : &candidates.front();
+    double leadDistM = 0.0;
+    bool hasArrival = false;
+    int64_t arrivalMs = 0;
+    double arrivalMinReal = 0.0;
+    if (hasIp && lead != nullptr && lead->row != nullptr && lead->row->speed > 0.0) {
+        leadDistM = distanceM(lead->lng, lead->lat, ipLng, ipLat);
+        const double sec = leadDistM / lead->row->speed;
+        arrivalMinReal = sec / 60.0;
+        if (t0 > 0) {
+            arrivalMs = t0 + static_cast<int64_t>(std::llround(sec * 1000.0));
+            hasArrival = true;
+        }
+    }
+
+    // 打击：规则包的 `plannedFinish{from-t0,minutes}`（Q1 裁决：相对 t0 的分钟）
+    int64_t strikeMs = 0;
+    if (t0 > 0 && hasPlanMinutes) strikeMs = t0 + static_cast<int64_t>(pfMinutes) * 60000;
+
+    // 评估：打击完成时刻 + 评估航线实飞时长（航线总长 ÷ 速度）—— 「评估」不是拍出来的时刻
+    double assessDurMin = 0.0;
+    int64_t assessMs = 0;
+    if (strikeMs > 0 && routeLenM > 0.0 && avgSpeed > 0.0) {
+        const double sec = routeLenM / avgSpeed;
+        assessDurMin = sec / 60.0;
+        assessMs = strikeMs + static_cast<int64_t>(std::llround(sec * 1000.0));
+    }
+
+    nlohmann::json items = nlohmann::json::array();
+    // t0
+    {
+        nlohmann::json b = basisJson(
+            t0FromMission
+                ? "t0 = 任务下达时刻（flow.enter 建任务那一刻，宿主记的 missionStartMs_，epoch ms）"
+                : "t0 = phase-engine 台账里当前阶段的 enteredAt（回落：宿主没有任务下达时刻）",
+            {{"missionId", missionId_},
+             {"phaseKey", pv.phaseKey},
+             {"enteredAt", t0},
+             {"missionStartMs", missionStartMs_},
+             {"fromMissionStart", t0FromMission},
+             {"fromEngine", pv.fromEngine}},
+            "phase::PhaseEngine::phaseContext(missionId).enteredAt（公开头 phase_engine.h:594）");
+        nlohmann::json item = {{"key", "t0"},
+                               {"name", "任务下达（t0）"},
+                               {"atMs", t0 > 0 ? nlohmann::json(t0) : nlohmann::json(nullptr)},
+                               {"atText", timeText(t0)},
+                               {"basis", b}};
+        if (t0 == 0) {
+            item["note"] = "引擎没给 enteredAt → 留空（不用挂钟顶替）";
+            notes.push_back("t0 留空：phase-engine 未返回 enteredAt");
+        }
+        items.push_back(std::move(item));
+    }
+    // 到达
+    {
+        nlohmann::json item = {{"key", "arrival"}, {"name", "预计到达 IP 点"}};
+        if (hasArrival) {
+            nlohmann::json b = basisJson(
+                "到达 = t0 + (d / v) × 1000 ms；d = 平台→IP 点大圆距离（m），v = 平台实测速度（m/s）",
+                {{"d_m", leadDistM},
+                 {"v_mps", lead->row->speed},
+                 {"platform", lead->row->deviceId},
+                 {"entityId", lead->entityId},
+                 {"fromLng", lead->lng},
+                 {"fromLat", lead->lat},
+                 {"ipKey", geo["attackStart"].value("key", std::string())},
+                 {"ipLng", ipLng},
+                 {"ipLat", ipLat},
+                 {"t0", t0}},
+                "平台位置 = entity-ledger 台账（alloc.assign 登记；与 guidance.lines[].from 同一份"
+                "坐标）；速度 = 场景 deployment.json aircraft[].speedMps");
+            item["atMs"] = arrivalMs;
+            item["atText"] = timeText(arrivalMs);
+            item["offsetMinutes"] = arrivalMinReal;
+            item["t0PlusMinutes"] = t0Min + arrivalMinReal;
+            item["basis"] = b;
+        } else {
+            item["atMs"] = nullptr;
+            item["atText"] = "";
+            item["basis"] = basisJson(
+                "到达 = t0 + (d / v) × 1000 ms（本段无输入）",
+                {{"t0", t0}, {"d_m", nullptr}, {"v_mps", nullptr}},
+                "留空原因：需要 IP 点几何（strike-geometry.json）+ 台账里已登记平台的位置与速度");
+            item["note"] = "留空：没有可用的 IP 点几何或台账平台坐标/速度（MUST NOT 编时刻）";
+            notes.push_back("到达时刻留空：缺 IP 点几何或台账平台坐标/速度");
+        }
+        items.push_back(std::move(item));
+    }
+    // 打击
+    {
+        nlohmann::json item = {{"key", "strike"}, {"name", "打击完成（规则包预计完成时间）"}};
+        if (strikeMs > 0) {
+            nlohmann::json item2 = {{"key", "strike"},
+                                    {"name", "打击完成（规则包预计完成时间）"},
+                                    {"atMs", strikeMs},
+                                    {"atText", timeText(strikeMs)},
+                                    {"basis", basisJson(
+                                         "打击 = t0 + plannedFinish.minutes × 60000 ms"
+                                         "（Q1 裁决：相对 t0 的分钟）",
+                                         {{"plannedFinish.basis", pfBasis},
+                                          {"plannedFinish.minutes", pfMinutes},
+                                          {"t0", t0}},
+                                         "规则包 scoring/policies/mapapp/planTemplates.json → "
+                                         "TemplatesPack.raw.items[<key>].plannedFinish"
+                                         "（引擎不解析、经 raw 供宿主读取）")}};
+            if (hasArrival) {
+                item2["planned"] = true;
+                item2["computed"] = false;
+                item2["deltaVsArrivalMinutes"] =
+                    (static_cast<double>(strikeMs - arrivalMs) / 60000.0);
+            }
+            if (hasArrival && strikeMs < arrivalMs) {
+                item2["conflict"] =
+                    {{"reason", "规则包的预计完成时间**早于**按实测算出的到达时刻"},
+                     {"arrivalAtMs", arrivalMs},
+                     {"strikeAtMs", strikeMs}};
+                notes.push_back("时间轴冲突：plannedFinish.minutes 推算的打击时刻早于实测到达时刻 —— "
+                                "两边都原样给出（宿主不替规则包改数）");
+            }
+            item = std::move(item2);
+        } else {
+            item["atMs"] = nullptr;
+            item["atText"] = "";
+            item["basis"] = basisJson("打击 = t0 + plannedFinish.minutes × 60000 ms（本段无输入）",
+                                     {{"t0", t0},
+                                      {"plannedFinish.basis", pfBasis},
+                                      {"plannedFinish.minutes", pfMinutes}},
+                                     "留空原因：模板的 plannedFinish 不是 {basis:\"from-t0\", minutes>0} "
+                                     "或不含该字段");
+            item["note"] = "留空：模板未声明可用的 plannedFinish";
+            notes.push_back("打击时刻留空：模板未声明 plan 侧的 plannedFinish{from-t0,minutes}");
+        }
+        items.push_back(std::move(item));
+    }
+    // 评估
+    {
+        nlohmann::json item = {{"key", "assess"}, {"name", "评估完成（评估航线飞完）"}};
+        if (assessMs > 0) {
+            item["atMs"] = assessMs;
+            item["atText"] = timeText(assessMs);
+            item["offsetMinutes"] = assessDurMin;
+            item["basis"] =
+                basisJson("评估 = 打击 + (L / v) × 1000 ms；L = 评估航线折线总长（m），"
+                          "v = 参与该方案平台的实测速度均值（m/s）",
+                          {{"L_m", routeLenM},
+                           {"v_mps", avgSpeed},
+                           {"speedSamples", speedCount},
+                           {"waypointCount", static_cast<int>(routePts.size())},
+                           {"strikeAtMs", strikeMs}},
+                          "航线几何 = strike-geometry.json assessRoutes[].waypoints[]；"
+                          "速度 = 场景 deployment.json aircraft[].speedMps");
+        } else {
+            item["atMs"] = nullptr;
+            item["atText"] = "";
+            item["basis"] = basisJson("评估 = 打击 + (L / v) × 1000 ms（本段无输入）",
+                                     {{"strikeAtMs", strikeMs},
+                                      {"L_m", routeLenM},
+                                      {"v_mps", avgSpeed}},
+                                     "留空原因：缺评估航线几何、打击时刻或台账平台速度");
+            item["note"] = "留空：评估航线/打击时刻/速度三者有缺（MUST NOT 编时刻）";
+            notes.push_back("评估时刻留空：缺评估航线几何或平台速度");
+        }
+        items.push_back(std::move(item));
+    }
+
+    d["timeline"] = {{"anchor", {{"kind", t0FromMission ? "mission-start" : "phase-enteredAt"},
+                                 {"phaseKey", pv.phaseKey},
+                                 {"enteredAt", t0},
+                                 {"atText", timeText(t0)},
+                                 {"fromMissionStart", t0FromMission},
+                                 {"source", t0FromMission
+                                                ? "宿主：flow.enter 建任务的时刻（任务下达）"
+                                                : "phase::PhaseContext.enteredAt（phase-engine 台账，回落）"}}},
+                     {"items", items}};
+    d["assessFlight"] = {{"lengthM", routeLenM},
+                         {"speedMps", avgSpeed},
+                         {"speedSamples", speedCount},
+                         {"durationMinutes", assessDurMin}};
+    d["notes"] = std::move(notes);
+    d["source"] = "宿主：几何 ← scenario-data/strike-geometry.json + entity-ledger 台账；"
+                  "字段 ← scoring TemplatesPack.raw（原样）；时刻 ← 每段 basis 里的算式";
+    return d;
+}
+
 nlohmann::json FlowEngine::command(const std::string& verb, const nlohmann::json& params) {    if (verb.empty()) return badRequest(verb, "缺少 verb");
 
     // ---------------------------------------------------------------- 启动加载
@@ -2150,6 +3005,9 @@ nlohmann::json FlowEngine::command(const std::string& verb, const nlohmann::json
                     d["message"] = cr.message;
                 } else {
                     missionId_ = cr.data.id;
+                    // **任务下达时刻**（时间轴 t0 的锚点）：建任务成功这一刻。
+                    // 与 enteredAtMs_（当前阶段进入时刻）分开存 —— 后者每推进一个阶段都会变。
+                    missionStartMs_ = wallClockMs();
                     // 步 7（P4）：探测结果的落账任务 = 引擎刚给的 missionId（同一个来源，
                     // 宿主不自己拼 id）。线程：见 onDetection。
                     {
@@ -2896,6 +3754,9 @@ nlohmann::json FlowEngine::command(const std::string& verb, const nlohmann::json
                     if (rr.code == 0) {
                         row["entityId"] = rr.data.id;
                         row["no"] = rr.data.no;
+                        // 步 9（P5）：记下"这台平台在台账里的实体 id" —— 引导连线的起点要取
+                        // **台账里那台**的坐标（引擎是台账的唯一权威），不另取一份场景坐标。
+                        entityIdOfDevice_[p.deviceId] = rr.data.id;
                         row["dynamicState"] = rr.data.dynamicState;
                         ++registered;
                     }
@@ -2948,6 +3809,398 @@ nlohmann::json FlowEngine::command(const std::string& verb, const nlohmann::json
 #else
         return reply(verb, 1005, {{"message", "resource-alloc/scoring 未装配（编译期开关关闭）"}});
 #endif
+    }
+
+    // ================================================================ 步 8：打击三方案（P5）
+    //
+    // 与 `alloc.plans` **同一套**（同一个 `generateCandidates` + `score`，只把 `side` 换成
+    // "strike"）；差别只有一处：打击侧要带出 M5 的四个新字段，并在方案上**如实标注几何是否可用**。
+    if (verb == "strike.plans") {
+        // 【引擎】scoring::ScoringEngine::generateCandidates(const CandidateRequest&)（scoring.h:822）
+        //        + scoring::ScoringEngine::score(const CandidateRequest&)（scoring.h:824）
+        //        + scoring::ScoringEngine::templatesPack()（:813）→ `TemplatesPack::raw` 取 M5 字段
+        //   入参：count（默认 3）、scene（默认 = 当前场景）、snapshot **真填**（与 alloc.plans 同一份）
+        //   回执：候选与评分**原样** + `recommendedId/recommendedPercent`（全部来自 ScoreResult）+ 几何标注
+#if MA_WITH_SCORING && MA_WITH_RESOURCE
+        if (!engines_.scoringEngine) {
+            return reply(verb, 1005, {{"message", "scoring 未装配（编译期 MA_WITH_SCORING=0）"}});
+        }
+        const int want = intOr(params, "count", 3);
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (missionId_.empty()) {
+            return reply(verb, 1003, {{"message", "尚未进入任务：先 flow.enter（台账/评分按任务隔离）"}});
+        }
+        const std::string targetId = missionId_;
+        std::string scene = params.value("scene", std::string());
+        if (scene.empty()) scene = scenarioKeyOf(engines_);
+        const LedgerInit init = ensureLedger(engines_, targetId, scene);
+        if (init.code != 0) {
+            return reply(verb, init.code, {{"message", init.message}, {"targetId", targetId}});
+        }
+        nlohmann::json notes = nlohmann::json::array();
+        notes.push_back(std::string("台账：") + (init.created ? "本次初始化（" : "已存在，未重建（") +
+                        init.message + "）");
+
+        const PhaseView v = phaseViewLocked();
+        const scoring::PhaseContext pc =
+            toScoringPhaseContext(v.phaseKey, v.seq, scene, v.enteredAt, targetId);
+        scoring::CandidateRequest req;
+        req.missionId = targetId;
+        req.phase = pc;
+        req.side = "strike";              // ★ 与 alloc.plans 的唯一差别
+        req.scene = scene;
+        req.includeInapplicable = true;   // SCD-CAND-02：不适用 MUST 标注而非静默丢弃
+        req.dedupe = true;                // SCD-CAND-04
+        req.snapshot = buildSnapshot(engines_, targetId, pc, scene, notes);
+
+        const std::vector<scoring::Candidate> cands = engines_.scoringEngine->generateCandidates(req);
+        const scoring::ScoreResult sr = engines_.scoringEngine->score(req);
+        if (sr.code != 0) {
+            return reply(verb, sr.code,
+                         {{"message", sr.message}, {"notes", notes}, {"scene", scene}, {"side", "strike"}});
+        }
+
+        nlohmann::json items = nlohmann::json::array();
+        int taken = 0;
+        int resolvedGeometry = 0;
+        int unresolvedGeometry = 0;
+        for (const auto& cs : sr.candidates) {
+            if (taken >= want) break;
+            const nlohmann::json candidateRaw = nlohmann::json::parse(cs.candidate.toJson().dump());
+            const std::string tkey = candidateRaw.value("key", cs.candidate.key);
+            const nlohmann::json tpl = templateRawOfLocked(tkey);   // M5 字段的原样来源
+            const nlohmann::json geo = strikeGeometryOfLocked(tpl);
+            if (!tpl.is_object() || tpl.empty()) {
+                notes.push_back("模板 " + tkey + " 在 TemplatesPack.raw 里查不到 → M5 字段与几何标注留空");
+            }
+            if (geo.value("resolved", false)) {
+                ++resolvedGeometry;
+            } else {
+                ++unresolvedGeometry;
+            }
+            items.push_back({{"candidate", candidateRaw},
+                             {"score", nlohmann::json::parse(cs.toJson().dump())},
+                             // M5：**模板原样**（coordination/coordinationLabel/plannedFinish/
+                             // attackStart/assessRoute 都在里面；宿主不拼业务文案）
+                             {"template", tpl},
+                             {"coordination", tpl.contains("coordination")
+                                                  ? tpl["coordination"]
+                                                  : nlohmann::json(nullptr)},
+                             {"coordinationLabel", tpl.contains("coordinationLabel")
+                                                       ? tpl["coordinationLabel"]
+                                                       : nlohmann::json(nullptr)},
+                             {"plannedFinish", tpl.contains("plannedFinish")
+                                                   ? tpl["plannedFinish"]
+                                                   : nlohmann::json(nullptr)},
+                             {"attackStart", tpl.contains("attackStart") ? tpl["attackStart"]
+                                                                         : nlohmann::json(nullptr)},
+                             {"assessRoute", tpl.contains("assessRoute") ? tpl["assessRoute"]
+                                                                         : nlohmann::json(nullptr)},
+                             {"geometry", geo}});
+            ++taken;
+        }
+        nlohmann::json candidatesRaw = nlohmann::json::array();
+        for (const auto& c : cands) candidatesRaw.push_back(nlohmann::json::parse(c.toJson().dump()));
+        nlohmann::json reasons = nlohmann::json::array();
+        for (const auto& rs : sr.reasons) reasons.push_back(nlohmann::json::parse(rs.toJson().dump()));
+        nlohmann::json missing = nlohmann::json::array();
+        for (const auto& m : sr.missingInputs) missing.push_back(m);
+
+        const nlohmann::json& geoDoc = strikeGeometryLocked();
+        nlohmann::json d = nlohmann::json::object();
+        d["side"] = "strike";
+        d["scene"] = sr.scene.empty() ? scene : sr.scene;
+        d["missionId"] = targetId;
+        d["count"] = taken;
+        d["requestedCount"] = want;
+        d["items"] = items;
+        d["candidates"] = std::move(candidatesRaw);
+        d["recommendedId"] = sr.recommendedId;
+        d["hasRecommended"] = sr.hasRecommended;
+        d["recommendedPercent"] = sr.recommendedPercent;
+        d["nextId"] = sr.nextId;
+        d["nextPercent"] = sr.nextPercent;
+        d["leadOverNext"] = sr.leadOverNext;
+        d["leadOverNextPercent"] = sr.leadOverNextPercent;
+        d["reasons"] = std::move(reasons);
+        d["missingInputs"] = std::move(missing);
+        d["metricsDigest"] = sr.metricsDigest;
+        d["templatesDigest"] = sr.templatesDigest;
+        d["auditDigest"] = sr.auditDigest;
+        d["geometrySource"] = {{"path", geoDoc.value("path", std::string())},
+                               {"loaded", geoDoc.value("loaded", false)},
+                               {"attackStarts",
+                                geoDoc.contains("attackStarts") ? geoDoc["attackStarts"].size() : 0},
+                               {"assessRoutes",
+                                geoDoc.contains("assessRoutes") ? geoDoc["assessRoutes"].size() : 0},
+                               {"authority", "scenario-data（§10.1-Q4 变体 A：规则包只有键引用）"}};
+        d["geometryResolved"] = resolvedGeometry;
+        d["geometryUnresolved"] = unresolvedGeometry;
+        notes.push_back("几何标注：resolved=" + std::to_string(resolvedGeometry) + " / unresolved=" +
+                        std::to_string(unresolvedGeometry) +
+                        "（**只标注、不丢**：不适用项由引擎的 includeInapplicable 决定是否保留）");
+        notes.push_back("Q5 口径：本演示只跑场景一 → 场景二模板（stk-s2-*）不声明几何键，"
+                        "其 geometry.resolved=false 且给出 reason（MUST NOT 造坐标）");
+        d["notes"] = std::move(notes);
+        if (taken > 0 && sr.hasRecommended) {
+            hasStrikeScore_ = true;
+            lastStrikeRecommendation_ = sr.recommendedId;
+            lastStrikeRecommendedPercent_ = sr.recommendedPercent;
+        }
+        lastStrikePlans_ = d;  // /api/state 也带一份（前端刚挂载时不必等命令）
+        return reply(verb, 0, d);
+#else
+        return reply(verb, 1005, {{"message", "scoring/resource-alloc 未装配（编译期开关关闭）"}});
+#endif
+    }
+
+    // ---------------------------------------------------------------- 步 8：打击窗口（实体级）
+    if (verb == "strike.window") {
+        // 【引擎】entity_ledger::EntityLedger::strikeWindow(entityId, StrikeWindowQuery)
+        //   （公开头 entity_ledger.h:1276）—— 由**轨迹与规则**推算的结构化时间区间
+        //   （ELG-RATE-06：MUST NOT 是硬编码字符串）。规则 `strikeWindow.*` 在
+        //   entity-ledger/policies/mapapp/threatFactors.json 里。
+        //   宿主只转发（含 nowMs/horizonOverrideMs 两个可选入参），回执 = `StrikeWindowResult::toJson()` 原样。
+#if MA_WITH_LEDGER
+        if (!engines_.entityLedger) {
+            return reply(verb, 1005, {{"message", "entity-ledger 未装配（编译期 MA_WITH_LEDGER=0）"}});
+        }
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (missionId_.empty()) {
+            return reply(verb, 1003, {{"message", "尚未进入任务：先 flow.enter"}});
+        }
+        std::string entityId = params.value("entityId", std::string());
+        std::string pickedBy = "param";
+        if (entityId.empty()) {
+            // 未指定 → 取台账里**威胁分最高**的一条（平手按 no 小者）。这是**排序**不是造数据；
+            // 用的是引擎已经算好的 threatScore（`listEntities` 的只读视图）。
+            const std::vector<entity_ledger::EntityRecord> rows =
+                engines_.entityLedger->listEntities(entity_ledger::EntityQuery{missionId_});
+            const entity_ledger::EntityRecord* best = nullptr;
+            for (const auto& r : rows) {
+                if (r.retired) continue;
+                if (best == nullptr || r.threatScore > best->threatScore ||
+                    (r.threatScore == best->threatScore && r.no < best->no)) {
+                    best = &r;
+                }
+            }
+            if (best == nullptr) {
+                return reply(verb, 1004,
+                             {{"message", "台账里没有实体：先让目标被探测登记（步 7）"},
+                              {"missionId", missionId_},
+                              {"hint", "strike.window{entityId} 也可显式指定；未指定时取威胁分最高者"}});
+            }
+            entityId = best->id;
+            pickedBy = "highest-threat";
+        }
+        entity_ledger::StrikeWindowQuery q;
+        q.nowMs = static_cast<int64_t>(params.value("nowMs", static_cast<double>(0)));
+        q.horizonOverrideMs = intOr(params, "horizonOverrideMs", 0);
+        const entity_ledger::StrikeWindowResult res = engines_.entityLedger->strikeWindow(entityId, q);
+        nlohmann::json d = nlohmann::json::parse(res.toJson().dump());
+        d["entityId"] = entityId;
+        d["pickedBy"] = pickedBy;
+        if (res.code == 0 && !res.data.entityId.empty()) d["entityId"] = res.data.entityId;
+        return reply(verb, res.code, d);
+#else
+        return reply(verb, 1005, {{"message", "entity-ledger 未装配（编译期 MA_WITH_LEDGER=0）"}});
+#endif
+    }
+
+    // ---------------------------------------------------------------- 步 9：打击方案采纳 / 确认
+    //
+    // 与 `alloc.adopt`/`alloc.confirm` **同一套引擎语义**（同一个 `adopt`/`confirm`：
+    // 同侧互斥、幂等 code=0 + idempotent、非推荐方案标 deviated、`confirm` 的前置策略
+    // 由规则包 `confirmPrecondition` 裁决 —— 未采纳直接确认 → 1003，细节在 **data.unmet**）。
+    // 差别：`side` 固定 "strike"，且成功时把**流程**推到步 8/9 并把**阶段**推到 T5。
+    if (verb == "strike.adopt" || verb == "strike.confirm") {
+        // 【引擎】scoring::ScoringEngine::adopt(const AdoptRequest&)（scoring.h:834）
+        //        / scoring::ScoringEngine::confirm(const ConfirmRequest&)（scoring.h:836）
+        //        + phase::PhaseEngine::advance(const AdvanceRequest&)（phase_engine.h:577）到 T5
+#if MA_WITH_SCORING
+        if (!engines_.scoringEngine) {
+            return reply(verb, 1005, {{"message", "scoring 未装配（编译期 MA_WITH_SCORING=0）"}});
+        }
+        const std::string planId = params.value("planId", std::string());
+        if (planId.empty()) return badRequest(verb, "缺少 planId");
+        // `side`：默认 strike；若显式给了别的侧，就以模板自己声明的 side 为准（不猜、也不硬顶）
+        std::string side = params.value("side", std::string("strike"));
+        {
+            const nlohmann::json tpl = templateRawOfLocked(planId);
+            if (tpl.is_object() && tpl.contains("side")) side = tpl.value("side", side);
+        }
+        nlohmann::json d = nlohmann::json::object();
+        int code = 0;
+        bool stepChanged = false;
+        bool phaseMoved = false;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (missionId_.empty()) {
+                return reply(verb, 1003, {{"message", "尚未进入任务：先 flow.enter"}});
+            }
+            const std::string scene = scenarioKeyOf(engines_);
+            const PhaseView v = phaseViewLocked();
+            const scoring::PhaseContext pc =
+                toScoringPhaseContext(v.phaseKey, v.seq, scene, v.enteredAt, missionId_);
+            if (verb == "strike.adopt") {
+                scoring::AdoptRequest req;
+                req.missionId = missionId_;
+                req.phase = pc;
+                req.planId = planId;
+                req.side = side;
+                req.operatorId = params.value("operatorId", std::string("host"));
+                req.reason = params.value("reason", std::string("host:strike.adopt"));
+                req.hasRecommendedContext = hasStrikeScore_;
+                req.recommendedId = lastStrikeRecommendation_;
+                req.recommendedPercent = lastStrikeRecommendedPercent_;
+                req.planPercent =
+                    (planId == lastStrikeRecommendation_) ? lastStrikeRecommendedPercent_ : 0;
+#if MA_WITH_RESOURCE
+                {
+                    nlohmann::json tmp = nlohmann::json::array();
+                    req.snapshot = buildSnapshot(engines_, missionId_, pc, scene, tmp);
+                }
+#endif
+                const scoring::DecideResult res = engines_.scoringEngine->adopt(req);
+                code = res.code;
+                d = nlohmann::json::parse(res.dataJson().dump());
+                if (res.idempotent) d["idempotent"] = true;
+                if (res.code == 0) {
+                    adoptedStrikePlanId_ = planId;
+                    if (step_ < 8) {
+                        step_ = 8;  // 步 8 = 打击方案（采纳发生在这一步的卡片上）
+                        stepChanged = true;
+                    }
+                }
+            } else {
+                scoring::ConfirmRequest req;
+                req.missionId = missionId_;
+                req.phase = pc;
+                req.planId = planId;
+                req.side = side;
+                req.operatorId = params.value("operatorId", std::string("host"));
+                req.reason = params.value("reason", std::string("host:strike.confirm"));
+                const scoring::DecideResult res = engines_.scoringEngine->confirm(req);
+                code = res.code;
+                d = nlohmann::json::parse(res.dataJson().dump());
+                if (res.idempotent) d["idempotent"] = true;
+                if (res.code == 0) {
+                    confirmedStrikePlanId_ = planId;
+                    if (step_ < 9) {
+                        step_ = 9;  // 步 9 = 打击确认（IP 点 + 引导连线 + 时间轴）
+                        stepChanged = true;
+                    }
+                }
+            }
+        }
+        // ---- 阶段推进到 T5（与步 8/9 对齐）----
+        //
+        // 两步走：先**正常** advance（判据由 phase-engine 的 Gate 裁决）；被拦（如 T4 的
+        // `target-identified`）时再 `force=true` 重试一次。**为什么允许 force**：本演示的
+        // 步 8 可以从界面上直接进入（P5 自证脚本就跑这条最短路径），不 force 的话流程会卡在
+        // T0 —— 而"阶段推进"这件事本身是**流程步进**，不是引擎的判决结果；force 的两次回执
+        // 都原样回执，谁被跳过（`skippedGates`/`unmet`）一目了然，MUST NOT 静默。
+        if (code == 0) {
+            nlohmann::json advance = nlohmann::json::object();
+            std::lock_guard<std::mutex> lk(mtx_);
+            const int stepBefore = step_;
+            if (engines_.phase && !missionId_.empty()) {
+                phase::AdvanceRequest ar;
+                ar.missionId = missionId_;
+                ar.to = "T5";
+                ar.reason = std::string("host:") + verb;
+                ar.operatorId = params.value("operatorId", std::string("host"));
+                phase::TransitionResult tr = engines_.phase->advance(ar);
+                nlohmann::json first = tr.dataJson();
+                bool forced = false;
+                if (tr.code != 0) {
+                    ar.force = true;
+                    ar.reason = std::string("host:") + verb + ":force";
+                    tr = engines_.phase->advance(ar);
+                    forced = true;
+                }
+                advance["phase"] = "T5";
+                advance["forced"] = forced;
+                advance["code"] = tr.code;
+                advance["firstAttempt"] = first;
+                advance["result"] = tr.dataJson();
+                if (tr.code == 0) {
+                    const PhaseView v2 = phaseViewLocked();
+                    phase_ = v2.phaseKey.empty() ? std::string("T5") : v2.phaseKey;
+                    enteredAtMs_ = v2.enteredAt != 0 ? v2.enteredAt : enteredAtMs_;
+                    // ★ 步号**由动词决定，不是由阶段反推**：`stepForPhase("T5")` = 步 8，
+                    //   但 `strike.confirm` 落在**步 9**（打击确认屏，同一阶段 T5 的第二屏）——
+                    //   这里显式写回，否则 confirm 会被 advance 的 phase→step 映射"打回"步 8。
+                    step_ = (verb == "strike.confirm") ? 9 : 8;
+                    if (step_ != stepBefore) stepChanged = true;
+                    phaseMoved = true;
+                    advance["step"] = step_;
+                    advance["stepKey"] = flowStepOf(step_) ? flowStepOf(step_)->key : "";
+                    advance["enteredAt"] = enteredAtMs_;
+                    advance["phaseKey"] = phase_;
+                } else {
+                    advance["note"] = "phase-engine 拒绝（含 force）→ 流程停在原阶段，回执原样给出";
+                }
+            } else {
+                advance["note"] = "phase-engine 未装配 → 只推进宿主流程步";
+            }
+            d["advance"] = advance;
+            // ---- 步 9 的显示模式：可选覆盖一次（**键名由调用方给，宿主不猜**）----
+            //
+            // 【引擎】view_composer::ViewComposer::setModeOverride（公开头 view_composer.h:656）。
+            // 规则包 `view-composer/policies/mapapp/viewModes.json` 的 `requiredModes[]` 里声明了
+            // 步 9 用它（`strike-confirm`）；但**可用键的权威在规则包**，宿主 MUST NOT 把键写死
+            // 在源码里（否则规则包改名就静默失效）—— 所以 `modeKey` 由调用方给，缺省 = 不覆盖
+            // （返回的 `modeOverride` 就是引擎对"未指定模式"的判决，原样）。
+#if MA_WITH_VIEW_COMPOSER
+            if (verb == "strike.confirm" && engines_.viewComposer) {
+                const std::string mk = params.value("modeKey", std::string());
+                if (!mk.empty()) {
+                    const PhaseView v2 = phaseViewLocked();
+                    const view_composer::PhaseContext vc = toViewPhaseContext(
+                        v2.phaseKey, v2.seq, v2.scenarioKey, v2.enteredAt, missionId_);
+                    const view_composer::ModeResolution mr =
+                        engines_.viewComposer->setModeOverride(vc, mk);
+                    strikeModeOverride_ = nlohmann::json::parse(view_composer::toJson(mr).dump());
+                    d["modeOverride"] = strikeModeOverride_;
+                    if (!mr.ok) {
+                        d["modeOverrideNote"] =
+                            "引擎拒绝该 modeKey（键名必须在规则包 viewModes.json 里声明）——"
+                            "原样回执，宿主不改流程结果";
+                    }
+                }
+            }
+#endif
+        }
+        if (stepChanged || phaseMoved) broadcastFlowState();
+        return reply(verb, code, d);
+#else
+        return reply(verb, 1005, {{"message", "scoring 未装配（编译期 MA_WITH_SCORING=0）"}});
+#endif
+    }
+
+    // ---------------------------------------------------------------- 步 9：引导方案（IP 点 + 引导连线 + 时间轴）
+    if (verb == "guidance.plan") {
+        // 【数据源】① 几何 = 场景数据 `<scenarioDir>/strike-geometry.json`（IP 点 / 评估航线，
+        //              §10.1-Q4 变体 A：规则包只有 `attackStart.key` / `assessRoute.key` 键引用）
+        //           ② 引导连线的起点 = entity-ledger 台账里**已登记平台**的坐标
+        //           ③ M5 字段（coordination/plannedFinish/attackStart/assessRoute） = scoring
+        //              的 `TemplatesPack.raw`（引擎不解析，逐字原样）
+        //           ④ 时刻 = phase-engine 台账的 `enteredAt`（t0）+ 每段自己的算式（basis）
+        //   前置：该方案必须已被 `strike.adopt`（→`strike.confirm`）—— 与 alloc.* 同一套语义。
+        const std::string planId = params.value("planId", std::string());
+        if (planId.empty()) return badRequest(verb, "缺少 planId");
+        nlohmann::json d = nlohmann::json::object();
+        int code = 0;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (missionId_.empty()) {
+                return reply(verb, 1003, {{"message", "尚未进入任务：先 flow.enter"}});
+            }
+            d = buildGuidancePlanLocked(planId, params, code);
+        }
+        if (code == 0) lastGuidance_ = d;  // /api/state 复用（步 9 屏幕的"当前引导方案"）
+        return reply(verb, code, d);
     }
 
     // ================================================================ 步 6：仿真节拍

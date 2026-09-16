@@ -23,6 +23,8 @@ import { GroupConfirmScreen } from './screens/GroupConfirmScreen'
 import { StageOverlay } from './screens/StageOverlay'
 import { ExecuteScreen } from './screens/ExecuteScreen'
 import { TargetsScreen } from './screens/TargetsScreen'
+import { StrikeScreen } from './screens/StrikeScreen'
+import { StrikeConfirmScreen } from './screens/StrikeConfirmScreen'
 import { MapStage } from './MapStage'
 
 function param(name: string): string | null {
@@ -39,6 +41,8 @@ export function App() {
   const [busy, setBusy] = useState(false)
   // 步 4 → 步 5 只带一个"用户选了哪个方案"。切步本身一律发 `flow.goto`（step 归宿主）。
   const [planId, setPlanId] = useState<string | null>(null)
+  // 步 8 → 步 9 同理带一个"选了哪个**打击**方案"（步 9 的 `guidance.plan{planId}` 要用它）
+  const [strikePlanId, setStrikePlanId] = useState<string | null>(null)
   const goto = useGoto(send)
 
   const run = useCallback(async (verb: string, params: Record<string, unknown> = {}) => {
@@ -173,6 +177,34 @@ export function App() {
         {step === 7 && (
           <StageOverlay>
             <TargetsScreen state={state} flow={flow} />
+          </StageOverlay>
+        )}
+
+        {/* 步 8 任务决策与打击准备（T5-1）：三张打击方案卡（成功率/协同方式/预计完成时间/
+            方案要点/理由）+ 打击窗口 + 采纳回执。推荐标记只认引擎的 `recommendedId`。 */}
+        {step === 8 && (
+          <StageOverlay>
+            <StrikeScreen
+              state={state}
+              flow={flow}
+              selectedPlanId={strikePlanId}
+              onSelectPlan={setStrikePlanId}
+              onNext={() => goto(9)}
+            />
+          </StageOverlay>
+        )}
+
+        {/* 步 9 打击方案确认（T5-2）：地图上 IP 点高亮 + 引导连线（`MapDraw`，坐标全部取
+            `guidance.plan`）+ 打击窗口时间轴（每段带 basis）+ 确认打击回执逐条显示。 */}
+        {step === 9 && (
+          <StageOverlay>
+            <StrikeConfirmScreen
+              state={state}
+              flow={flow}
+              selectedPlanId={strikePlanId}
+              onSelectPlan={setStrikePlanId}
+              onBack={() => goto(8)}
+            />
           </StageOverlay>
         )}
       </div>
