@@ -1,0 +1,62 @@
+{
+  "schemaVersion": "1.0.0",
+  "note": "打击方案的 IP 点（攻击起点）与评估航线几何。权威归场景数据（业务层宿主层实施方案 §10.1 Q4 变体 A）：scoring/policies/mapapp/planTemplates.json 只写 attackStart.key / assessRoute.key 两个键引用，几何 MUST NOT 双写。坐标与 deployment.json / airspace.json / task-areas.json 同一经纬度框架，altM 与 deployment.json 同为海拔（ASL，米）。场景二按 Q5 不占位：其模板不声明 attackStart/assessRoute，本文件也就不含 ip-s2-* / route-assess-s2-* 键。",
+  "attackStarts": [
+    {
+      "key": "ip-c-west",
+      "name": "IP 点｜C 区西侧攻击起点",
+      "lng": 116.552,
+      "lat": 39.766,
+      "altM": 300
+    },
+    {
+      "key": "ip-c-north",
+      "name": "IP 点｜C 区北侧攻击起点",
+      "lng": 116.548,
+      "lat": 39.774,
+      "altM": 320
+    },
+    {
+      "key": "ip-c-east",
+      "name": "IP 点｜C 区东侧攻击起点",
+      "lng": 116.572,
+      "lat": 39.762,
+      "altM": 350
+    }
+  ],
+  "assessRoutes": [
+    {
+      "key": "route-assess-c-west",
+      "name": "评估航线｜C 区西侧",
+      "waypoints": [
+        [116.556, 39.766],
+        [116.5566, 39.7544],
+        [116.548, 39.756],
+        [116.5528, 39.7442],
+        [116.56, 39.748]
+      ]
+    },
+    {
+      "key": "route-assess-c-north",
+      "name": "评估航线｜C 区北侧",
+      "waypoints": [
+        [116.548, 39.78],
+        [116.554, 39.77],
+        [116.56, 39.766],
+        [116.564, 39.758],
+        [116.556, 39.752]
+      ]
+    },
+    {
+      "key": "route-assess-c-east",
+      "name": "评估航线｜C 区东侧",
+      "waypoints": [
+        [116.578, 39.76],
+        [116.582, 39.7564],
+        [116.574, 39.756],
+        [116.566, 39.748],
+        [116.56, 39.748]
+      ]
+    }
+  ]
+}
