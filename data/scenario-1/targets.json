@@ -1,0 +1,104 @@
+{
+  "schemaVersion": "1.0.0",
+  "note": "5 个目标：3 静止 + 1 动态（沿航线）+ 1 中途出现。typeKey 对齐 entity-ledger 规则包。",
+  "targets": [
+    {
+      "no": 1,
+      "typeKey": "command-node",
+      "name": "机动指挥节点",
+      "motion": "static",
+      "position": [
+        116.542,
+        39.762
+      ],
+      "confidence": 0.92,
+      "features": [
+        "大型设施",
+        "卫星天线",
+        "通信设备"
+      ],
+      "threat": "high",
+      "valueTag": "高价值"
+    },
+    {
+      "no": 2,
+      "typeKey": "air-defense",
+      "name": "防空火力阵地",
+      "motion": "static",
+      "position": [
+        116.552,
+        39.79
+      ],
+      "confidence": 0.85,
+      "features": [
+        "发射阵地",
+        "雷达车"
+      ],
+      "threat": "high"
+    },
+    {
+      "no": 3,
+      "typeKey": "comms-node",
+      "name": "通信保障节点",
+      "motion": "static",
+      "position": [
+        116.534,
+        39.8
+      ],
+      "confidence": 0.78,
+      "features": [
+        "通信设备",
+        "天线阵列"
+      ],
+      "threat": "mid"
+    },
+    {
+      "no": 4,
+      "typeKey": "vehicle-column",
+      "name": "机动运输车队",
+      "motion": "dynamic",
+      "route": [
+        [
+          116.56,
+          39.76
+        ],
+        [
+          116.548,
+          39.768
+        ],
+        [
+          116.536,
+          39.776
+        ],
+        [
+          116.526,
+          39.784
+        ]
+      ],
+      "speedMps": 12,
+      "loop": true,
+      "startOffsetMs": 0,
+      "confidence": 0.7,
+      "features": [
+        "车辆活动"
+      ],
+      "threat": "mid"
+    },
+    {
+      "no": 5,
+      "typeKey": "command-node",
+      "name": "临时指挥点（中途出现）",
+      "motion": "popup",
+      "position": [
+        116.52,
+        39.808
+      ],
+      "startOffsetMs": 60000,
+      "confidence": 0.65,
+      "features": [
+        "临时设施"
+      ],
+      "threat": "low"
+    }
+  ]
+}

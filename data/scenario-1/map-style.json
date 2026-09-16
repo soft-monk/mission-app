@@ -1,0 +1,63 @@
+{
+  "schemaVersion": "1.0.0",
+  "note": "个性化需求 1/2。useIcon=false 或缺 icon.url → 回落画点，不报错。",
+  "drone": {
+    "useIcon": false,
+    "icon": {
+      "url": "/icons/uav-optical.png",
+      "sizePx": [
+        28,
+        28
+      ],
+      "anchor": "center"
+    },
+    "point": {
+      "radiusPx": 5,
+      "color": "#22d3ee",
+      "strokeColor": "#0b1220",
+      "strokeWidthPx": 1
+    },
+    "byType": {
+      "optical": {
+        "point": {
+          "color": "#22d3ee"
+        }
+      },
+      "radar": {
+        "point": {
+          "color": "#f59e0b"
+        }
+      },
+      "electronic": {
+        "point": {
+          "color": "#a855f7"
+        }
+      },
+      "comm": {
+        "point": {
+          "color": "#22c55e"
+        }
+      }
+    }
+  },
+  "track": {
+    "widthPx": 2,
+    "dashed": false,
+    "color": "#38bdf8",
+    "opacity": 0.85
+  },
+  "groupColors": {
+    "recon-1": "#22d3ee",
+    "recon-2": "#22c55e",
+    "radar-1": "#f59e0b",
+    "relay-1": "#22c55e",
+    "ew-1": "#a855f7",
+    "reserve-1": "#8b5cf6"
+  },
+  "target": {
+    "radiusPx": 6,
+    "highColor": "#ef4444",
+    "midColor": "#f59e0b",
+    "lowColor": "#22d3ee"
+  }
+}

@@ -11,6 +11,9 @@ tmp/
 *.accept.log
 accept-*.log
 
+# 验收脚本的临时日志与明细
+scripts/.acceptance-*
+
 # 编辑器
 .vscode/
 .idea/
