@@ -1,10 +1,10 @@
 {
   "schemaVersion": "1.0.0",
-  "note": "5 个目标：3 静止 + 1 动态（沿航线）+ 1 中途出现。typeKey 对齐 entity-ledger 规则包。",
+  "note": "5 个目标：3 静止 + 1 动态（沿航线）+ 1 中途出现。typeKey 与 entity-ledger 规则包 entityTypes.json 的 key **逐字对齐**（cmdNode / airDefSite / commNode / logiUnit）—— 规则包是类型词汇表的唯一权威，场景数据只引用，不得自造。",
   "targets": [
     {
       "no": 1,
-      "typeKey": "command-node",
+      "typeKey": "cmdNode",
       "name": "机动指挥节点",
       "motion": "static",
       "position": [
@@ -22,7 +22,7 @@
     },
     {
       "no": 2,
-      "typeKey": "air-defense",
+      "typeKey": "airDefSite",
       "name": "防空火力阵地",
       "motion": "static",
       "position": [
@@ -38,7 +38,7 @@
     },
     {
       "no": 3,
-      "typeKey": "comms-node",
+      "typeKey": "commNode",
       "name": "通信保障节点",
       "motion": "static",
       "position": [
@@ -54,7 +54,7 @@
     },
     {
       "no": 4,
-      "typeKey": "vehicle-column",
+      "typeKey": "logiUnit",
       "name": "机动运输车队",
       "motion": "dynamic",
       "route": [
@@ -86,7 +86,7 @@
     },
     {
       "no": 5,
-      "typeKey": "command-node",
+      "typeKey": "cmdNode",
       "name": "临时指挥点（中途出现）",
       "motion": "popup",
       "position": [
