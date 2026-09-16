@@ -81,6 +81,22 @@ const evalJs = async (expression) => {
 }
 
 try {
+  // ★ P4 起 `config.json` 的 simAutoStart=false：**"起飞"发生在步 6（任务执行）**，
+  //   打开页面不再自动有遥测。本脚本只验"真链路能从后端流到前端"，所以先显式起飞一次
+  //   （否则 uavCount 恒为 0，页面上一架无人机都没有）。
+  //   注：url 默认是 vite dev server（5190），它只代理 /health /stats /runtime-config /tiles，
+  //   所以命令面要打到后端（MISSION_APP_BACKEND，缺省 8099）。
+  const backend = process.env.MISSION_APP_BACKEND ?? 'http://127.0.0.1:8099'
+  for (const base of [...new Set([URL_, backend])]) {
+    try {
+      const r = await fetch(`${base}/api/command`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ verb: 'sim.start', params: {} }),
+      })
+      if (r.ok && (await r.json())?.code === 0) break
+    } catch { /* 换下一个落点 */ }
+  }
+
   await connect()
   await send('Target.createTarget', { url: 'about:blank' })
   await sleep(400)

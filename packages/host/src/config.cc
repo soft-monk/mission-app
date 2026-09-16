@@ -101,6 +101,8 @@ bool HostConfig::loadFile(const std::string& path, HostConfig& out, std::string&
 
     if (!getString(j, "dataDir", out.dataDir, error)) return false;
     if (!getString(j, "webDist", out.webDist, error)) return false;
+    // 媒体素材根目录：**空 = 不托管**（合法取值，不是错误）；给了就按锚点规则解析。
+    if (!getString(j, "mediaRoot", out.mediaRoot, error)) return false;
 
     const auto& mods = sub(j, "modules", scratch);
     if (!getBool(mods, "hub", out.enableHub, error)) return false;

@@ -13,6 +13,10 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "forceConsistentCasingInFileNames": true,
+    // media-player 的源码用**带 `.ts` 后缀的 import**（它自己的 tsconfig 开了这一项），
+    // 而 Vite 别名是**原地引用它的 src**（见 vite.config.ts）。类型检查要跟构建看同一份源码，
+    // 所以这里也必须打开；`noEmit: true` 已满足该选项的前置条件。
+    "allowImportingTsExtensions": true,
     "types": ["node"],
     "baseUrl": ".",
     "paths": {

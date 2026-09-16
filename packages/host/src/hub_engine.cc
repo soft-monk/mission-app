@@ -1,6 +1,7 @@
 // mission-app · packages/host/src/hub_engine.cc
 #include "ma/hub_engine.h"
 
+#include <chrono>
 #include <utility>
 
 #include <trantor/utils/Logger.h>
@@ -14,9 +15,17 @@ namespace ma {
 
 IngestToHubSink::IngestToHubSink(realtime_hub::RealtimeHub& hub) : hub_(hub) {}
 
+void IngestToHubSink::setFrameTap(FrameTap tap) { tap_ = std::move(tap); }
+
 #if MA_WITH_INGEST
 
 namespace {
+std::int64_t wallClockMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
 /// 一条归一事件 → 一次广播。`data` 原样交给 hub（字段一个不改）。
 /// hub 自己会：校验事件名、打 ts、按当前在线名单投递。
 bool broadcastOne(realtime_hub::RealtimeHub& hub, const device_ingest::IngestEvent& ev) {
@@ -34,6 +43,15 @@ void IngestToHubSink::onEvent(const device_ingest::IngestEvent& ev) {
     } else {
         ++dropped_;
     }
+    // 旁路（只旁听）：步 6 的链路评估要线上真报文。异常一律吞掉 —— 旁路 MUST NOT
+    // 反过来影响广播腿（与模块"Sink 里不抛"的口径一致）。
+    if (tap_) {
+        try {
+            tap_(ev.type, ev.data, wallClockMs());
+            ++tapped_;
+        } catch (...) {
+        }
+    }
 }
 
 void IngestToHubSink::onBatch(const std::vector<device_ingest::IngestEvent>& evs) {
@@ -43,6 +61,13 @@ void IngestToHubSink::onBatch(const std::vector<device_ingest::IngestEvent>& evs
             ++forwarded_;
         } else {
             ++dropped_;
+        }
+        if (tap_) {
+            try {
+                tap_(ev.type, ev.data, wallClockMs());
+                ++tapped_;
+            } catch (...) {
+            }
         }
     }
 }
@@ -164,6 +189,7 @@ nlohmann::json HubEngine::statsJson() const {
         {"dropped", sink_ ? sink_->dropped() : 0},
         {"batches", sink_ ? sink_->batches() : 0},
         {"healthEvents", sink_ ? sink_->healthEvents() : 0},
+        {"tapped", sink_ ? sink_->tapped() : 0},
     };
     return out;
 }

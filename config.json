@@ -14,7 +14,8 @@
 
   "ingest": {
     "enabled": true,
-    "mergeWindowMs": 100,
+    "mergeWindowMs": 0,
+    "note": "mergeWindowMs=0（接入层不合并同设备报文）：步 6 的链路丢包率按报文 seq 断号实测；合并窗会把同一设备的多条报文并成一条，断号率就变成接入层的合并率（实测 0.47）而不是链路丢包 —— 口径不符。>0 时 topology.evaluate 会在 notes 里点名",
     "points": [
       {
         "id": "ingest-uav",
@@ -35,7 +36,10 @@
   "simWireType": "uav",
   "simSpeed": 1,
   "simAutoStart": true,
+  "simAutoStartNote": "true = 启动加载阶段就拉起数据链路。本工程的'链路/集群节点'探针要的是**真实报文与在线设备**，不起仿真源时它们只会停在 50%（启动加载永远完不成、进不了第 2 步）。因此'起飞'属启动阶段，步 6 的控制语义是**暂停/恢复/倍速**。",
   "scenarioDir": "data/scenario-1",
+
+  "mediaRoot": "data/scenario-1/media",
 
   "tiles": {
     "template": "/tiles/{z}/{x}/{y}.jpg",

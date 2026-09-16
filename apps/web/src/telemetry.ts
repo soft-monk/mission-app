@@ -247,6 +247,25 @@ export function connectTelemetry(
     void env
   })
 
+  // 本页只消费 `telemetry.uav.pos`（无人机位姿）；但宿主会广播**已登记**的一整批事件
+  // （P2 起：selfcheck.*/flow.*；P3 起：mission.*/plan.state/resource.*/entity.*/target.state；
+  //  P4 起：sim.state/topology.changed/media.channels…）。它们不是"未知事件"——
+  //  只是**不归这一层消费**（各自有专门的界面/钩子）。不登记的话会被计进 unknownEventTypes，
+  //  验收里"无未知事件类型"那条就会在有任务时报红（属口径问题，不是真的收到了野事件）。
+  // ★ `sys.*` 是保留命名空间：ws-client 自己内部消化（welcome/ping/pong/error），
+  //   订阅它会**抛异常**（"使用方不得占用"）—— 所以这里 MUST NOT 登记它们。
+  for (const type of [
+    'selfcheck.progress', 'selfcheck.ready', 'selfcheck.done', 'flow.state',
+    'mission.phase', 'mission.progress', 'mission.status',
+    'plan.state', 'resource.allocation.changed', 'resource.ledger.changed',
+    'entity.changed', 'target.state', 'entity.consistency',
+    'topology.changed', 'alert.raised', 'alert.updated', 'alert.acked',
+    'report.ready', 'sim.state', 'media.channels',
+    'device.online', 'device.offline', 'device.stats',
+  ]) {
+    channel.on(type, () => { /* 由各自的界面/钩子消费，这里只登记以免被当成未知事件 */ })
+  }
+
   // 未知事件不能静默丢：计数 + 控制台留痕（协议 §9.1）
   channel.onUnknown((env: Envelope) => {
     store.noteUnknown(env.type)

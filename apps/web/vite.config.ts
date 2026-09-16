@@ -58,8 +58,31 @@ function localScenarioData(): Plugin {
   }
 }
 
+/**
+ * 去掉源码 import 里的显式 `.ts` / `.tsx` 扩展名，再交给 Vite 解析。
+ *
+ * 为什么需要它：`media-player` 的源码内部 import 带显式扩展名（`./react/MediaPlayer.tsx`），
+ * 那是为了让 `node tests/unit-test.mjs` 能**直接跑 TS 源码**（Node 的 ESM 解析要求显式扩展名）。
+ * 打包器默认不带 tsconfig 的 `allowImportingTsExtensions` 语义，所以它自己的
+ * `media-player/vite.config.ts` 里也挂着**同一个插件**；本应用用别名原地引用它的 `src`，
+ * 于情于理都得有这一层（否则构建报 `Could not resolve "./react/MediaPlayer.ts"`）。
+ *
+ * 只对"带显式扩展名"的 specifier 生效：本应用自己的相对 import 不带扩展名，不受影响。
+ */
+function stripTsExtension(): Plugin {
+  return {
+    name: 'mission-app-strip-ts-extension',
+    enforce: 'pre',
+    async resolveId(source, importer, options) {
+      if (!/\.tsx?$/.test(source)) return null
+      const stripped = source.replace(/\.tsx?$/, '')
+      return this.resolve(stripped, importer, { ...options, skipSelf: true })
+    },
+  }
+}
+
 export default defineConfig({
-  plugins: [react(), localScenarioData()],
+  plugins: [stripTsExtension(), react(), localScenarioData()],
   resolve: {
     alias: {
       '@': fileURLToPath(new URL('./src', import.meta.url)),

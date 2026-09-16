@@ -64,6 +64,9 @@
 #include "ma/scenario/scenario_dataset.h"
 #include "ma/sim_bridge/sim_bridge.h"
 #endif
+#if MA_WITH_SIM_SOURCE && MA_WITH_INGEST && MA_WITH_SENSOR_MODEL
+#include "ma/sensor_bridge.h"
+#endif
 #ifndef MA_WITH_SIM_SOURCE
 #define MA_WITH_SIM_SOURCE 0
 #endif
@@ -179,6 +182,31 @@ struct Engines {
     /// 仿真 + 接入的读数（/stats 里那两行）。
     nlohmann::json simStatsJson() const;
     nlohmann::json ingestStatsJson() const;
+#endif
+
+#if MA_WITH_SIM_SOURCE && MA_WITH_INGEST && MA_WITH_SENSOR_MODEL
+    // ---------------------------------------------------------------- 传感器探测模型
+    //
+    // 链路的形状（两侧刻意不互相 include，中间这本映射只能由宿主写）：
+    //   sim-source ──SensorPose──▶ SensorBridge（sim_source::ISensorModel）
+    //                              └─▶ sensor_model::SimplifiedSensorModel::sense()
+    //   sim-source ◀─SimObservation─┘        （只有 visible=true 的才回得去）
+    //
+    // `sensorBridge` 由 `loadSimulation` 装配（它才知道场景目录与场景中心）：
+    //   ① 读 `<scenarioDir>/sensors.json` → SpecTable（SensorSpec 的唯一来源）
+    //   ② setSensorModel + setSensorAttachments（**在 init() 之后立即调**：引擎的
+    //      setSensorAttachments 内部会 applyAttachments()，覆盖式生效）
+    std::shared_ptr<ma::sensor_bridge::SensorBridge> sensorBridge;
+    /// 真的挂上去的挂接清单（/stats 与 sensor.status 都要看它，不是"配了没有"）
+    std::vector<sim_source::SensorAttachment> sensorAttachments;
+    std::string sensorNote;
+
+    /// 装配探测模型：读 `<dir>/sensors.json` → 建 SensorBridge → 注入引擎并挂接。
+    ///
+    /// 返回 false 时 `sensorNote` 给出可读原因（**不阻止仿真链路装配**：探测是第 7 步
+    /// 的能力，缺了它前面的步骤照样跑 —— 但账本与 /stats 会如实写成未装配）。
+    bool attachSensorModel(const std::string& dir, const sim_source::SimScenario& neutral,
+                           std::string& error);
 #endif
 
     /// 把就绪状态写进账本（顺序 = 装配顺序）。

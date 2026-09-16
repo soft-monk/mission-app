@@ -9,6 +9,7 @@
 //      启动加载在工作线程里跑，锁的粒度是"每一次问引擎"，不是整段启动。
 #include "ma/flow.h"
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <sstream>
@@ -117,9 +118,25 @@ public:
 // ============================================================================
 
 FlowEngine::FlowEngine(Engines& engines, Registry& reg, const HostConfig& cfg)
-    : engines_(engines), reg_(reg), cfg_(cfg) {}
+    : engines_(engines), reg_(reg), cfg_(cfg) {
+#if MA_WITH_SIM_SOURCE && MA_WITH_INGEST && MA_WITH_SENSOR_MODEL
+    // 探测结果的落账出口：**在这里接线**（装配顺序上 sensorBridge 早于本对象）。
+    // 回调来自仿真驱动线程 —— 见 onDetection 的线程说明（只碰 detectMtx_）。
+    if (engines_.sensorBridge) {
+        engines_.sensorBridge->setDetectionSink(
+            [this](const ma::sensor_bridge::Detection& d) { onDetection(d); });
+        LOG_INFO << "[flow] 探测模型已接线：" << engines_.sensorNote;
+    } else {
+        LOG_WARN << "[flow] 探测模型未装配：" << engines_.sensorNote;
+    }
+#endif
+}
 
 FlowEngine::~FlowEngine() {
+#if MA_WITH_SIM_SOURCE && MA_WITH_INGEST && MA_WITH_SENSOR_MODEL
+    // 先摘回调（driver 已在 engines.stop() 里停掉；这里只是不给"悬空的 this"留机会）
+    if (engines_.sensorBridge) engines_.sensorBridge->setDetectionSink(nullptr);
+#endif
     if (bootThread_.joinable()) bootThread_.join();
 }
 
@@ -516,6 +533,33 @@ nlohmann::json FlowEngine::stateJson() {
 
     out["wsClients"] = clients_ ? clients_() : 0;
 
+    // ---- 步 6–7（P4）：仿真读数 + 媒体通道 + 探测可用性（前端三处都要）----
+    //
+    // 事件面（`sim.state` / `media.channels`）是给"变化时推送"的；/api/state 放一份当前值，
+    // 这样前端刚挂载时不必等下一次事件。
+#if MA_WITH_SIM_SOURCE && MA_WITH_INGEST
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        out["simulation"] = simStateJsonLocked();
+    }
+#endif
+    out["media"] = mediaChannelsJson();
+    {
+        nlohmann::json sen = nlohmann::json::object();
+        sen["available"] = false;
+        sen["note"] = sensorNote();
+#if MA_WITH_SIM_SOURCE && MA_WITH_INGEST && MA_WITH_SENSOR_MODEL
+        if (engines_.sensorBridge) {
+            sen["available"] = true;
+            sen["enabled"] = engines_.sensorBridge->enabled();
+            sen["rangeScale"] = engines_.sensorBridge->rangeScale();
+            sen["attachments"] = static_cast<int>(engines_.sensorAttachments.size());
+            sen["note"] = engines_.sensorNote;
+        }
+#endif
+        out["sensor"] = std::move(sen);
+    }
+
     // 能力快照（真实读数）：前端做演示与排障都要看它
     if (capabilityProbe_) {
         try {
@@ -910,6 +954,17 @@ void FlowEngine::resetMissionLocked() {
     lastPlanRecommendation_.clear();
     lastPlanRecommendedPercent_ = 0;
     step_ = 1;
+    // 步 6–7（P4）：探测落账的当前任务也要跟着清（否则探测结果会落到旧任务名下）；
+    // 拓扑装配标记同样复位（新任务 = 新拓扑；不 reset 会沿用上一轮的链路状态）。
+    {
+        std::lock_guard<std::mutex> dl(detectMtx_);
+        detectMissionId_.clear();
+        detectEntityOf_.clear();
+    }
+    topologyReady_ = false;
+    topologyMissionId_.clear();
+    topologyLinkTo_.clear();
+    simAutoStarted_ = false;
 }
 
 FlowEngine::PhaseView FlowEngine::phaseViewLocked() const {    PhaseView v;
@@ -951,8 +1006,925 @@ nlohmann::json FlowEngine::ledgerSnapshotLocked() const {
     return nlohmann::json::object();
 }
 
-nlohmann::json FlowEngine::command(const std::string& verb, const nlohmann::json& params) {
-    if (verb.empty()) return badRequest(verb, "缺少 verb");
+// ============================================================================
+// 步 6–7（P4）：仿真节拍 / 探测落账 / 链路评估 / 覆盖率
+// ============================================================================
+//
+// 三条贯穿这段代码的口径：
+//   ① **读数全部来自引擎**：running/paused/speed/simElapsedMs 来自 `Driver` 与 `Metrics`；
+//      覆盖率/遍历周期来自 `sensor_model::cover/revisitPeriodMs`；链路状态来自 topology 的
+//      `linkQualities()` + 规则包 linkThresholds.json 的 states/hysteresis（原样回执）。
+//   ② **线程纪律**：仿真驱动在它自己的线程里跑（Driver），探测回调在**驱动线程**里进来，
+//      线上报文在**接入层线程**里进来。前者只碰 `detectMtx_`，后者只入队；
+//      所有引擎调用仍然只在命令线程、`mtx_` 之下发生。
+//   ③ **不编数**：任何拿不到的输入留空并在 `notes` 里点名（本层从 P3 起就守这条）。
+
+#if MA_WITH_SIM_SOURCE && MA_WITH_INGEST
+
+nlohmann::json FlowEngine::simStateJsonLocked() const {
+    // 冻结形状（流程接口冻结 §1）：{running, speed, simElapsedMs, platforms, emitted}
+    // 取值逐项来自引擎：Driver::running/paused + SimSource::metrics()/capabilities()。
+    nlohmann::json d = nlohmann::json::object();
+    d["running"] = false;
+    d["paused"] = false;
+    d["speed"] = 1;
+    d["simElapsedMs"] = 0;
+    d["platforms"] = 0;
+    d["emitted"] = 0;
+    if (!engines_.bridge.engine) {
+        d["note"] = "仿真源未装配（sim-source / 接入层未编译进来）";
+        return d;
+    }
+    const sim_source::Metrics m = engines_.bridge.engine->metrics();
+    const sim_source::Capabilities cap = engines_.bridge.engine->capabilities();
+    d["running"] = engines_.bridge.driver != nullptr && engines_.bridge.driver->running();
+    d["paused"] = cap.paused;
+    d["speed"] = cap.speedMultiplier;
+    d["simElapsedMs"] = m.simElapsedMs;
+    d["platforms"] = cap.platforms;
+    d["emitted"] = m.eventsEmitted;
+    // 排障/自证用的扩展读数（前端只用上面那五个键；多出来的键不改语义）
+    d["ticks"] = m.ticks;
+    d["steps"] = m.steps;
+    d["observations"] = m.observationsEmitted;
+    d["sensorCalls"] = m.sensorCalls;
+    d["sensorErrors"] = m.sensorErrors;
+    d["pausedMs"] = m.pausedMs;
+    d["popupSpawned"] = m.popupSpawned;
+    d["arrivals"] = m.arrivals;
+    d["scenarioKey"] = cap.scenarioKey;
+    d["source"] = "sim_source::Metrics + Capabilities（宿主只搬运）";
+    return d;
+}
+
+void FlowEngine::broadcastSimState() {
+    if (!broadcast_) return;
+    broadcast_("sim.state", simStateJsonLocked());
+}
+
+nlohmann::json FlowEngine::autoStartSimLocked() {
+    nlohmann::json d = nlohmann::json::object();
+    d["autoStart"] = true;
+    d["requested"] = true;
+    if (!engines_.bridge.engine || !engines_.bridge.driver) {
+        d["started"] = false;
+        d["reason"] = "仿真源未装配（sim-source / 接入层未编译进来）";
+        return d;
+    }
+    if (engines_.bridge.driver->running() && !engines_.bridge.driver->paused()) {
+        d["started"] = false;
+        d["idempotent"] = true;
+        d["reason"] = "仿真节拍已在运行（自动起飞幂等命中）";
+        d["state"] = simStateJsonLocked();
+        return d;
+    }
+    // "起飞" = 让仿真时间开始走：没起线程就起线程；起了但引擎处于暂停 → 恢复
+    // （否则会出现"start 调用成功、时间却一动不动"的假成功）。
+    std::string action;
+    if (!engines_.bridge.driver->running()) {
+        engines_.bridge.driver->primeNow();   // 先对齐时钟基线（首 tick 只记基线）
+        engines_.bridge.driver->start();
+        d["started"] = true;
+        action = "start";
+    }
+    if (engines_.bridge.driver->paused()) {
+        engines_.bridge.driver->resume();
+        d["resumed"] = true;
+        action = action.empty() ? "resume" : (action + "+resume");
+    }
+    simAutoStarted_ = true;
+    d["started"] = true;
+    d["action"] = action;
+    d["note"] = "已自动起飞：流程进入步 6（任务执行）→ 宿主调 Driver 让仿真时间开始走";
+    d["state"] = simStateJsonLocked();
+    return d;
+}
+
+#endif  // MA_WITH_SIM_SOURCE && MA_WITH_INGEST
+
+// ---------------------------------------------------------------- 线上报文入队
+
+void FlowEngine::onWireEvent(const std::string& type, const nlohmann::json& data, int64_t recvAtMs) {
+    (void)type;  // 事件名不参与形状判定：认的是"这行报文里有没有 uavId"（线格式的事实）
+    if (!data.is_object()) return;
+    const auto it = data.find("uavId");
+    if (it == data.end() || !it->is_string()) return;
+    const std::string deviceId = it->get<std::string>();
+    if (deviceId.empty()) return;
+
+    int64_t seq = -1;
+    {
+        const auto s = data.find("seq");
+        if (s != data.end() && s->is_number_integer()) seq = s->get<int64_t>();
+    }
+    int64_t simTs = 0;
+    {
+        const auto s = data.find("ts");
+        if (s != data.end() && s->is_number_integer()) simTs = s->get<int64_t>();
+    }
+    const std::size_t bytes = data.dump().size();
+
+    // **逐链路累加**（不做队列：队列溢出会把宿主自己的丢帧算成链路丢包，实测踩过）。
+    std::lock_guard<std::mutex> lk(wireMtx_);
+    ++wireTotal_;
+    WireAgg& a = wireAgg_[deviceId];
+    if (a.frames == 0) {
+        a.deviceType = data.value("type", std::string());
+        a.groupId = data.value("groupId", std::string());
+        a.firstMs = recvAtMs;
+    }
+    a.frames += 1;
+    a.bytes += static_cast<int64_t>(bytes);
+    if (recvAtMs > a.lastMs) a.lastMs = recvAtMs;
+    if (seq >= 0) {
+        if (a.lastSeq >= 0 && seq > a.lastSeq + 1) a.gaps += (seq - a.lastSeq - 1);
+        if (seq > a.lastSeq) a.lastSeq = seq;
+    }
+    a.simTs = simTs;
+}
+
+#if MA_WITH_SIM_SOURCE && MA_WITH_INGEST && MA_WITH_SENSOR_MODEL
+
+// ---------------------------------------------------------------- 探测 → 台账
+
+std::map<std::string, std::string> FlowEngine::targetTypeKeysLocked() const {
+    std::map<std::string, std::string> out;
+#if MA_WITH_SIM_SOURCE && MA_WITH_INGEST
+    // 场景数据是**唯一**的 id → typeKey 来源（typeKey 必须是规则包 entityTypes.json 的词汇）
+    for (const auto& t : engines_.scenarioData.targets) out[t.id] = t.typeKey;
+#endif
+    return out;
+}
+
+void FlowEngine::onDetection(const ma::sensor_bridge::Detection& d) {
+    // ★ 本函数在**仿真驱动线程**里跑（Driver 持有自己的锁时回调进来）：
+    //   只碰 detectMtx_ 与 entity-ledger（后者自带可重入锁），MUST NOT 取 mtx_。
+#if MA_WITH_LEDGER
+    if (d.targetId.empty()) return;
+    std::string mission;
+    {
+        std::lock_guard<std::mutex> lk(detectMtx_);
+        mission = detectMissionId_;
+    }
+    if (mission.empty()) {
+        std::lock_guard<std::mutex> lk(detectMtx_);
+        ++detectNoMission_;
+        return;
+    }
+    if (d.targetTypeKey.empty()) {
+        // 场景数据没给这个实体的 typeKey → 规则包的词汇表对不上，引擎会以 1000 拒。
+        // 宿主 MUST NOT 自造 typeKey（那是规则包的事）→ 如实计数并把原话记下来。
+        std::lock_guard<std::mutex> lk(detectMtx_);
+        ++detectFailed_;
+        detectLastError_ = "探测到的实体 id=" + d.targetId +
+                           " 在场景 targets 里找不到 typeKey（宿主不自造类型键）";
+        return;
+    }
+    if (!engines_.entityLedger) return;
+
+    const std::string key = mission + "/" + d.targetId;
+    std::string known;
+    {
+        std::lock_guard<std::mutex> lk(detectMtx_);
+        const auto it = detectEntityOf_.find(key);
+        if (it != detectEntityOf_.end()) known = it->second;
+    }
+
+    auto build = [&](const std::string& sourceKey) {
+        entity_ledger::RegisterInput ri;
+        ri.missionId = mission;
+        ri.typeKey = d.targetTypeKey;
+        ri.lng = d.lng;
+        ri.lat = d.lat;
+        ri.alt = d.altM;
+        ri.confidence = d.confidence;   // = 模型算的概率（宿主不改这个数）
+        ri.obsKey = d.targetId;         // 去重主键 = 被探测实体的 id（多传感器 → 归并）
+        ri.operatorId = "host:sensor.detect";
+        if (!sourceKey.empty()) {
+            entity_ledger::SourceObs so;
+            so.source = sourceKey;      // 观测来源 = 传感器类别（规则包 confidence.sources 的键）
+            so.obsKey = d.targetId;
+            so.confidence = d.confidence;
+            so.at = d.ts;
+            ri.sources.push_back(so);
+        }
+        nlohmann::json attrs = {{"sensorId", d.sensorId},
+                                {"sensorClass", d.sensorClass},
+                                {"detectedBy", d.platformId},
+                                {"probability", d.confidence},
+                                {"distanceM", d.distanceM},
+                                {"azimuthDeg", d.azimuthDeg},
+                                {"elevationDeg", d.elevationDeg},
+                                {"detectTs", d.ts},
+                                {"detectKind", "sensor.detect"},
+                                {"targetName", d.targetName},
+                                {"targetNo", d.targetNo}};
+        if (d.hasRevisit) attrs["revisitPeriodMs"] = d.revisitPeriodMs;
+        attrs["factors"] = d.factors;
+        ri.attributes = attrs;
+        return ri;
+    };
+
+    entity_ledger::RegisterResult rr =
+        engines_.entityLedger->registerEntity(build(d.sensorClass));
+    if (rr.code == 1000 && std::string(rr.message).find("observation source") != std::string::npos) {
+        // 观测来源键必须出现在规则包 confidence.sources 里；不认识就回落规则包默认源
+        // （引擎的 defaultSource）并把这次回落记下来 —— 宿主不自己判"该算哪个源"。
+        {
+            std::lock_guard<std::mutex> lk(detectMtx_);
+            ++detectSourceFallback_;
+        }
+        rr = engines_.entityLedger->registerEntity(build(std::string()));
+    }
+    if (rr.code != 0) {
+        std::lock_guard<std::mutex> lk(detectMtx_);
+        ++detectFailed_;
+        detectLastError_ = "registerEntity code=" + std::to_string(rr.code) + "：" + rr.message;
+        return;
+    }
+
+    std::string entityId = rr.data.id;
+    bool rebound = false;
+    if (rr.created && !known.empty() && known != entityId) {
+        // 引擎的保守去重要求**全部去重键**命中（obsKey + typeKey + space≤300 m）。目标移动
+        // 超过空间半径时它会新建实体并标 candidates —— 用引擎自己的 mergeEntities 并回主实体
+        // （宿主不直接改台账）。
+        const entity_ledger::RegisterResult mr =
+            engines_.entityLedger->mergeEntities(known, {entityId}, "host:sensor.detect");
+        if (mr.code == 0) {
+            rebound = true;
+            entityId = known;
+        } else {
+            std::lock_guard<std::mutex> lk(detectMtx_);
+            detectLastError_ = "mergeEntities code=" + std::to_string(mr.code) + "：" + mr.message;
+        }
+    }
+
+    nlohmann::json row = nlohmann::json::object();
+    row["missionId"] = mission;
+    row["targetId"] = d.targetId;
+    row["entityId"] = entityId;
+    row["no"] = rr.data.no;
+    row["typeKey"] = d.targetTypeKey;
+    row["status"] = rr.status;          // created / merged
+    row["created"] = rr.created;
+    row["merged"] = rr.merged;
+    row["rebound"] = rebound;
+    row["confidence"] = d.confidence;
+    row["sensorId"] = d.sensorId;
+    row["platformId"] = d.platformId;
+    row["sensorClass"] = d.sensorClass;
+    row["distanceM"] = d.distanceM;
+    row["probability"] = d.confidence;
+    row["ts"] = d.ts;
+    {
+        std::lock_guard<std::mutex> lk(detectMtx_);
+        if (rebound) {
+            ++detectRebound_;
+        } else if (rr.created) {
+            ++detectRegistered_;
+        } else {
+            ++detectMerged_;
+        }
+        detectEntityOf_[key] = entityId;
+        detectLast_ = row;
+    }
+#else
+    (void)d;
+#endif  // MA_WITH_LEDGER
+}
+
+#endif  // MA_WITH_SIM_SOURCE && MA_WITH_INGEST && MA_WITH_SENSOR_MODEL
+
+// ---------------------------------------------------------------- 媒体通道
+//
+// §D.3 第 3 步：把 `{channels:[{id,name,kind,url|frames,frameIntervalMs}]}` 交给前端。
+// 通道**从磁盘扫出来**（不是写死的清单）：`<mediaRoot>/<子目录>/` 里的图片序列 =
+// 一条 `image-seq` 通道（frames 是 URL 数组）；`<mediaRoot>` 下的视频文件 = `video` 通道。
+// 空目录/不存在的文件 → 该通道 available=false 并把原因写进 note（不假装有素材）。
+nlohmann::json FlowEngine::mediaChannelsJson(bool refresh) const {
+    if (!refresh) {
+        std::lock_guard<std::mutex> lk(mediaMtx_);
+        if (mediaCached_) return mediaCache_;
+    }
+    nlohmann::json out = nlohmann::json::object();
+    nlohmann::json channels = nlohmann::json::array();
+    nlohmann::json notes = nlohmann::json::array();
+    namespace fs = std::filesystem;
+
+    const std::string root = cfg_.mediaRoot.empty() ? std::string() : cfg_.resolvePath(cfg_.mediaRoot);
+    out["root"] = root;
+    const bool hosted = !root.empty() && fs::is_directory(root);
+    out["hosted"] = hosted;
+    out["basePath"] = "/media";
+    if (root.empty()) {
+        notes.push_back("config.json 的 mediaRoot 为空 → /media/** 不托管、通道清单为空");
+        out["channels"] = std::move(channels);
+        out["notes"] = std::move(notes);
+        return out;
+    }
+    if (!hosted) {
+        notes.push_back("mediaRoot 不是目录（不存在？）：" + root + " → 通道清单为空");
+        out["channels"] = std::move(channels);
+        out["notes"] = std::move(notes);
+        return out;
+    }
+
+    const auto isImage = [](const std::string& ext) {
+        return ext == ".jpg" || ext == ".jpeg" || ext == ".png";
+    };
+    const auto isVideo = [](const std::string& ext) {
+        return ext == ".mp4" || ext == ".webm" || ext == ".m4v";
+    };
+
+    std::error_code ec;
+    std::vector<fs::path> dirs;
+    std::vector<fs::path> files;
+    for (const auto& e : fs::directory_iterator(root, ec)) {
+        if (e.is_directory()) {
+            dirs.push_back(e.path());
+        } else if (e.is_regular_file() && isVideo(e.path().extension().string())) {
+            files.push_back(e.path());
+        }
+    }
+    std::sort(dirs.begin(), dirs.end());
+    std::sort(files.begin(), files.end());
+
+    for (const auto& dir : dirs) {
+        std::vector<std::string> frames;
+        for (const auto& e : fs::directory_iterator(dir, ec)) {
+            if (!e.is_regular_file()) continue;
+            if (!isImage(e.path().extension().string())) continue;
+            const std::string rel = (dir.filename() / e.path().filename()).generic_string();
+            frames.push_back("/media/" + rel);
+        }
+        std::sort(frames.begin(), frames.end());
+        nlohmann::json ch = nlohmann::json::object();
+        ch["id"] = dir.filename().generic_string();
+        ch["name"] = dir.filename().generic_string();
+        ch["kind"] = "image-seq";
+        ch["frames"] = frames;
+        ch["frameCount"] = static_cast<int>(frames.size());
+        ch["frameIntervalMs"] = 200;  // media-player 的 defaultFrameIntervalMs（常量，不是编的读数）
+        ch["url"] = nullptr;
+        ch["available"] = !frames.empty();
+        if (frames.empty()) {
+            ch["unavailableReason"] = "目录里没有 .jpg/.png 帧";
+        }
+        ch["sourceLabel"] = "本地占位素材（" + dir.filename().generic_string() + "/*.jpg）";
+        channels.push_back(std::move(ch));
+    }
+    for (const auto& f : files) {
+        nlohmann::json ch = nlohmann::json::object();
+        ch["id"] = f.stem().generic_string();
+        ch["name"] = f.stem().generic_string();
+        ch["kind"] = "video";
+        ch["url"] = "/media/" + f.filename().generic_string();
+        ch["frames"] = nullptr;
+        ch["frameCount"] = 0;
+        ch["frameIntervalMs"] = 0;
+        ch["available"] = true;
+        ch["sourceLabel"] = "本地占位素材（" + f.filename().generic_string() + "）";
+        channels.push_back(std::move(ch));
+    }
+
+    if (channels.empty()) {
+        notes.push_back("mediaRoot 下没有可用的通道（既没有图片序列子目录，也没有视频文件）：" + root);
+    } else {
+        notes.push_back("通道清单由宿主扫盘得到（image-seq = 子目录内的帧序列；video = 视频文件），"
+                        "frameIntervalMs 用 media-player 的 defaultFrameIntervalMs=200");
+    }
+    notes.push_back("字节流走 /media/**（支持 Range/206/Content-Range/416；不存在 → 404）；"
+                    "媒体引擎是 npm 包，宿主不引入 C++ 侧依赖");
+    out["channels"] = std::move(channels);
+    out["notes"] = std::move(notes);
+    {
+        std::lock_guard<std::mutex> lk(mediaMtx_);
+        mediaCache_ = out;
+        mediaCached_ = true;
+    }
+    return out;
+}
+
+void FlowEngine::broadcastMediaChannels() {
+    if (!broadcast_) return;
+    broadcast_("media.channels", mediaChannelsJson());
+}
+
+std::string FlowEngine::sensorNote() const {
+#if MA_WITH_SIM_SOURCE && MA_WITH_INGEST && MA_WITH_SENSOR_MODEL
+    if (engines_.sensorBridge) return engines_.sensorNote;
+    return engines_.sensorNote.empty() ? std::string("探测模型未装配") : engines_.sensorNote;
+#else
+    return "探测模型未装配（编译期 MA_WITH_SENSOR_MODEL=0）";
+#endif
+}
+
+// ---------------------------------------------------------------- 链路评估（topology）
+
+#if MA_WITH_TOPOLOGY && MA_WITH_SIM_SOURCE && MA_WITH_INGEST
+
+nlohmann::json FlowEngine::ensureTopologyLocked() {
+    nlohmann::json out = nlohmann::json::object();
+    out["configured"] = false;
+    out["reused"] = false;
+    out["nodes"] = 0;
+    out["edges"] = 0;
+    if (!engines_.topologyEngine) {
+        out["code"] = 1005;
+        out["message"] = "topology 未装配（编译期 MA_WITH_TOPOLOGY=0）";
+        return out;
+    }
+    // 已经装配过（同一次任务）→ **不重建**：`configureTopology(reset=true)` 会清掉链路样本
+    // 与状态机（状态是带迟滞的，重建等于把观测历史抹掉）。
+    if (topologyReady_ && topologyMissionId_ == missionId_) {
+        const topology::ValidationReport vr = engines_.topologyEngine->validate();
+        const topology::TopologyView tv = engines_.topologyEngine->topologyView();
+        out["configured"] = true;
+        out["reused"] = true;
+        out["topologyId"] = tv.topologyId;
+        out["structureKey"] = tv.structureKey;
+        out["nodes"] = static_cast<int>(tv.nodes.size());
+        out["edges"] = static_cast<int>(tv.edges.size());
+        out["validate"] = nlohmann::json::parse(vr.toJson().dump());
+        out["linkTo"] = topologyLinkTo_;
+        return out;
+    }
+
+    // ---- 结构键：**从规则包里挑**（不写死）——优先声明为 mesh 的那个 ----
+    std::string structureKey;
+    {
+        const auto pol = engines_.topologyEngine->policy();
+        if (pol.has_value()) {
+            for (const auto& st : pol->structures) {
+                if (st.mode == topology::StructureMode::Mesh) {
+                    structureKey = st.key;
+                    break;
+                }
+            }
+            if (structureKey.empty() && !pol->structures.empty()) {
+                structureKey = pol->structures.front().key;
+            }
+        }
+    }
+    if (structureKey.empty()) structureKey = "mesh";
+
+    const topology::MutationResult cfg =
+        engines_.topologyEngine->configureTopology("mission-map", structureKey, true);
+    out["configure"] = nlohmann::json::parse(cfg.toJson().dump());
+    if (cfg.code != 0) {
+        out["code"] = cfg.code;
+        out["message"] = cfg.message;
+        return out;
+    }
+
+    // ---- 节点/边：**全部按场景数据**（deployment.json 的 aircraft[] 与 groups[]）----
+    //
+    // 节点类型键取自规则包 linkThresholds.json 的 items（cloud/edge/forward/cluster）：
+    //   编组 → cluster（规则包自己声明 graphic=cluster、tier=2）
+    //   平台 → edge（tier=1 的边缘节点）
+    // 这本"场景概念 → 规则词汇"的映射是宿主的事（两个仓互不认识），映射规则写在这里可复核；
+    // 引擎的 `validate()` 结论原样回执（有没有问题由引擎说）。
+    nlohmann::json notes = nlohmann::json::array();
+    std::vector<topology::NodeSpec> nodes;
+    std::vector<topology::EdgeSpec> edges;
+    topologyLinkTo_.clear();
+    nlohmann::json edgeRows = nlohmann::json::array();
+
+    const auto& sd = engines_.scenarioData;
+    auto platformRows = platformsOf(engines_);
+
+    // 编组节点：坐标 = 组内平台站位的均值（场景数据算出来的，不是画上去的）
+    for (const auto& g : sd.groups) {
+        double sx = 0, sy = 0;
+        int n = 0;
+        for (const auto& p : platformRows) {
+            if (p.groupKey != g.key) continue;
+            sx += p.lng;
+            sy += p.lat;
+            ++n;
+        }
+        topology::NodeSpec node;
+        node.id = "grp:" + g.key;
+        node.typeKey = "cluster";
+        node.name = g.name;
+        node.clusterId = g.key;
+        node.hasPosition = (n > 0);
+        if (n > 0) {
+            node.lng = sx / n;
+            node.lat = sy / n;
+        }
+        nodes.push_back(node);
+    }
+    // 平台节点 + 平台→编组 的边（链路 id = 平台 deviceId：线上报文里的 uavId 直接就是它）
+    for (const auto& p : platformRows) {
+        topology::NodeSpec node;
+        node.id = p.deviceId;
+        node.typeKey = "edge";
+        node.name = p.deviceId + "（" + p.model + "）";
+        node.clusterId = p.groupKey;
+        node.lng = p.lng;
+        node.lat = p.lat;
+        node.hasPosition = true;
+        nodes.push_back(node);
+
+        if (p.groupKey.empty()) continue;
+        topology::EdgeSpec e;
+        e.id = p.deviceId;
+        e.from = p.deviceId;
+        e.to = "grp:" + p.groupKey;
+        edges.push_back(e);
+        topologyLinkTo_[e.id] = e.to;
+        edgeRows.push_back({{"id", e.id},
+                            {"from", e.from},
+                            {"to", e.to},
+                            {"kind", "platform-group"},
+                            {"deviceType", p.model}});
+    }
+    // 中继关系：comm 机型（deviceTypes.json 自述"中继/组网"）→ 其它编组节点。
+    // 只做场景/规则包**已经声明**的关系，不猜拓扑形状。
+    for (const auto& p : platformRows) {
+        if (p.model != "comm") continue;
+        for (const auto& g : sd.groups) {
+            if (g.key == p.groupKey) continue;
+            topology::EdgeSpec e;
+            e.id = "relay:" + p.deviceId + "->" + g.key;
+            e.from = p.deviceId;
+            e.to = "grp:" + g.key;
+            edges.push_back(e);
+            edgeRows.push_back({{"id", e.id},
+                                {"from", e.from},
+                                {"to", e.to},
+                                {"kind", "relay"},
+                                {"deviceType", p.model}});
+        }
+    }
+
+    const topology::MutationResult nr = engines_.topologyEngine->addNodes(nodes);
+    const topology::MutationResult er = engines_.topologyEngine->addEdges(edges);
+    out["addNodes"] = nlohmann::json::parse(nr.toJson().dump());
+    out["addEdges"] = nlohmann::json::parse(er.toJson().dump());
+    const topology::ValidationReport vr = engines_.topologyEngine->validate();
+    out["validate"] = nlohmann::json::parse(vr.toJson().dump());
+
+    notes.push_back("节点/边来自场景数据：groups[] → cluster 节点（坐标 = 组内站位均值）；"
+                    "aircraft[] → edge 节点 + 「平台→所属编组」边（链路 id = deviceId，"
+                    "与线上报文的 uavId 同一口径）；comm 机型（deviceTypes.json 自述中继/组网）"
+                    "→ 其它编组的 relay 边");
+    notes.push_back("节点类型键取自规则包 linkThresholds.json 的 items（cluster/edge）；"
+                    "场景概念 → 规则词汇的映射写在宿主，引擎的 validate() 结论原样回执");
+    if (!vr.issues.empty()) {
+        notes.push_back("validate() 报了 " + std::to_string(vr.issues.size()) + " 条问题（见 validate）");
+    }
+
+    topologyReady_ = (nr.code == 0 && er.code == 0);
+    topologyMissionId_ = missionId_;
+    out["configured"] = topologyReady_;
+    out["structureKey"] = structureKey;
+    out["topologyId"] = "mission-map";
+    out["nodes"] = static_cast<int>(nodes.size());
+    out["edges"] = static_cast<int>(edges.size());
+    out["edgeDetail"] = std::move(edgeRows);
+    out["linkTo"] = topologyLinkTo_;
+    out["notes"] = std::move(notes);
+    return out;
+}
+
+nlohmann::json FlowEngine::toTopologyEvents(const std::map<std::string, WireAgg>& agg,
+                                            nlohmann::json& notes) const {
+    // 线上报文 → topology 的 ingest 形状（`{linkId, ts, 指标…}`）。**只做形状转换**：
+    //
+    //   指标：只投**真的量得到、且口径对得上**的那一项
+    //     · lossRate = 断号数 ÷ (断号数 + 实收帧数) —— 由报文自带的 seq 连续性实测
+    //   （为什么不投 bandwidthMbps：实测吞吐是"本应用此刻发了多少"，不是链路的**标称带宽**；
+    //    把 ~0.01 Mbps 的遥测速率塞进量程 0–200 Mbps 的"带宽"指标，只会让规则包把一条
+    //    零丢包的链路判成红 —— 口径不符，所以留空并在 notes 里点名。数字仍然实测、仍可查，
+    //    只是不进评分：见回执 metricDetail 的 bytes/spanMs/throughputMbps。）
+    //   时间：ts = **到货挂钟**（topology 的窗口/迟滞都以它为准；报文里的 ts 是仿真时间，
+    //         60 倍速下与挂钟不同基准，拿它当 ts 会把样本立刻挤出窗口）。
+    nlohmann::json events = nlohmann::json::array();
+    nlohmann::json detail = nlohmann::json::array();
+    int64_t unmapped = 0;
+    for (const auto& kv : agg) {
+        const WireAgg& a = kv.second;
+        if (topologyLinkTo_.find(kv.first) == topologyLinkTo_.end()) {
+            ++unmapped;  // 不是本拓扑里的链路（例如非平台设备）→ 不投
+            continue;
+        }
+        const int64_t total = a.frames + a.gaps;
+        const double lossRate = total > 0 ? static_cast<double>(a.gaps) / static_cast<double>(total)
+                                          : 0.0;
+        const int64_t spanMs = std::max<int64_t>(a.lastMs - a.firstMs, 1);
+        const double throughputMbps =
+            static_cast<double>(a.bytes) * 8.0 / (static_cast<double>(spanMs) / 1000.0) / 1e6;
+
+        nlohmann::json ev = nlohmann::json::object();
+        ev["linkId"] = kv.first;
+        ev["ts"] = a.lastMs;
+        ev["from"] = kv.first;
+        ev["to"] = topologyLinkTo_.at(kv.first);
+        ev["lossRate"] = lossRate;
+        events.push_back(ev);
+
+        detail.push_back({{"linkId", kv.first},
+                          {"frames", a.frames},
+                          {"gaps", a.gaps},
+                          {"bytes", a.bytes},
+                          {"spanMs", spanMs},
+                          {"lossRate", lossRate},
+                          {"throughputMbps", throughputMbps},
+                          {"ingested", nlohmann::json::array({"lossRate"})},
+                          {"notIngested", nlohmann::json::array({"bandwidthMbps"})},
+                          {"deviceType", a.deviceType},
+                          {"groupId", a.groupId},
+                          {"lastSimTs", a.simTs}});
+    }
+
+    notes.push_back("ingest 只投**实测且口径对得上**的 lossRate（报文 seq 断号 ÷ 总数）；"
+                    "吞吐（bytes/spanMs）作为事实留在 metricDetail 里，但**不投** bandwidthMbps "
+                    "—— 实测吞吐不是标称带宽，投进去会让规则包把零丢包的链路判红");
+    notes.push_back("lossRate 的口径要求接入层**不合并**报文（config.json 的 "
+                    "ingest.mergeWindowMs=0）：合并窗会把同一设备的多条报文并成一条，"
+                    "seq 断号率随之变成【接入层合并率】（实测 0.47）而不是链路丢包 —— "
+                    "本宿主不做这种张冠李戴");
+    notes.push_back("留空未投的指标：signal（本工程没有射频测量源；规则包 valueMap 的 "
+                    "strong/medium/weak 没有对应读数）、latencyMs（接入层不记录到货时延；"
+                    "报文 ts 是仿真时间，60 倍速下与挂钟不可比）、bandwidthMbps（见上）、"
+                    "coverageKm2（链路级覆盖无实测源；传感器覆盖在 sensor.status 里，"
+                    "MUST NOT 挪来当链路指标）、nodeLoad/cacheAvailable/cacheTotal（无来源）。"
+                    "引擎对缺字段的口径是 preserved（保持原值），不是补 0");
+    if (unmapped > 0) {
+        notes.push_back("有 " + std::to_string(unmapped) +
+                        " 个设备不属于本拓扑的任何链路（未投递）：线格式里的 deviceId 必须在"
+                        "「平台→编组」边集合里");
+    }
+    return nlohmann::json{{"events", events}, {"detail", detail}};
+}
+
+#else  // 未装配 topology / 场景数据 / 接入层：两个 helper 仍要存在（verb 分派引用它们）
+
+nlohmann::json FlowEngine::ensureTopologyLocked() {
+    return nlohmann::json{{"configured", false},
+                          {"code", 1005},
+                          {"message", "topology 或场景数据未装配（编译期开关关闭）"}};
+}
+
+nlohmann::json FlowEngine::toTopologyEvents(const std::vector<WireFrame>& frames,
+                                            nlohmann::json& notes) const {
+    (void)frames;
+    notes.push_back("拓扑/场景数据未装配：线上报文不投递");
+    return nlohmann::json{{"events", nlohmann::json::array()},
+                          {"detail", nlohmann::json::array()}};
+}
+
+#endif  // MA_WITH_TOPOLOGY && MA_WITH_SIM_SOURCE && MA_WITH_INGEST
+
+// ---------------------------------------------------------------- 覆盖率 / 遍历周期
+
+nlohmann::json FlowEngine::sensorStatusLocked() {
+    // 覆盖率的每一平方米、遍历周期的每一毫秒都来自 `sensor_model`：
+    //   `cover(PlatformPose, SensorSpec, nowMs, occluders, sensorSensitivity)`
+    //   `revisitPeriodMs(SensorSpec)`
+    // 宿主只做三件事：① 取平台的**实时位姿**（sim-source 的 EntityStatus）；
+    //                 ② lng/lat → 局部平面米（GeoRef）；③ 汇总（口径写在 notes 里）。
+    nlohmann::json out = nlohmann::json::object();
+    nlohmann::json notes = nlohmann::json::array();
+    nlohmann::json rows = nlohmann::json::array();
+    out["available"] = false;
+#if MA_WITH_SIM_SOURCE && MA_WITH_INGEST && MA_WITH_SENSOR_MODEL
+    if (!engines_.sensorBridge) {
+        out["message"] = sensorNote();
+        notes.push_back("探测模型未装配：" + sensorNote());
+        out["sensors"] = std::move(rows);
+        out["notes"] = std::move(notes);
+        return out;
+    }
+    auto& bridge = *engines_.sensorBridge;
+    const ma::sensor_bridge::GeoRef& ref = bridge.geoRef();
+    const auto& sd = engines_.scenarioData;
+    const int64_t simNow =
+        engines_.bridge.driver ? engines_.bridge.driver->metrics().simElapsedMs : 0;
+
+    double sumAreaM2 = 0.0;
+    double sumSensitiveM2 = 0.0;
+    int withSpec = 0;
+    double revMin = 0, revMax = 0, revSum = 0;
+    int revN = 0;
+    nlohmann::json byType = nlohmann::json::object();
+
+    for (const auto& a : sd.aircraft) {
+        const auto spec = bridge.effectiveSpec(a.typeKey);
+        nlohmann::json row = nlohmann::json::object();
+        row["platformId"] = a.deviceId;
+        row["deviceType"] = a.typeKey;
+        row["groupKey"] = a.groupKey;
+        if (!spec.has_value()) {
+            row["available"] = false;
+            row["reason"] = "sensors.json 里没有该机型键的 SensorSpec → 不猜（覆盖率留空）";
+            rows.push_back(std::move(row));
+            continue;
+        }
+        ++withSpec;
+        row["sensorId"] = spec->sensorId;
+        row["sensorClass"] = sensor_model::toString(spec->sensorClass);
+        row["aimFrame"] = sensor_model::toString(spec->aimFrame);
+        row["scanPattern"] = sensor_model::toString(spec->scanPattern);
+        row["maxRangeM"] = spec->maxRangeM;
+        row["scanPeriodMs"] = spec->scanPeriodMs;
+
+        // 实时位姿：引擎里的实体状态（没跑起来 → 回落场景站位并标注）
+        double lng = a.stationLng, lat = a.stationLat, alt = a.altM, heading = 0.0;
+        bool live = false;
+        sim_source::EntityStatus es;
+        if (engines_.bridge.engine && engines_.bridge.engine->entity(a.deviceId, es)) {
+            lng = es.lng;
+            lat = es.lat;
+            alt = es.altM;
+            heading = es.heading;
+            live = true;
+        }
+        row["poseSource"] = live ? "sim_source::EntityStatus（实时）" : "deployment.json 站位（仿真未初始化）";
+        row["lng"] = lng;
+        row["lat"] = lat;
+        row["altM"] = alt;
+        row["headingDeg"] = heading;
+
+        sensor_model::PlatformPose pose;
+        pose.position = ref.toLocal(lng, lat, alt);
+        pose.headingDeg = heading;
+        pose.platformId = a.deviceId;
+
+        const auto cov = bridge.coverFor(a.typeKey, pose, simNow, /*sensorSensitivity=*/false);
+        const auto covSens = bridge.coverFor(a.typeKey, pose, simNow, /*sensorSensitivity=*/true);
+        if (cov.has_value()) {
+            row["coverageAreaM2"] = cov->areaM2;
+            row["coverageAreaKm2"] = cov->areaM2 / 1e6;
+            row["coveragePolygonPoints"] = static_cast<int>(cov->polygon.size());
+            row["sectorRadiusM"] = cov->sectorRadiusM;
+            row["sectorSpanDeg"] = cov->sectorSpanDeg;
+            row["sectorStartAzimuthDeg"] = cov->sectorStartAzimuthDeg;
+            row["truncatedByOccluders"] = cov->truncatedByOccluders;
+            sumAreaM2 += cov->areaM2;
+        } else {
+            row["coverageAreaM2"] = nullptr;
+            row["reason"] = "cover() 返回 nullopt（参数非法：空 sensorId / maxRangeM<=0）";
+        }
+        if (covSens.has_value()) {
+            row["sensitiveAreaM2"] = covSens->areaM2;
+            sumSensitiveM2 += covSens->areaM2;
+        }
+        const auto rev = bridge.revisitFor(a.typeKey);
+        if (rev.has_value()) {
+            row["revisitPeriodMs"] = *rev;
+            if (revN == 0) {
+                revMin = revMax = *rev;
+            } else {
+                revMin = std::min(revMin, *rev);
+                revMax = std::max(revMax, *rev);
+            }
+            revSum += *rev;
+            ++revN;
+        } else {
+            row["revisitPeriodMs"] = nullptr;
+        }
+        row["available"] = true;
+        rows.push_back(std::move(row));
+
+        nlohmann::json& t = byType[a.typeKey];
+        if (!t.is_object()) {
+            t = nlohmann::json::object();
+            t["deviceType"] = a.typeKey;
+            t["platforms"] = 0;
+            t["coverageAreaM2"] = 0.0;
+            t["revisitPeriodMs"] = nullptr;
+        }
+        t["platforms"] = t["platforms"].get<int>() + 1;
+        t["coverageAreaM2"] = t["coverageAreaM2"].get<double>() +
+                              (cov.has_value() ? cov->areaM2 : 0.0);
+        if (rev.has_value()) t["revisitPeriodMs"] = *rev;
+    }
+
+    // 覆盖率：**任务区被覆盖的比例**（有界 [0,1]），口径与来源都写死在这里：
+    //   任务区多边形 → GeoRef 局部平面 → 在包围盒上按固定步长打格点；
+    //   格点是否在任务区内 = sensor_model::pointInPolygon；
+    //   格点是否被覆盖     = 落在**任一**传感器 cover() 多边形内（sensor_model::cover 的输出）。
+    // 为什么不用 Σ覆盖面积÷任务区面积：各传感器量程 3–20 km 远大于 9 km² 的任务区，
+    // 直接相加会得到 283 这种"上界"（且重复计重叠），对"任务区覆盖率"没有意义 ——
+    // 上界仍然照报（coveredAreaUpperBound），但覆盖率用**交集**口径。
+    double taskAreaM2 = 0.0;
+    std::string taskAreaKey = sd.pickPrimaryTaskKey();
+    std::vector<sensor_model::Vec3> taskRing;
+    for (const auto& ta : sd.taskAreas) {
+        if (ta.key != taskAreaKey) continue;
+        for (const auto& p : ta.polygon) taskRing.push_back(ref.toLocal(p.first, p.second, 0.0));
+        taskAreaM2 = sensor_model::polygonAreaM2(taskRing);
+    }
+    nlohmann::json grid = nlohmann::json::object();
+    int insideTask = 0;
+    int coveredPoints = 0;
+    double gridStepM = 0.0;
+    if (taskRing.size() >= 3) {
+        double minX = taskRing[0].x, maxX = taskRing[0].x, minY = taskRing[0].y, maxY = taskRing[0].y;
+        for (const auto& p : taskRing) {
+            minX = std::min(minX, p.x);
+            maxX = std::max(maxX, p.x);
+            minY = std::min(minY, p.y);
+            maxY = std::max(maxY, p.y);
+        }
+        // 步长：目标 ≤ 40000 个格点（够细且不拖慢命令），最小 20 m
+        constexpr int kMaxSamples = 40000;
+        const double spanX = std::max(maxX - minX, 1.0);
+        const double spanY = std::max(maxY - minY, 1.0);
+        gridStepM = std::max(20.0, std::sqrt(spanX * spanY / kMaxSamples));
+        // 覆盖多边形（局部平面）——用 cover() 的原样输出
+        std::vector<std::vector<sensor_model::Vec3>> covers;
+        for (const auto& row : rows) {
+            if (!row.value("available", false)) continue;
+            const std::string dt = row.value("deviceType", std::string());
+            sensor_model::PlatformPose pose;
+            pose.position = ref.toLocal(row.value("lng", 0.0), row.value("lat", 0.0),
+                                        row.value("altM", 0.0));
+            pose.headingDeg = row.value("headingDeg", 0.0);
+            pose.platformId = row.value("platformId", std::string());
+            const auto cov = bridge.coverFor(dt, pose, simNow, false);
+            if (cov.has_value() && cov->polygon.size() >= 3) covers.push_back(cov->polygon);
+        }
+        for (double x = minX; x <= maxX; x += gridStepM) {
+            for (double y = minY; y <= maxY; y += gridStepM) {
+                sensor_model::Vec3 p;
+                p.x = x;
+                p.y = y;
+                p.z = 0.0;
+                if (!sensor_model::pointInPolygon(p, taskRing)) continue;
+                ++insideTask;
+                for (const auto& poly : covers) {
+                    if (sensor_model::pointInPolygon(p, poly)) {
+                        ++coveredPoints;
+                        break;
+                    }
+                }
+            }
+        }
+        grid["stepM"] = gridStepM;
+        grid["samplesInTaskArea"] = insideTask;
+        grid["samplesCovered"] = coveredPoints;
+        grid["taskAreaPolygonPoints"] = static_cast<int>(taskRing.size());
+    }
+
+    out["available"] = true;
+    out["specSource"] = bridge.specs().path();
+    out["specTable"] = bridge.specs().toJson();
+    out["enabled"] = bridge.enabled();
+    out["rangeScale"] = bridge.rangeScale();
+    out["attachmentCount"] = static_cast<int>(engines_.sensorAttachments.size());
+    out["platformsWithSpec"] = withSpec;
+    out["platforms"] = static_cast<int>(sd.aircraft.size());
+    out["coveredAreaM2"] = sumAreaM2;
+    out["coveredAreaKm2"] = sumAreaM2 / 1e6;
+    out["sensitiveAreaKm2"] = sumSensitiveM2 / 1e6;
+    out["taskAreaKey"] = taskAreaKey;
+    out["taskAreaM2"] = taskAreaM2;
+    out["taskAreaKm2"] = taskAreaM2 / 1e6;
+    out["coveredAreaUpperBoundKm2"] = sumAreaM2 / 1e6;   // Σ各传感器覆盖面积（未去重叠）
+    out["coverageUpperBoundRatio"] = taskAreaM2 > 0 ? (sumAreaM2 / taskAreaM2) : 0.0;
+    out["coverageGrid"] = grid;
+    out["coverageRatio"] =
+        insideTask > 0 ? static_cast<double>(coveredPoints) / static_cast<double>(insideTask) : 0.0;
+    out["revisitPeriodMs"] = {{"min", revN > 0 ? revMin : 0.0},
+                              {"max", revN > 0 ? revMax : 0.0},
+                              {"mean", revN > 0 ? revSum / revN : 0.0},
+                              {"count", revN}};
+    out["byType"] = std::move(byType);
+    out["simNowMs"] = simNow;
+    out["sensors"] = std::move(rows);
+    out["bridgeStats"] = bridge.statsJson();
+
+    notes.push_back("覆盖面积 = sensor_model::cover(位姿, 规格, nowMs, occluders={}, "
+                    "sensorSensitivity=false).areaM2（几何包络），逐传感器求和；"
+                    "sensitiveAreaKm2 是同一次调用传 sensorSensitivity=true（按 detectionThreshold "
+                    "截断）的结果");
+    notes.push_back("coverageRatio = **任务区被覆盖的比例**：在任务区包围盒上按 "
+                    "coverageGrid.stepM 打格点，格点落在任务区多边形内（sensor_model::pointInPolygon）"
+                    "且落在任一传感器 cover() 多边形内即算覆盖 → coveredSamples ÷ samplesInTaskArea"
+                    "（有界 [0,1]，含重叠只算一次）");
+    notes.push_back("coveredAreaUpperBoundKm2 / coverageUpperBoundRatio = Σ覆盖面积 ÷ 任务区面积"
+                    "（**未去重叠**、且含全向大范围传感器，可远大于 1）—— 只作上界参照，"
+                    "不是覆盖率；任务区面积用 sensor_model::polygonAreaM2 算");
+    notes.push_back("遍历周期 = sensor_model::revisitPeriodMs(有效规格)，逐型号取值；"
+                    "min/max/mean 是挂接平台上的汇总");
+    notes.push_back("遮挡体留空（occluders={}）：场景的 no-fly/情报区是空域多边形，"
+                    "不是不透明遮挡体");
+    out["notes"] = std::move(notes);
+#else
+    out["message"] = sensorNote();
+    notes.push_back(sensorNote());
+    out["sensors"] = std::move(rows);
+    out["notes"] = std::move(notes);
+#endif
+    return out;
+}
+
+nlohmann::json FlowEngine::command(const std::string& verb, const nlohmann::json& params) {    if (verb.empty()) return badRequest(verb, "缺少 verb");
 
     // ---------------------------------------------------------------- 启动加载
     if (verb == "boot.run") {
@@ -1178,6 +2150,12 @@ nlohmann::json FlowEngine::command(const std::string& verb, const nlohmann::json
                     d["message"] = cr.message;
                 } else {
                     missionId_ = cr.data.id;
+                    // 步 7（P4）：探测结果的落账任务 = 引擎刚给的 missionId（同一个来源，
+                    // 宿主不自己拼 id）。线程：见 onDetection。
+                    {
+                        std::lock_guard<std::mutex> dl(detectMtx_);
+                        detectMissionId_ = missionId_;
+                    }
                     // ② 进 T0：显式调 advance（create 已落在唯一起始阶段 T0 → 引擎回
                     //    AlreadyThere + idempotent=true，零副作用；这里要的是**回执**，
                     //    不是"再进一次"）。
@@ -1241,6 +2219,7 @@ nlohmann::json FlowEngine::command(const std::string& verb, const nlohmann::json
         nlohmann::json d = nlohmann::json::object();
         int code = 0;
         bool moved = false;
+        bool simAuto = false;
         {
             std::lock_guard<std::mutex> lk(mtx_);
             if (missionId_.empty()) {
@@ -1266,9 +2245,25 @@ nlohmann::json FlowEngine::command(const std::string& verb, const nlohmann::json
                 const int s = stepForPhase(phase_);
                 if (s > 0) step_ = s;
                 moved = true;
+                // 宿主侧的流程读数也一并回执（前端切屏要它；引擎负载里没有这两个键）
+                d["step"] = step_;
+                d["stepKey"] = flowStepOf(step_) ? flowStepOf(step_)->key : "";
+                d["phase"] = phase_;
+                d["missionId"] = missionId_;
+#if MA_WITH_SIM_SOURCE && MA_WITH_INGEST
+                // 演示叙事：**"起飞"发生在步 6（任务执行）**，不是开机。
+                // 流程进入步 6（phase T2/T3）→ 宿主自动调 sim.start（幂等：已跑就命中）。
+                if (s == 6) {
+                    d["simAutoStart"] = autoStartSimLocked();
+                    d["simNote"] = "已自动起飞：进入步 6（任务执行）时宿主调 Driver::primeNow + start；"
+                                   "手动控制仍走 sim.start/sim.pause/sim.resume/sim.speed/sim.step";
+                    simAuto = true;
+                }
+#endif
             }
         }
         if (moved) broadcastFlowState();
+        if (simAuto) broadcastSimState();
         return reply(verb, code, d);
 #else
         return reply(verb, 1005, {{"message", "phase-engine 未装配（编译期 MA_WITH_PHASE=0）"}});
@@ -1955,6 +2950,494 @@ nlohmann::json FlowEngine::command(const std::string& verb, const nlohmann::json
 #endif
     }
 
+    // ================================================================ 步 6：仿真节拍
+    //
+    // 冻结命令面（流程接口冻结 §2 步 6）：sim.start / sim.pause / sim.resume / sim.speed /
+    // sim.step；事件 `sim.state`（形状见 §1）。
+    //
+    // 【引擎】唯一的时间入口是 `ma::sim_bridge::Driver`（它内部调 SimSource::tick/step）：
+    //   start()    → 起驱动线程（真实时间 × 倍速）
+    //   pause()/resume() → 引擎口径：暂停期间的真实时间被丢弃（不会"跳一下"）
+    //   setSpeed(1|8|60) → 非法值由引擎拒绝（返回 false）
+    //   stepOnce(dtMs)   → 推 dtMs **仿真毫秒**（与倍速无关）
+    // 宿主只转发 + 把 Driver/metrics 的读数折成 sim.state 负载。
+    if (verb == "sim.start" || verb == "sim.pause" || verb == "sim.resume" ||
+        verb == "sim.speed" || verb == "sim.step" || verb == "sim.state") {
+#if MA_WITH_SIM_SOURCE && MA_WITH_INGEST
+        if (!engines_.bridge.engine || !engines_.bridge.driver) {
+            return reply(verb, 1005,
+                         {{"message", "仿真源未装配（sim-source / 接入层未编译进来）"},
+                          {"note", engines_.simNote}});
+        }
+        nlohmann::json d = nlohmann::json::object();
+        int code = 0;
+        bool changed = false;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            auto& driver = *engines_.bridge.driver;
+            if (verb == "sim.start") {
+                if (driver.running() && !driver.paused()) {
+                    d["idempotent"] = true;
+                    d["reason"] = "仿真节拍已在运行且未暂停";
+                    d["action"] = "noop";
+                } else {
+                    // "start" 的口径 = 让仿真时间开始走（起线程；已暂停则恢复）——
+                    // 否则会出现"start 成功但时间不动"的假成功（暂停只是引擎层面的）。
+                    std::string action;
+                    if (!driver.running()) {
+                        driver.primeNow();  // 先对齐基线（首 tick 只记基线，不推进）
+                        driver.start();
+                        action = "start";
+                    }
+                    if (driver.paused()) {
+                        driver.resume();
+                        action = action.empty() ? "resume" : (action + "+resume");
+                    }
+                    changed = true;
+                    d["action"] = action;
+                    d["note"] = "已起飞：仿真时间开始推进（真实时间 × 倍速）";
+                }
+            } else if (verb == "sim.pause") {
+                if (driver.paused()) {
+                    d["idempotent"] = true;
+                } else {
+                    driver.pause();
+                    changed = true;
+                }
+                d["note"] = "暂停：引擎丢弃暂停期间的真实时间（SimSource::pause 口径）";
+            } else if (verb == "sim.resume") {
+                // "resume" = 让时间继续自己走：线程没起就起（单步之后就是这样），引擎暂停就解除。
+                // 只调 Driver::resume() 是不够的 —— 单步会把驱动线程停掉，那样"恢复了"但时间不动。
+                std::string action;
+                if (!driver.running()) {
+                    driver.primeNow();
+                    driver.start();
+                    action = "start";
+                }
+                if (driver.paused()) {
+                    driver.resume();
+                    action = action.empty() ? "resume" : (action + "+resume");
+                }
+                if (action.empty()) {
+                    d["idempotent"] = true;
+                } else {
+                    changed = true;
+                }
+                d["action"] = action.empty() ? "noop" : action;
+            } else if (verb == "sim.speed") {
+                const int want = intOr(params, "speed", 0);
+                if (want == 0) return badRequest(verb, "缺少 speed（1 | 8 | 60）");
+                const bool ok = driver.setSpeed(want);
+                d["requested"] = want;
+                d["accepted"] = ok;
+                if (!ok) {
+                    code = 1000;
+                    nlohmann::json allowed = nlohmann::json::array();
+                    for (int s : sim_source::allowedSpeedMultipliers()) allowed.push_back(s);
+                    d["message"] = "引擎拒绝该倍速（SimSource::setSpeed 只接受 1 / 8 / 60）";
+                    d["allowed"] = allowed;
+                } else {
+                    changed = true;
+                }
+            } else if (verb == "sim.step") {
+                const int dt = intOr(params, "dtMs", 1000);
+                if (dt <= 0) return badRequest(verb, "dtMs 必须 > 0（单位：仿真毫秒）");
+                // 单步 = **让时间只走这一下**。三步都要做（引擎口径决定的，不是偏好）：
+                //   ① 停驱动线程（否则真实时间的 tick 会继续推）
+                //   ② 解除暂停（`SimSource::step()` 在 paused 时返回 0 —— 引擎明写）
+                //   ③ `step(dtMs)` 推 dtMs 仿真毫秒（与倍速无关）
+                // 之后用 `sim.resume` / `sim.start` 让时间继续自己走。
+                const bool stoppedDriver = driver.running();
+                if (stoppedDriver) driver.stop();
+                const bool wasPaused = driver.paused();
+                if (wasPaused) driver.resume();
+                const int events = driver.stepOnce(dt);
+                d["dtMs"] = dt;
+                d["events"] = events;
+                d["driverStopped"] = stoppedDriver;
+                d["unpaused"] = wasPaused;
+                d["note"] = "单步：停驱动线程 + 解除暂停后调 step(dtMs)（引擎的 step 在 paused 时"
+                            "返回 0）；接着用 sim.resume / sim.start 继续";
+                changed = true;
+            }
+            d["state"] = simStateJsonLocked();
+        }
+        if (changed) broadcastSimState();
+        return reply(verb, code, d);
+#else
+        return reply(verb, 1005,
+                     {{"message", "仿真源未装配（编译期 MA_WITH_SIM_SOURCE / MA_WITH_INGEST=0）"}});
+#endif
+    }
+
+    // ================================================================ 步 6–7：探测读数 / 开关
+    if (verb == "sensor.status") {
+        std::lock_guard<std::mutex> lk(mtx_);
+        return reply(verb, 0, sensorStatusLocked());
+    }
+
+    if (verb == "sensor.configure") {
+        // "拔掉传感器 / 把距离拉远"的**演示开关**（自证要能证明"拔掉它 → 目标不再出现"）。
+        // 语义是改**模型入参**：enabled=false → sense() 直接返回空（一条观测都不发）；
+        // rangeScale 乘在 SensorSpec 的 maxRangeM/referenceRangeM 上 → 观测仍由引擎算。
+        // MUST NOT 用"把概率改小"之类的办法伪造不可见。
+#if MA_WITH_SIM_SOURCE && MA_WITH_INGEST && MA_WITH_SENSOR_MODEL
+        if (!engines_.sensorBridge) {
+            return reply(verb, 1005, {{"message", sensorNote()}});
+        }
+        std::lock_guard<std::mutex> lk(mtx_);
+        nlohmann::json d = nlohmann::json::object();
+        if (params.contains("enabled")) {
+            const bool on = params.value("enabled", true);
+            engines_.sensorBridge->setEnabled(on);
+            d["enabled"] = on;
+        }
+        if (params.contains("rangeScale")) {
+            const double sc = params.value("rangeScale", 1.0);
+            if (!(sc > 0.0)) return badRequest(verb, "rangeScale 必须 > 0");
+            engines_.sensorBridge->setRangeScale(sc);
+            d["rangeScale"] = sc;
+        }
+        d["note"] = "改的是传感器模型的入参（enabled / 量程缩放）：观测与可见性仍由 "
+                    "sensor_model::sense 判定，宿主不产生观测";
+        d["stats"] = engines_.sensorBridge->statsJson();
+        return reply(verb, 0, d);
+#else
+        return reply(verb, 1005, {{"message", sensorNote()}});
+#endif
+    }
+
+    // ================================================================ 步 6：链路评估
+    if (verb == "topology.evaluate") {
+        // 【引擎】topology::TopologyEngine 的五个入口（公开头 :759-788, :809, :817）：
+        //   ① configureTopology(topologyId, structureKey, reset=true)  —— 结构键**从规则包里挑**
+        //   ② addNodes/addEdges                                        —— 节点/边**按场景数据**
+        //   ③ ingest(逐条)/ingestBatch                                 —— 线上报文（形状转换在宿主）
+        //   ④ evaluate(PhaseContext) + linkQualities()                 —— 评分与绿/黄/红（带迟滞）
+        //   ⑤ primitives()                                             —— 图元（含坐标）
+        // 回执里另附 `policy`（states/hysteresis/metrics）——**状态的判据原样来自规则包**
+        // linkThresholds.json，宿主不解释阈值。
+#if MA_WITH_TOPOLOGY && MA_WITH_SIM_SOURCE && MA_WITH_INGEST
+        if (!engines_.topologyEngine) {
+            return reply(verb, 1005, {{"message", "topology 未装配（编译期 MA_WITH_TOPOLOGY=0）"}});
+        }
+        nlohmann::json notes = nlohmann::json::array();
+        nlohmann::json d = nlohmann::json::object();
+        int code = 0;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            const nlohmann::json topo = ensureTopologyLocked();
+            d["topology"] = topo;
+            d["missionId"] = missionId_;
+            if (!topo.value("configured", false)) {
+                code = topo.value("code", 1005);
+                d["notes"] = notes;
+                return reply(verb, code, d);
+            }
+
+            // ---- 排空线上报文（接入层线程只累加；这里在 `mtx_` 之下快照并清零）----
+            std::map<std::string, WireAgg> agg;
+            int64_t frames = 0;
+            {
+                std::lock_guard<std::mutex> wl(wireMtx_);
+                agg.swap(wireAgg_);   // delta 语义：本次评估的窗口 = 上次评估以来的报文
+                for (const auto& kv : agg) frames += kv.second.frames;
+                ++wireWindows_;
+            }
+            const nlohmann::json conv = toTopologyEvents(agg, notes);
+            const nlohmann::json& evs = conv["events"];
+
+            std::vector<topology::json> batch;
+            for (const auto& e : evs) {
+                batch.push_back(topology::json::parse(e.dump()));
+            }
+            nlohmann::json ingest = nlohmann::json::object();
+            ingest["frames"] = frames;
+            ingest["links"] = static_cast<int>(batch.size());
+            ingest["window"] = wireWindows_;
+            ingest["wireTotals"] = {{"accepted", wireTotal_}, {"windows", wireWindows_}};
+            if (!batch.empty()) {
+                const topology::MutationResult ir = engines_.topologyEngine->ingestBatch(batch);
+                ingest["result"] = nlohmann::json::parse(ir.toJson().dump());
+                if (ir.code != 0) {
+                    code = ir.code;
+                    notes.push_back("ingestBatch 未全成功：" + ir.message);
+                }
+                topologyIngests_ += static_cast<int64_t>(batch.size());
+                topologyLinkSamples_ += frames;
+            } else {
+                ingest["result"] = nullptr;
+                notes.push_back("本次没有可投递的线上报文（窗口内没收到帧）：引擎按缺样本处理，"
+                                "MUST NOT 由宿主补数");
+            }
+            d["ingest"] = std::move(ingest);
+            d["metricDetail"] = conv["detail"];
+
+            // ---- 评估 + 逐链路状态 + 图元 ----
+            const PhaseView v = phaseViewLocked();
+            topology::PhaseContext pc;
+            pc.phaseKey = v.phaseKey;
+            pc.seq = v.seq;
+            pc.scenarioKey = v.scenarioKey;
+            pc.enteredAt = v.enteredAt;
+            pc.missionId = v.missionId;
+            const topology::EvaluationResult er = engines_.topologyEngine->evaluate(pc);
+            d["evaluation"] = nlohmann::json::parse(er.toJson().dump());
+
+            nlohmann::json links = nlohmann::json::array();
+            int withState = 0;
+            int withScore = 0;
+            for (const auto& lq : engines_.topologyEngine->linkQualities()) {
+                nlohmann::json row = nlohmann::json::parse(lq.toJson().dump());
+                // toJson 只写"已知"的字段：没有状态 → 没有 state 键；没有评分 → 没有 score 键。
+                // 这里把两个布尔量显式补上，便于前端与验收脚本判读（值来自引擎的 hasState/hasScore）。
+                row["hasState"] = lq.hasState;
+                row["hasScore"] = lq.hasScore;
+                if (lq.hasState) ++withState;
+                if (lq.hasScore) ++withScore;
+                links.push_back(std::move(row));
+            }
+            d["links"] = std::move(links);
+            d["linkCount"] = static_cast<int>(engines_.topologyEngine->linkQualities().size());
+            d["linksWithState"] = withState;
+            d["linksWithScore"] = withScore;
+            d["primitives"] = nlohmann::json::parse(
+                engines_.topologyEngine->primitives().dump());
+
+            // ---- 判据出处：规则包的 states/hysteresis/metrics（原样回执）----
+            const auto pol = engines_.topologyEngine->policy();
+            if (pol.has_value()) {
+                nlohmann::json states = nlohmann::json::array();
+                for (const auto& s : pol->states) {
+                    states.push_back({{"key", s.key},
+                                      {"state", topology::toString(s.state)},
+                                      {"min", s.min}});
+                }
+                nlohmann::json metrics = nlohmann::json::array();
+                for (const auto& m : pol->metrics) {
+                    metrics.push_back({{"key", m.key},
+                                       {"ledgerKey", m.ledgerKey},
+                                       {"unit", m.unit},
+                                       {"direction", m.direction == topology::MetricDirection::Higher
+                                                         ? "higher"
+                                                         : "lower"},
+                                       {"min", m.min},
+                                       {"max", m.max},
+                                       {"weight", m.weight},
+                                       {"inScore", m.inScore()}});
+                }
+                d["policy"] = {{"states", states},
+                               {"hysteresis",
+                                {{"riseMargin", pol->hysteresis.riseMargin},
+                                 {"fallMargin", pol->hysteresis.fallMargin},
+                                 {"confirmCount", pol->hysteresis.confirmCount},
+                                 {"minDwellMs", pol->hysteresis.minDwellMs}}},
+                               {"window", {{"windowMs", pol->window.windowMs},
+                                           {"maxSamples", pol->window.maxSamples}}},
+                               {"metrics", metrics},
+                               {"source", "topology::TopologyEngine::policy()"
+                                          "（= linkThresholds.json 的生效值）"}};
+            } else {
+                notes.push_back("规则包未装载：policy() 为空（states/hysteresis 拿不到）");
+            }
+            d["notes"] = std::move(notes);
+        }
+        return reply(verb, code, d);
+#else
+        return reply(verb, 1005,
+                     {{"message", "topology 未装配或场景数据不可用（编译期开关关闭）"}});
+#endif
+    }
+
+    // ================================================================ 步 7：目标列表 / 详情 / 处置
+    if (verb == "targets.list") {
+        // 【引擎】entity_ledger::EntityLedger::listEntities(EntityQuery)（公开头 :1236）
+        // 清单 = **台账里真的有的实体**：目标随探测出现（sensor-model 判定可见 → 宿主落账），
+        // 所以这里数的不是 targets.json 的全量，而是"到目前为止被探测到的"。
+#if MA_WITH_LEDGER
+        if (!engines_.entityLedger) {
+            return reply(verb, 1005, {{"message", "entity-ledger 未装配（编译期 MA_WITH_LEDGER=0）"}});
+        }
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (missionId_.empty()) {
+            return reply(verb, 1003, {{"message", "尚未进入任务：先 flow.enter"}});
+        }
+        entity_ledger::EntityQuery q;
+        q.missionId = missionId_;
+        q.includeRetired = params.value("includeRetired", false);
+        q.limit = intOr(params, "limit", 200);
+        q.offset = intOr(params, "offset", 0);
+        const std::vector<entity_ledger::EntityRecord> rows =
+            engines_.entityLedger->listEntities(q);
+
+        nlohmann::json items = nlohmann::json::array();
+        for (const auto& r : rows) {
+            items.push_back(nlohmann::json::parse(entity_ledger::toJson(r).dump()));
+        }
+        // 只把**目标**（= 探测出来的敌方实体）与平台分开报：判据是场景数据里的 targets[]
+        const std::map<std::string, std::string> targetKeys = targetTypeKeysLocked();
+        nlohmann::json targets = nlohmann::json::array();
+        nlohmann::json others = nlohmann::json::array();
+        for (const auto& r : rows) {
+            bool isTarget = false;
+            for (const auto& kv : targetKeys) {
+                if (kv.second == r.typeKey) {
+                    isTarget = true;
+                    break;
+                }
+            }
+            if (isTarget) {
+                targets.push_back(nlohmann::json::parse(entity_ledger::toJson(r).dump()));
+            } else {
+                others.push_back(nlohmann::json::parse(entity_ledger::toJson(r).dump()));
+            }
+        }
+
+        nlohmann::json d = nlohmann::json::object();
+        d["missionId"] = missionId_;
+        d["count"] = static_cast<int>(items.size());
+        d["targetCount"] = static_cast<int>(targets.size());
+        d["items"] = std::move(items);
+        d["targets"] = std::move(targets);
+        d["platformEntities"] = std::move(others);
+        d["coverage"] = sensorStatusLocked();   // 覆盖率/遍历周期（sensor-model 算的）
+        nlohmann::json notes = nlohmann::json::array();
+        notes.push_back("清单 = entity-ledger 台账里**已被探测登记**的实体（missionId=" +
+                        missionId_ + "），不是 targets.json 的全量 —— 目标随探测出现");
+        notes.push_back("分类口径：typeKey 命中场景 targets[] 的 = 目标；其余（编组登记的平台实体）"
+                        "单列 platformEntities");
+        {
+            std::lock_guard<std::mutex> dl(detectMtx_);
+            d["detection"] = {{"registered", detectRegistered_},
+                              {"merged", detectMerged_},
+                              {"rebound", detectRebound_},
+                              {"failed", detectFailed_},
+                              {"noMission", detectNoMission_},
+                              {"sourceFallback", detectSourceFallback_},
+                              {"lastError", detectLastError_},
+                              {"last", detectLast_}};
+        }
+        d["detectionNotes"] = nlohmann::json::array(
+            {"registered = 首次探测 → registerEntity 新建实体；merged = 引擎按 obsKey 归并到"
+             "既有实体（多传感器）；rebound = 目标移动超出空间去重半径时引擎新建了实体，"
+             "宿主用 mergeEntities 并回主实体；noMission = 还没进任务时的探测结果（无处落账）",
+             "落账 ID 口径：obsKey = 被探测实体的场景 id（同一目标多传感器归并）；"
+             "confidence = sensor_model 算的概率（宿主不改）；typeKey = 场景 targets[].typeKey"
+             "（必须是规则包 entityTypes.json 的词汇）"});
+        d["notes"] = std::move(notes);
+        return reply(verb, 0, d);
+#else
+        return reply(verb, 1005, {{"message", "entity-ledger 未装配（编译期 MA_WITH_LEDGER=0）"}});
+#endif
+    }
+
+    if (verb == "targets.detail") {
+        // 【引擎】entity_ledger::EntityLedger::getEntity(entityId)（:1234）
+        //        + assessEntity(entityId)（:1272，威胁评级**纯函数**，逐因子可读）
+        //        + actionLog(ActionLogQuery)（:1311，处置留痕）
+        // 威胁等级/分值的唯一来源是规则包 threatFactors.json（引擎按 items 权重与 bands 分档）。
+#if MA_WITH_LEDGER
+        if (!engines_.entityLedger) {
+            return reply(verb, 1005, {{"message", "entity-ledger 未装配"}});
+        }
+        const std::string entityId = params.value("entityId", std::string());
+        if (entityId.empty()) return badRequest(verb, "缺少 entityId");
+        std::lock_guard<std::mutex> lk(mtx_);
+        const std::optional<entity_ledger::EntityRecord> rec =
+            engines_.entityLedger->getEntity(entityId);
+        if (!rec.has_value()) {
+            return reply(verb, 1004, {{"message", "台账里没有这个实体：" + entityId}});
+        }
+        nlohmann::json d = nlohmann::json::object();
+        d["entity"] = nlohmann::json::parse(entity_ledger::toJson(*rec).dump());
+        const entity_ledger::ThreatAssessment ta = engines_.entityLedger->assessEntity(entityId);
+        d["assessment"] = nlohmann::json::parse(ta.toJson().dump());
+        const entity_ledger::DefinitionInfo di = engines_.entityLedger->definitionInfo();
+        d["definition"] = {{"policiesNamespace", di.policiesNamespace},
+                           {"schemaVersion", di.schemaVersion},
+                           {"definitionVersion", di.definitionVersion},
+                           {"digest", di.digest},
+                           {"actionCount", di.actionCount},
+                           {"factorCount", di.factorCount},
+                           {"bandKeys", di.bandKeys}};
+        // 处置动作清单：**规则包声明的动作**（宿主不自造业务动作）
+        d["declaredActions"] = di.actionKeys;
+        entity_ledger::ActionLogQuery aq;
+        aq.missionId = rec->missionId;
+        aq.entityId = entityId;
+        nlohmann::json log = nlohmann::json::array();
+        for (const auto& e : engines_.entityLedger->actionLog(aq)) {
+            log.push_back(nlohmann::json::parse(entity_ledger::toJson(e).dump()));
+        }
+        d["actionLog"] = std::move(log);
+        entity_ledger::TrackStats ts = engines_.entityLedger->trackStats(entityId);
+        d["trackStats"] = nlohmann::json::parse(entity_ledger::toJson(ts).dump());
+        nlohmann::json notes = nlohmann::json::array();
+        notes.push_back("威胁分值/等级来自规则包 threatFactors.json：score 0–100、band = "
+                        "bands[].key（high/mid/low）、status = bands[].state（红/黄/灰）；"
+                        "factors[] 是逐因子得分与权重（可手算核对）");
+        notes.push_back("动作清单来自规则包 entityTypes.json 的 actions[]：" +
+                        std::to_string(di.actionCount) + " 个（宿主不自造动作）");
+        if (ta.rejected) {
+            notes.push_back("assessEntity 被引擎标 rejected（必填因子输入缺失）：" + ta.rejectReason);
+        }
+        d["notes"] = std::move(notes);
+        return reply(verb, 0, d);
+#else
+        return reply(verb, 1005, {{"message", "entity-ledger 未装配"}});
+#endif
+    }
+
+    if (verb == "targets.act") {
+        // 【引擎】entity_ledger::EntityLedger::applyAction(ActionRequest)（公开头 :1308）
+        //   闸门：规则包 `actions[].requires` 里的 `$` 前缀项是**引擎内建守卫**
+        //   （$action:upgrade / $in-sequence / $confidence-min:0.x）；非 `$` 前缀的是**宿主闸门**，
+        //   本规则包**一个都没声明** → 宿主不注册、也不自造（registerActionGate 一个都不调，
+        //   回执里如实写 registeredGates=0 与 declaredRequires 原样）。
+        //   规则包没声明的动作 → 引擎拒（宿主原样透传它的 code/message）。
+        //   幂等/互斥语义（once/exclusive/undoWithinMs）全部由引擎裁决。
+#if MA_WITH_LEDGER
+        if (!engines_.entityLedger) {
+            return reply(verb, 1005, {{"message", "entity-ledger 未装配"}});
+        }
+        const std::string entityId = params.value("entityId", std::string());
+        const std::string action = params.value("action", std::string());
+        if (entityId.empty()) return badRequest(verb, "缺少 entityId");
+        if (action.empty()) return badRequest(verb, "缺少 action（取值见规则包 actions[]）");
+        entity_ledger::ActionRequest req;
+        req.entityId = entityId;
+        req.actionKey = action;
+        req.reason = params.value("reason", std::string("host:targets.act"));
+        req.operatorId = params.value("operatorId", std::string("host"));
+        if (params.contains("params") && params["params"].is_object()) req.params = params["params"];
+        nlohmann::json d = nlohmann::json::object();
+        int code = 0;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            const entity_ledger::ActionResult ar = engines_.entityLedger->applyAction(req);
+            code = ar.code;
+            d = nlohmann::json::parse(ar.toJson().dump());
+            const entity_ledger::DefinitionInfo di = engines_.entityLedger->definitionInfo();
+            d["declaredActions"] = di.actionKeys;
+            d["registeredGates"] = 0;
+            d["gateNote"] = "本规则包的 actions[].requires 全是 `$` 内建守卫（宿主闸门 0 个）→ "
+                            "registerActionGate 未调用；宿主 MUST NOT 自造闸门或动作";
+        }
+        return reply(verb, code, d);
+#else
+        return reply(verb, 1005, {{"message", "entity-ledger 未装配"}});
+#endif
+    }
+
+    // ================================================================ 步 7：媒体通道
+    if (verb == "media.channels") {
+        nlohmann::json d = mediaChannelsJson(params.value("refresh", false));
+        if (params.value("broadcast", false)) {
+            if (broadcast_) broadcast_("media.channels", d);
+        }
+        return reply(verb, 0, d);
+    }
+
     if (verb == "flow.goto") {
         // 演示/串联用：按步骤号或步骤 key 跳转（不改变任何引擎状态）
         int target = intOr(params, "step", 0);
@@ -1966,16 +3449,29 @@ nlohmann::json FlowEngine::command(const std::string& verb, const nlohmann::json
         }
         const FlowStep* s = flowStepOf(target);
         if (!s) return badRequest(verb, "step 越界（1..11）：" + std::to_string(target));
+        nlohmann::json autoStart = nullptr;
+        bool toMedia = false;
         {
             std::lock_guard<std::mutex> lk(mtx_);
             step_ = target;
             if (s->phase[0] != '\0') phase_ = s->phase;
+#if MA_WITH_SIM_SOURCE && MA_WITH_INGEST
+            // 与 mission.advance 同一条口径：跳到步 6 = 进入任务执行 = 自动起飞
+            if (target == 6) autoStart = autoStartSimLocked();
+#endif
+            toMedia = (target == 7);  // 步 7 才挂媒体面板 → 到这一步广播一次通道清单
         }
         broadcastFlowState();
+        if (autoStart.is_object()) broadcastSimState();
+        if (toMedia) broadcastMediaChannels();
         nlohmann::json d = nlohmann::json::object();
         d["step"] = step_;
         d["stepKey"] = s->key;
         d["phase"] = phase_;
+        if (autoStart.is_object()) {
+            d["simAutoStart"] = autoStart;
+            d["simNote"] = "已自动起飞（flow.goto 到步 6）";
+        }
         return reply(verb, 0, d);
     }
 

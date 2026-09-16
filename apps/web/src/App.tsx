@@ -21,6 +21,8 @@ import { SituationScreen } from './screens/SituationScreen'
 import { GroupingScreen } from './screens/GroupingScreen'
 import { GroupConfirmScreen } from './screens/GroupConfirmScreen'
 import { StageOverlay } from './screens/StageOverlay'
+import { ExecuteScreen } from './screens/ExecuteScreen'
+import { TargetsScreen } from './screens/TargetsScreen'
 import { MapStage } from './MapStage'
 
 function param(name: string): string | null {
@@ -156,6 +158,21 @@ export function App() {
               selectedPlanId={planId}
               onPickPlan={setPlanId}
             />
+          </StageOverlay>
+        )}
+
+        {/* 步 6 任务执行（T2-1/T3-1）：同样是覆盖层——地图台照常画无人机与航迹，
+            本屏只叠控制条（起飞/暂停/恢复/倍速）与两块引擎读数面板（链路/覆盖）。 */}
+        {step === 6 && (
+          <StageOverlay>
+            <ExecuteScreen state={state} flow={flow} />
+          </StageOverlay>
+        )}
+
+        {/* 步 7 实时侦察目标显示（T4-1/T4-2）：目标列表 + 详情/处置 + 视频/SAR 回传面板。 */}
+        {step === 7 && (
+          <StageOverlay>
+            <TargetsScreen state={state} flow={flow} />
           </StageOverlay>
         )}
       </div>

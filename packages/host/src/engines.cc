@@ -6,8 +6,13 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <map>
+#include <memory>
 #include <sstream>
+#include <string>
 #include <vector>
+
+#include <trantor/utils/Logger.h>
 
 #if MA_WITH_HUB
 #include "realtime_hub/hub.h"
@@ -298,8 +303,122 @@ bool Engines::loadSimulation(const std::string& dir, const std::string& kindName
                   static_cast<int>(neutralScenario.areas.size()),
                   static_cast<int>(scenarioData.groupIds().size()), kindName.c_str());
     simNote = buf;
+
+#if MA_WITH_SENSOR_MODEL
+    // 3) 探测模型（D.2 第 3–4 步）：**紧接 init() 之后**装配 —— `sim_bridge::build()`
+    //    内部已经调过 init()，而引擎的 `setSensorAttachments` 自己会 applyAttachments()
+    //    （覆盖式），所以这个时机是正确的（头 :543）。
+    {
+        std::string sensorError;
+        if (!attachSensorModel(dir, neutralScenario, sensorError)) {
+            // 不阻止仿真链路：如实记一行，账本由 report() 写成未装配。
+            LOG_WARN << "[engines] 探测模型未装配：" << sensorError;
+        }
+    }
+#endif
     return true;
 }
+
+#if MA_WITH_SENSOR_MODEL
+bool Engines::attachSensorModel(const std::string& dir, const sim_source::SimScenario& neutral,
+                                std::string& error) {
+    if (!bridge.engine) {
+        error = "仿真引擎未装配";
+        sensorNote = error;
+        return false;
+    }
+
+    // ① SensorSpec 的来源：`<场景目录>/sensors.json`（sensor-model **没有规则包入口**，
+    //    引擎头也明写"零内建型号参数" → 规格只能由宿主逐字段给）。
+    const std::string specsPath = (fs::path(dir) / "sensors.json").string();
+    auto specs = std::make_shared<ma::sensor_bridge::SpecTable>();
+    std::string specError;
+    if (!specs->loadFile(specsPath, specError)) {
+        error = specError;
+        sensorNote = "规格装载失败：" + specError;
+        return false;
+    }
+
+    // ② 坐标原点：场景中心（scenario-data 给的 center；缺 → 取部署区/平台站位均值并标注）。
+    ma::sensor_bridge::GeoRef ref;
+    if (scenarioData.hasCenter) {
+        ref.lng0 = scenarioData.center.first;
+        ref.lat0 = scenarioData.center.second;
+        ref.valid = true;
+    } else if (!scenarioData.aircraft.empty()) {
+        double sx = 0, sy = 0;
+        for (const auto& a : scenarioData.aircraft) {
+            sx += a.stationLng;
+            sy += a.stationLat;
+        }
+        ref.lng0 = sx / static_cast<double>(scenarioData.aircraft.size());
+        ref.lat0 = sy / static_cast<double>(scenarioData.aircraft.size());
+        ref.valid = true;
+    }
+
+    ma::sensor_bridge::Options opts;
+    opts.enabled = true;
+    opts.observationKind = "sensor.detect";
+    auto bridgePtr =
+        std::make_shared<ma::sensor_bridge::SensorBridge>(specs, ref, opts);
+
+    // ③ 目标身份表（id → typeKey/name/no）：取自**中立场景**（它同时有 id 与 typeKey）。
+    std::map<std::string, ma::sensor_bridge::TargetInfo> catalog;
+    for (const auto& t : neutral.targets) {
+        ma::sensor_bridge::TargetInfo info;
+        info.id = t.id;
+        info.typeKey = t.typeKey;
+        info.name = t.name;
+        info.deviceType = t.deviceType;
+        info.no = t.no;
+        catalog[t.id] = info;
+    }
+    bridgePtr->setTargetCatalog(catalog);
+
+    // ④ 挂接：每台平台按**自己的机型键**取规格（sensors.json 的四条 = 四个机型键）。
+    //    intervalMs = spec.scanPeriodMs（该型号的扫描周期：规则数据里唯一有据的观测节拍）。
+    sensorAttachments.clear();
+    std::vector<std::string> noSpec;
+    for (const auto& p : neutral.platforms) {
+        const sensor_model::SensorSpec* sp = specs->byDeviceType(p.deviceType);
+        if (sp == nullptr) {
+            noSpec.push_back(p.deviceId + "(" + p.deviceType + ")");
+            continue;
+        }
+        sim_source::SensorAttachment a;
+        a.platformId = p.deviceId;
+        a.sensorId = sp->sensorId;
+        a.rangeM = sp->maxRangeM;
+        a.intervalMs = sp->scanPeriodMs;
+        sensorAttachments.push_back(a);
+    }
+
+    bridge.engine->setSensorModel(bridgePtr);
+    bridge.engine->setSensorAttachments(sensorAttachments);
+
+    char buf[512];
+    std::snprintf(buf, sizeof(buf),
+                  "规格 %d 条（%s）· 挂接 %d/%d 台 · 原点 %.5f,%.5f · 观测节拍=各型号 scanPeriodMs",
+                  static_cast<int>(specs->items().size()), specsPath.c_str(),
+                  static_cast<int>(sensorAttachments.size()),
+                  static_cast<int>(neutral.platforms.size()), ref.lng0, ref.lat0);
+    sensorNote = buf;
+    if (!noSpec.empty()) {
+        std::string missing;
+        for (const auto& s : noSpec) {
+            if (!missing.empty()) missing += ",";
+            missing += s;
+        }
+        sensorNote += "；无规格未挂接：" + missing;
+    }
+    if (!specs->issues().empty()) {
+        sensorNote += "；validateSpec 报告 " + std::to_string(specs->issues().size()) + " 条问题";
+    }
+    sensorBridge = bridgePtr;
+    error.clear();
+    return true;
+}
+#endif  // MA_WITH_SENSOR_MODEL
 
 nlohmann::json Engines::simStatsJson() const {
     nlohmann::ordered_json out;
@@ -348,6 +467,38 @@ nlohmann::json Engines::simStatsJson() const {
             {"sentBytes", s.sentBytes},
         };
     }
+#if MA_WITH_SENSOR_MODEL
+    // 探测模型的**真实读数**（D.2 第 5 步）：senseCalls/sensorErrors 来自引擎自身计数，
+    // 其余来自适配器；未装配时如实写 instantiated=false 并给出原因。
+    {
+        nlohmann::ordered_json sj;
+        sj["instantiated"] = (sensorBridge != nullptr);
+        sj["specSource"] = sensorNote;
+        sj["attachments"] = static_cast<int>(sensorAttachments.size());
+        nlohmann::ordered_json rows = nlohmann::ordered_json::array();
+        for (const auto& a : sensorAttachments) {
+            rows.push_back(nlohmann::ordered_json{{"platformId", a.platformId},
+                                                  {"sensorId", a.sensorId},
+                                                  {"rangeM", a.rangeM},
+                                                  {"intervalMs", a.intervalMs}});
+        }
+        sj["attachmentDetail"] = std::move(rows);
+        if (bridge.engine) {
+            const sim_source::Metrics m = bridge.engine->metrics();
+            const sim_source::Capabilities cap = bridge.engine->capabilities();
+            sj["engineSensorCalls"] = m.sensorCalls;
+            sj["engineSensorErrors"] = m.sensorErrors;
+            sj["observationsEmitted"] = m.observationsEmitted;
+            sj["customSensorInjected"] = cap.customSensorInjected;
+            sj["engineSensors"] = cap.sensors;
+        }
+        if (sensorBridge) {
+            const nlohmann::json bs = sensorBridge->statsJson();
+            for (auto it = bs.begin(); it != bs.end(); ++it) sj[it.key()] = it.value();
+        }
+        out["sensor"] = std::move(sj);
+    }
+#endif
     out["note"] = simNote;
     return out;
 }
@@ -476,11 +627,24 @@ void Engines::report(Registry& reg) const {
     reg.set("simSource", true, bridge.engine != nullptr,
             bridge.engine ? (simNote + "；出口 " + ingestEndpoint) : "装配失败（见启动日志）");
     {
-        std::string note = "未装配";
 #if MA_WITH_SENSOR_MODEL
-        note = "已装配（本份配置未挂接探测模型）";
+        // **真值**（D.2 第 5 步）：instantiated 只在"引擎真的持有自定义模型"时为 true ——
+        // 证据是 `capabilities().customSensorInjected` 与适配器对象同时在位。
+        bool injected = false;
+        int sensors = 0;
+        if (bridge.engine) {
+            const sim_source::Capabilities cap = bridge.engine->capabilities();
+            injected = cap.customSensorInjected;
+            sensors = cap.sensors;
+        }
+        const bool ok = (sensorBridge != nullptr) && injected;
+        std::string note = sensorNote.empty() ? "未装配" : sensorNote;
+        if (!ok) note += "（instantiated=false：customSensorInjected=" +
+                         std::string(injected ? "1" : "0") + "）";
+        reg.set("sensorModel", true, ok, note);
+#else
+        reg.set("sensorModel", false, false, "编译期 MA_WITH_SENSOR_MODEL=0（模块未装配）");
 #endif
-        reg.set("sensorModel", MA_WITH_SENSOR_MODEL != 0, false, note);
     }
 #else
     reg.set("simSource", MA_WITH_SIM_SOURCE != 0, false,
@@ -506,6 +670,9 @@ void Engines::stop() {
     if (bridge.driver) bridge.driver->stop();
     bridge.driver.reset();
     bridge.sink.reset();   // 出口在引擎之前放掉（引擎还持有 shared_ptr，不会悬空）
+#if MA_WITH_SENSOR_MODEL
+    sensorBridge.reset();  // 探测模型也持有引擎的引用（setSensorModel 是 shared_ptr）
+#endif
     bridge.engine.reset();
 #endif
 #if MA_WITH_INGEST

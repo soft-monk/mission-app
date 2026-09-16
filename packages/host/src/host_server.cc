@@ -352,8 +352,7 @@ void HostServer::registerRoutes() {
 
 #if MA_WITH_GEO
     // ---- 瓦片路由：归一请求 → geo-data 的 TileService → 写回
-    //      宿主不解析坐标、不做缓存策略、不做业务判断。
-    //
+    //      宿主不解析坐标、不做缓存策略、不做业务判断。    //
     // ★ 路由必须按**正则**注册整棵子树：drogon 的 `registerHandler(path, …)` 对不含
     //   占位符的路径是**精确匹配**（HttpControllersRouter 的 simpleCtrlMap_），只注册
     //   `route` 本身的后果是任何 `/tiles/...` 子路径都落到 drogon 自带的 HTML 404，
@@ -437,6 +436,204 @@ void HostServer::registerRoutes() {
             {drogon::Get, drogon::Head});
     }
 #endif
+
+    // ---- /media/**：媒体字节流（F1 明确允许的**唯一** per-feature HTTP 路由）----
+    //
+    // 为什么不能复用瓦片那条路由（事实）：
+    //   · 那条路由属于 geo-data，只认瓦片包的版本化路径，**不认任意文件**；
+    //   · 它对 `Stream` 形态的正文是"抽干进内存再 setBody"（`while(next(chunk)) all.insert(...)`）
+    //     —— 大文件等于把整个文件读进内存，也没有 Range/206 语义。
+    // 所以这里自己实现：**只读请求到的那一段字节**（seekg + read），完整支持
+    //   · 200 + Content-Length + Accept-Ranges: bytes
+    //   · Range: bytes=a-b / bytes=a- / bytes=-n → 206 + Content-Range
+    //   · 越界/不可满足 → 416 + Content-Range: bytes */size
+    //   · 不存在 / 目录 / 越权路径（..）→ **404**（不是 200 + 一张 HTML 提示页）
+    //   · HEAD 只回头不回体
+    // 路径安全：先拒绝含 ".." 的段，再把解析后的绝对路径与 mediaRoot 的规范路径比前缀。
+    {
+        const std::string root = cfg_.mediaRoot.empty() ? std::string()
+                                                        : cfg_.resolvePath(cfg_.mediaRoot);
+        app.registerHandlerViaRegex(
+            "/media(?:/.*)?",
+            [root](const drogon::HttpRequestPtr& req,
+                   std::function<void(const drogon::HttpResponsePtr&)>&& cb) {
+                auto notFound = [&cb](const std::string& why) {
+                    nlohmann::json body;
+                    body["code"] = 1004;
+                    body["error"] = {{"message", why}};
+                    auto resp = drogon::HttpResponse::newHttpResponse();
+                    resp->setStatusCode(drogon::k404NotFound);
+                    resp->setContentTypeCode(drogon::CT_APPLICATION_JSON);
+                    resp->setBody(body.dump());
+                    cb(resp);
+                };
+                auto rangeErr = [&cb](std::uintmax_t size) {
+                    nlohmann::json body;
+                    body["code"] = 1000;
+                    body["error"] = {{"message", "Range 不可满足"}};
+                    auto resp = drogon::HttpResponse::newHttpResponse();
+                    resp->setStatusCode(drogon::k416RequestedRangeNotSatisfiable);
+                    resp->setContentTypeCode(drogon::CT_APPLICATION_JSON);
+                    resp->addHeader("Content-Range", "bytes */" + std::to_string(size));
+                    resp->addHeader("Accept-Ranges", "bytes");
+                    resp->setBody(body.dump());
+                    cb(resp);
+                };
+
+                if (root.empty()) {
+                    notFound("未托管媒体：config.json 的 mediaRoot 为空");
+                    return;
+                }
+                std::string path = req->getPath();
+                if (path.empty()) path = req->getOriginalPath();
+                const std::string prefix = "/media/";
+                std::string rel = path == "/media" ? std::string()
+                                                   : (path.rfind(prefix, 0) == 0
+                                                          ? path.substr(prefix.size())
+                                                          : std::string());
+                if (rel.empty()) {
+                    notFound("缺文件名：/media/<子目录>/<文件>");
+                    return;
+                }
+                // 反斜杠统一成 '/' 之后逐段拒绝 `..`（Windows 上两种分隔符都要挡）
+                for (char& c : rel) {
+                    if (c == '\\') c = '/';
+                }
+                for (std::size_t i = 0; i < rel.size();) {
+                    const std::size_t j = rel.find('/', i);
+                    const std::string seg = rel.substr(i, j == std::string::npos ? j : j - i);
+                    if (seg == ".." || seg.empty()) {
+                        notFound("非法路径段：" + seg);
+                        return;
+                    }
+                    if (j == std::string::npos) break;
+                    i = j + 1;
+                }
+
+                std::error_code ec;
+                const fs::path rootPath = fs::weakly_canonical(fs::path(root), ec);
+                const fs::path full = fs::weakly_canonical(rootPath / fs::path(rel), ec);
+                const std::string fullStr = full.generic_string();
+                const std::string rootStr = rootPath.generic_string();
+                if (fullStr.rfind(rootStr, 0) != 0) {
+                    notFound("越权路径（不在 mediaRoot 下）");
+                    return;
+                }
+                if (!fs::exists(full, ec) || !fs::is_regular_file(full, ec)) {
+                    notFound("文件不存在：" + rel);
+                    return;
+                }
+                const std::uintmax_t size = fs::file_size(full, ec);
+                if (ec) {
+                    notFound("读不到文件大小：" + rel);
+                    return;
+                }
+
+                const auto ext = full.extension().string();
+                std::string ctype = "application/octet-stream";
+                if (ext == ".jpg" || ext == ".jpeg") ctype = "image/jpeg";
+                else if (ext == ".png") ctype = "image/png";
+                else if (ext == ".mp4") ctype = "video/mp4";
+                else if (ext == ".webm") ctype = "video/webm";
+                else if (ext == ".m4v") ctype = "video/x-m4v";
+                else if (ext == ".json") ctype = "application/json";
+                else if (ext == ".txt") ctype = "text/plain; charset=utf-8";
+
+                // ---- Range 解析（单段；多段按 RFC 允许忽略 → 回 200 全量）----
+                std::uintmax_t begin = 0;
+                std::uintmax_t end = size == 0 ? 0 : size - 1;
+                bool partial = false;
+                const std::string range = req->getHeader("range");
+                if (!range.empty() && size > 0) {
+                    std::string spec = range;
+                    if (spec.rfind("bytes=", 0) == 0) spec = spec.substr(6);
+                    if (spec.find(',') != std::string::npos) {
+                        // 多段 Range：本实现明确不支持 → 忽略 Range，回 200 全量（如实可观测）
+                    } else {
+                        const std::size_t dash = spec.find('-');
+                        if (dash == std::string::npos) {
+                            rangeErr(size);
+                            return;
+                        }
+                        const std::string a = spec.substr(0, dash);
+                        const std::string b = spec.substr(dash + 1);
+                        try {
+                            if (a.empty() && !b.empty()) {  // bytes=-n：最后 n 字节
+                                const std::uintmax_t n = std::stoull(b);
+                                if (n == 0) {
+                                    rangeErr(size);
+                                    return;
+                                }
+                                begin = n >= size ? 0 : size - n;
+                                end = size - 1;
+                                partial = true;
+                            } else if (!a.empty()) {
+                                begin = std::stoull(a);
+                                if (begin >= size) {
+                                    rangeErr(size);
+                                    return;
+                                }
+                                if (!b.empty()) {
+                                    end = std::stoull(b);
+                                    if (end >= size) end = size - 1;
+                                } else {
+                                    end = size - 1;
+                                }
+                                if (end < begin) {
+                                    rangeErr(size);
+                                    return;
+                                }
+                                partial = true;
+                            }
+                        } catch (const std::exception&) {
+                            rangeErr(size);
+                            return;
+                        }
+                    }
+                }
+
+                const std::uintmax_t want = size == 0 ? 0 : (end - begin + 1);
+                std::string body;
+                if (size > 0 && want > 0) {
+                    std::ifstream in(full, std::ios::binary);
+                    if (!in) {
+                        notFound("打不开文件：" + rel);
+                        return;
+                    }
+                    body.resize(static_cast<std::size_t>(want));
+                    in.seekg(static_cast<std::streamoff>(begin));
+                    in.read(&body[0], static_cast<std::streamsize>(want));
+                    body.resize(static_cast<std::size_t>(in.gcount()));
+                }
+
+                const bool head = req->method() == drogon::Head;
+                auto resp = drogon::HttpResponse::newHttpResponse();
+                resp->setStatusCode(partial ? drogon::k206PartialContent : drogon::k200OK);
+                resp->setContentTypeString(ctype);  // 替换（不是 addHeader）—— 避免双 content-type
+                resp->addHeader("Accept-Ranges", "bytes");
+                resp->addHeader("Cache-Control", "no-store");
+                if (partial) {
+                    resp->addHeader("Content-Range",
+                                    "bytes " + std::to_string(begin) + "-" +
+                                        std::to_string(end) + "/" + std::to_string(size));
+                }
+                // ★ content-length **不自己加**（GET/206）：正文长度就是 Content-Length，
+                //   drogon 会按 body 写一个；自己再加一个会写出两条同名头（实测 undici 直接报
+                //   `ResponseContentLengthMismatchError`）。HEAD 没有正文，必须自己给长度，
+                //   否则客户端会以为资源是 0 字节。
+                if (head) {
+                    resp->addHeader("Content-Length", std::to_string(want));
+                } else {
+                    resp->setBody(body);
+                }
+                LOG_INFO << "[host][media] " << (head ? "HEAD " : "GET ") << rel << " → "
+                         << (partial ? 206 : 200) << " bytes=" << begin << "-" << end << "/" << size;
+                cb(resp);
+            },
+            {drogon::Get, drogon::Head});
+        LOG_INFO << "[host] 媒体路由: /media/**（root="
+                 << (root.empty() ? std::string("(未配置：一律 404)") : root) << "）";
+    }
 
     refreshIndexHint();
 

@@ -315,6 +315,16 @@ else()
   message(STATUS "[mission-app] 跳过 scenario-data / sim-bridge：sim-source 未装配")
 endif()
 
+# 探测模型的形状适配器（sensor_bridge.cc）**只在 sensor-model 真的装配时**才编：
+# 它 include 的是模块的公开头（sensor_model/sensor_model.h），模块不在就没有那个头 ——
+# 与其编不过，不如按本文件既有纪律"模块不在 = 编译期事实"整段跳过。
+if(MA_HAVE_SENSOR_MODEL AND TARGET sensor_model)
+  set(MA_HAVE_SENSOR_BRIDGE ON)
+else()
+  set(MA_HAVE_SENSOR_BRIDGE OFF)
+  message(STATUS "[mission-app] 跳过 sensor_bridge.cc：sensor-model 未装配")
+endif()
+
 # ================================================================ 依赖：Drogon
 if(NOT TARGET Drogon::Drogon)
   find_package(Drogon CONFIG REQUIRED)
@@ -333,6 +343,11 @@ add_executable(mission_host
   packages/host/src/host_server.cc
   packages/host/src/drogon_transport.cc
   packages/host/src/hub_engine.cc)
+
+# 探测模型的形状适配器（sensor_bridge.cc）：模块在才编（见上面的 MA_HAVE_SENSOR_BRIDGE）。
+if(MA_HAVE_SENSOR_BRIDGE)
+  target_sources(mission_host PRIVATE packages/host/src/sensor_bridge.cc)
+endif()
 
 target_include_directories(mission_host PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/packages/host/include")

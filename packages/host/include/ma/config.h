@@ -32,6 +32,12 @@ struct HostConfig {
     std::string tilesRoot;  // 空 = 不托管任何包
     std::string tilesSubDir = "raster";
 
+    // ---- 媒体素材根目录（相对路径锚在配置文件旁边；**空 = /media/** 不托管**）----
+    //
+    // 它只回答"字节从哪个目录来"：通道清单由宿主扫这个目录得到（子目录 = image-seq 通道，
+    // 视频文件 = video 通道），字节流走 HostServer 的 /media/** 路由（支持 Range/206）。
+    std::string mediaRoot;
+
     // ---- selfcheck 规则包（可选；文件不存在则跳过装载，如实记 note）
     std::string selfcheckPolicies;
     std::string selfcheckCapabilities;

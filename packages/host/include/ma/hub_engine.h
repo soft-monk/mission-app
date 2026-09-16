@@ -18,6 +18,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -43,7 +44,17 @@ class IngestToHubSink final
 #endif
 {
 public:
+    /// 报文旁路（**只旁听，不改广播行为**）：`(事件名, data, 到货挂钟 ms)`。
+    ///
+    /// 为什么需要它：步 6 的链路评估要拿**线上真报文**喂 `topology.ingest`，而这条
+    /// sink 是报文进进程后的第一个落脚点。宿主侧只做"入队"，真正的形状转换与投递在
+    /// 命令线程（topology 全模块无锁，见《流程接口冻结》§7）。
+    /// 回调在**接入层线程**里被调用 → 实现 MUST 立即返回、自己保证线程安全。
+    using FrameTap = std::function<void(const std::string& type, const nlohmann::json& data,
+                                       int64_t recvAtMs)>;
+
     explicit IngestToHubSink(realtime_hub::RealtimeHub& hub);
+    void setFrameTap(FrameTap tap);
 
 #if MA_WITH_INGEST
     // ---- 数据出口（两条都实现）----
@@ -57,13 +68,16 @@ public:
     std::uint64_t dropped() const { return dropped_; }  // 事件名非法被 hub 拒的次数
     std::uint64_t batches() const { return batches_; }
     std::uint64_t healthEvents() const { return healthEvents_; }
+    std::uint64_t tapped() const { return tapped_; }
 
 private:
     realtime_hub::RealtimeHub& hub_;
+    FrameTap tap_;
     std::uint64_t forwarded_ = 0;
     std::uint64_t dropped_ = 0;
     std::uint64_t batches_ = 0;
     std::uint64_t healthEvents_ = 0;
+    std::uint64_t tapped_ = 0;
 };
 
 /// 广播腿的生命周期与读数。

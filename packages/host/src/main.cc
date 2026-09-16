@@ -247,11 +247,12 @@ json capabilitySnapshot(const ma::HostConfig& cfg, ma::Engines& e, ma::Registry&
     // ---- 系统安全：核心子系统**在位**才算完整性通过（可复核：逐条来自就绪账本）
     //
     // 口径说明：`ingest` 那一条账本记的是"只链接、start() 由 main 后置调用"，
-    // 所以这里以 `gatewayRunning` 为准；`sensorModel` 尚未装配（P4 才接）不计入核心。
+    // 所以这里以 `gatewayRunning` 为准；`sensorModel` 在 P4 之前没接（跳过），
+    // P4 接上之后它**在位就算数**（未装配时仍跳过，避免状态条谎报"故障"）。
     {
         bool coreReady = true;
         for (const auto& row : reg.entries()) {
-            if (row.key == "sensorModel") continue;
+            if (row.key == "sensorModel" && !row.instantiated) continue;
 #if MA_WITH_INGEST
             if (row.key == "ingest") {
                 if (!e.gatewayRunning) coreReady = false;
@@ -270,12 +271,12 @@ json capabilitySnapshot(const ma::HostConfig& cfg, ma::Engines& e, ma::Registry&
     // ---- 系统就绪 / 遥测存活（状态条用）
     //
     // 口径与"系统完整性"一致：核心子系统在位 + 接入层真的在跑。**不能**用"全部 entries 都
-    // instantiated"——账本里的 `sensorModel`（P4 才接）与 `ingest`（后置 start()）会把它永久
-    // 判成 false，症状是底部状态条一直显示"系统状态 故障"。
+    // instantiated"——账本里的 `ingest`（后置 start()）会把它永久判成 false，
+    // 症状是底部状态条一直显示"系统状态 故障"。
     {
         bool coreReady = true;
         for (const auto& row : reg.entries()) {
-            if (row.key == "sensorModel") continue;
+            if (row.key == "sensorModel" && !row.instantiated) continue;
 #if MA_WITH_INGEST
             if (row.key == "ingest") {
                 if (!e.gatewayRunning) coreReady = false;
@@ -479,6 +480,15 @@ int main(int argc, char** argv) {
             hubEngine.hub().broadcast(type, data);
         });
     flow.setClientCounter([&hubEngine]() { return static_cast<int>(hubEngine.hub().clientCount()); });
+    // ---- 线上报文旁路：接入层的同一条出口再挂一个 tap（只入队）→ 步 6 的链路评估用 ----
+    //
+    // 为什么走 tap 而不是让 flow 直接连 device-ingest：报文进进程后的第一个落脚点就是这条
+    // sink，而 topology 全模块无锁（单线程假设）—— 只有命令线程在 `mtx_` 之下才能投递。
+    // 所以这里只把报文交给 flow 入队，形状转换与 ingest 都发生在 `topology.evaluate` 里。
+    hubEngine.sink().setFrameTap(
+        [&flow](const std::string& type, const nlohmann::json& data, int64_t recvAtMs) {
+            flow.onWireEvent(type, data, recvAtMs);
+        });
     flow.setCapabilityProbe([&cfg, &engines, &registry, &hubEngine]() {
         return capabilitySnapshot(cfg, engines, registry, hubEngine);
     });
@@ -565,6 +575,11 @@ int main(int argc, char** argv) {
     engines.report(registry);
 
     // ---- 仿真节拍：起驱动线程（真实时间 × 倍速）
+    //
+    // ★ 演示叙事（P4 起）：`simAutoStart=false` —— **"起飞"发生在步 6（任务执行）**，
+    //   由流程层在 `mission.advance` 到 T2 / `flow.goto` 到 6 时自动调 `sim.start`。
+    //   也就是说"打开页面就有遥测在跑"不是本应用的口径；要遥测就先让流程走到步 6
+    //   （或手动发 `sim.start`）。
 #if MA_WITH_SIM_SOURCE && MA_WITH_INGEST
     if (simReady && engines.bridge.driver) {
         engines.bridge.driver->setSpeed(cfg.simSpeed);
@@ -574,7 +589,8 @@ int main(int argc, char** argv) {
             std::cout << "[host] 仿真已启动：" << cfg.simSpeed << "x → " << cfg.ingestHost << ":"
                       << cfg.ingestPort() << "\n";
         } else {
-            std::cout << "[host] 仿真未启动（--no-sim 或 simAutoStart=false）；可随时用 --speed 路径重启\n";
+            std::cout << "[host] 仿真未启动（--no-sim 或 simAutoStart=false）："
+                      << "流程进入步 6（T2）时自动起飞，或手动 sim.start\n";
         }
     }
 #endif
@@ -597,7 +613,11 @@ int main(int argc, char** argv) {
               << "    健康   http://" << cfg.host << ":" << cfg.port << "/health\n"
               << "    统计   http://" << cfg.host << ":" << cfg.port << "/stats\n"
               << "    实时   ws://" << cfg.host << ":" << cfg.port << "/ws\n"
-              << "    瓦片模板 " << cfg.tilesTemplate << "\n";
+              << "    瓦片模板 " << cfg.tilesTemplate << "\n"
+              << "    媒体   " << (cfg.mediaRoot.empty()
+                                          ? std::string("/media/** 未托管（mediaRoot 为空）")
+                                          : "/media/** ← " + cfg.resolvePath(cfg.mediaRoot))
+              << "\n";
     if (!server.indexHint().empty()) {
         std::cout << "    （前端产物不存在：" << server.indexHint() << " —— / 返回提示页）\n";
     }
