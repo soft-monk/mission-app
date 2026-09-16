@@ -21,6 +21,14 @@ export const C = {
   warn: '#f59e0b',
   bad: '#ef4444',
   unknown: '#64748b',
+  /**
+   * 「已失效 / 已清除」的中性色（步 10 目标命中变灰、步 11 毁伤评估同一口径）。
+   *
+   * 为什么不叫 gray/disabled：**这个色的含义由引擎给的状态决定**（`target.state` 的
+   * `status=gray` / `dynamicState=destroyed`），不是在说"这个控件不能点"。规则包给别的
+   * 状态名时，取值仍然走 `statusColor()`，本令牌只负责"失效"这一档。
+   */
+  muted: '#8b93a7',
   bar: 'linear-gradient(90deg, #1d4ed8 0%, #38bdf8 100%)',
 } as const
 
@@ -43,9 +51,12 @@ export const panelTitle: CSSProperties = {
 /** 状态色：`status` 文案由规则包给出（normal/abnormal/online/stable/…），这里只做**颜色归类**。 */
 export function statusColor(status?: string): string {
   const s = (status ?? '').toLowerCase()
-  if (['ok', 'normal', 'online', 'stable', 'safe', 'ready', 'fixed', 'pass'].includes(s)) return C.ok
-  if (['degraded', 'unstable', 'warn', 'partial', 'attention'].includes(s)) return C.warn
-  if (['fail', 'abnormal', 'offline', 'broken', 'risk', 'lost', 'fault'].includes(s)) return C.bad
+  if (['ok', 'normal', 'online', 'stable', 'safe', 'ready', 'fixed', 'pass', 'green'].includes(s)) return C.ok
+  if (['degraded', 'unstable', 'warn', 'partial', 'attention', 'yellow'].includes(s)) return C.warn
+  if (['fail', 'abnormal', 'offline', 'broken', 'risk', 'lost', 'fault', 'red'].includes(s)) return C.bad
+  // 规则包 `threatFactors.json` 的 `bands[].state` 取值域就是 red/yellow/gray；
+  // gray = 该档威胁等级判为"已失效"，用中性令牌（不是"未知"）。
+  if (['gray', 'grey', 'muted', 'inactive', 'cleared', 'destroyed', 'struck'].includes(s)) return C.muted
   return C.unknown
 }
 

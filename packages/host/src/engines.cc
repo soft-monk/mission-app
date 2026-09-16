@@ -420,6 +420,42 @@ bool Engines::attachSensorModel(const std::string& dir, const sim_source::SimSce
 }
 #endif  // MA_WITH_SENSOR_MODEL
 
+// ---------------------------------------------------------------- P7：仿真源重建
+//
+// `sim.reset` 的引擎侧实现：**先停旧驱动**，再走装配期同一条路重新装载。
+//
+// 为什么必须"先停"（不是可选的整洁）：`sim_bridge::build()` 第一行就是 `out = Bridge{}`
+// —— 它会把旧的 Driver/SimSource 析构掉。若旧驱动线程还在跑，它可能正卡在
+// `engine_.tick()` 里（sim-source 全模块单写者、无锁），join 之前析构引擎 = 悬空引用。
+// 所以这里显式 `stop()`（它自己 join），再让 build 去替换。
+bool Engines::rebuildSimulation(const std::string& kindName, const std::string& wireType,
+                                const std::string& host, int port, std::string& error) {
+    // ① 先停旧驱动（join 驱动线程）—— 见上。
+    if (bridge.driver) bridge.driver->stop();
+
+    // ② 场景目录用**装配期解析出来的那一个**（不在这里重新解释 config：锚点规则只在一处）。
+    if (scenarioDir.empty()) {
+        error = "场景目录为空（装配期 loadSimulation 未成功过）→ 没有可重建的仿真源";
+        return false;
+    }
+
+    // ③ 与装配期同一条路：loadScenario 重读本地配置 → build 新建 SimSource/Driver/UdpWireSink
+    //    → attachSensorModel 重建规格表与挂接清单。接入点（host/port）原样传入。
+    if (!loadSimulation(scenarioDir, kindName, wireType, host, port, error)) return false;
+
+    // ④ 重建后**自己确认真起来了**（三件都在才算数）：少一件就如实报失败，
+    //    不把"看着像重置了"当成功（调用方据此回 1005）。
+    if (!bridge.engine || !bridge.driver || !bridge.sink) {
+        error = "重建后不完整（engine=" + std::string(bridge.engine ? "有" : "无") +
+                " driver=" + std::string(bridge.driver ? "有" : "无") +
+                " sink=" + std::string(bridge.sink ? "有" : "无") +
+                "）→ 现场读数见回执 data.state";
+        return false;
+    }
+    error.clear();
+    return true;
+}
+
 nlohmann::json Engines::simStatsJson() const {
     nlohmann::ordered_json out;
     out["configDir"] = scenarioDir;

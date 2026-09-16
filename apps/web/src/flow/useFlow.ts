@@ -35,6 +35,14 @@ export interface UseFlow {
   lastReply: CommandReply | null
   /** 按事件名留存的最近一份负载（`sim.state` / `media.channels` / `entity.changed`…） */
   events: Record<string, EventSlot>
+  /**
+   * 订阅某类事件（**复用本钩子那一条 WS 通道**），返回取消订阅的函数。
+   *
+   * 为什么不在屏里自己 `createChannel`：那会开出**第二条**连接，多一份心跳与解析开销，
+   * 而且"事件是不是收到了"会变成两处真相。步 10 要**累积**每一条 `target.state`
+   * （状态迁移链），`events` 只留最近一份不够用，所以从这里挂一个回调。
+   */
+  bind: (type: string, fn: (data: Record<string, unknown>, ts: number) => void) => () => void
   /** 事件通道的累计计数（排障用；`channel.stats` 原样） */
   wsStats: { received: number; unknown: number; malformed: number } | null
   /**
@@ -51,11 +59,20 @@ export interface UseFlow {
 const POLL_MS = 500
 
 /**
- * 本页面**订阅**的事件名（步 3–7 用到的）。
+ * 本页面**订阅**的事件名（步 3–11 用到的）。
  *
  * 纪律：只订阅要用的事件；没订阅的事件仍会走 `onUnknown`（打日志，不静默丢）。
  * 留一份最新值给界面即可——这几个事件都是"状态快照"语义（`sim.state` / `media.channels`），
  * 不需要队列；真正的台账类数据仍由各屏自己发 verb 取（单一权威来源）。
+ *
+ * 步 10/11 新增订阅的三个口径：
+ *   · `target.state` = 引擎 `TargetStateEvent.toJson()`
+ *     `{targetId,targetNo,threat,confidence,dynamicState,lng,lat,status,ts}`（entity_ledger.h:1112）
+ *     —— 步 10 的"命中/变灰"**只认它**（前端 MUST NOT 自己判定命中）；
+ *   · `alert.raised/updated/acked` = `AlertDelivery.toJson()`（步 11 的预警条旁证；
+ *     计数权威是 `report.generate` 回执里 alert-engine 的 counts）；
+ *   · `report.ready` = `ReportReadyPayload.toJson()`
+ *     `{reportNo,missionId,path,schemaVersion,generatedAt}` —— 收到即重取一次回执。
  */
 const EVENT_TOPICS = [
   'sim.state',
@@ -63,6 +80,11 @@ const EVENT_TOPICS = [
   'topology.changed',
   'entity.changed',
   'target.state',
+  // 步 11：报告已生成的通知 + 告警投递（计数权威仍是 `report.generate` 的回执）
+  'report.ready',
+  'alert.raised',
+  'alert.updated',
+  'alert.acked',
 ] as const
 
 /** `wsStats` 的轮询间隔（排障计数不必跟事件同频） */
@@ -77,6 +99,8 @@ export function useFlow(wsUrl: string): UseFlow {
   const [wsStats, setWsStats] = useState<UseFlow['wsStats']>(null)
   const stateRef = useRef<FlowState | null>(null)
   stateRef.current = state
+  /** 屏自己挂的事件回调（`bind`）；与上面的"最近一份"互不影响。 */
+  const bindRef = useRef(new Map<string, Set<(data: Record<string, unknown>, ts: number) => void>>())
 
   const pull = useCallback(async () => {
     try {
@@ -138,8 +162,12 @@ export function useFlow(wsUrl: string): UseFlow {
       // 只走事件的数据源（`sim.state` / `media.channels`）：留最近一份给界面读，**原样不改**
       for (const type of EVENT_TOPICS) {
         channel.on(type, (data: Record<string, unknown>, env: Envelope) => {
-          const slot: EventSlot = { ts: typeof env?.ts === 'number' ? env.ts : Date.now(), data }
+          const ts = typeof env?.ts === 'number' ? env.ts : Date.now()
+          const slot: EventSlot = { ts, data }
           setEvents((prev) => ({ ...prev, [type]: slot }))
+          // 屏自己挂的回调（步 10 累积 `target.state` 用）：一个抛错不影响别人
+          const set = bindRef.current.get(type)
+          if (set) for (const fn of [...set]) { try { fn(data, ts) } catch { /* 屏里的回调自己兜底 */ } }
         })
       }
       channel.onUnknown((env: Envelope) => console.warn(`[ws] 未订阅事件：${env.type}`))
@@ -167,5 +195,12 @@ export function useFlow(wsUrl: string): UseFlow {
     return reply
   }, [pull])
 
-  return { state, error, send, lastReply, replies, events, wsStats, refresh: () => void pull() }
+  const bind = useCallback((type: string, fn: (data: Record<string, unknown>, ts: number) => void) => {
+    let set = bindRef.current.get(type)
+    if (!set) { set = new Set(); bindRef.current.set(type, set) }
+    set.add(fn)
+    return () => { bindRef.current.get(type)?.delete(fn) }
+  }, [])
+
+  return { state, error, send, lastReply, replies, events, bind, wsStats, refresh: () => void pull() }
 }

@@ -209,6 +209,28 @@ struct Engines {
                            std::string& error);
 #endif
 
+#if MA_WITH_SIM_SOURCE && MA_WITH_INGEST
+    // ---------------------------------------------------------------- P7：仿真源重建
+    //
+    // 为什么需要它（实测）：`mission.reset` / `boot.reset` 只清**任务与阶段**，仿真本身回不到
+    // 起点 —— 平台已经飞完、已经 `arrived`、甚至已经被 `exec.run` 改过高度/速度档（俯冲剖面）。
+    // 没有这条入口，"不重启进程再跑一遍"就只能跑一个**接着上一轮**的仿真（看起来重置了，
+    // 其实没有）。所以重建必须发生在**引擎对象层**，而不是靠清计数器糊过去。
+    //
+    /// 把仿真源重建到**刚装配好的状态**（`sim.reset` 的实现）。四件事，顺序不能换：
+    ///   ① **先停旧驱动**（`Driver::stop()` 会 join 驱动线程）—— 替换期间绝不允许还有一条
+    ///      线程在 `tick()` 即将析构的引擎（sim-source 是单写者假设，模块无锁）；
+    ///   ② 走**装配期同一条路**重新装载：`loadScenario`（重读本地配置）→ `sim_bridge::build`
+    ///      （新建 SimSource + Driver + UdpWireSink）→ `attachSensorModel`（重建规格表与挂接）；
+    ///   ③ **接入点与出口目标原样**（host/port 不变）→ device-ingest / hub 侧零改动；
+    ///   ④ 不自动起飞、不自动设倍速（调用方按重建前的读数恢复；见 FlowEngine::rebuildSimLocked）。
+    ///
+    /// 失败 → false 且 `error` 给出可读原因；此时 `sim_bridge::build` 已先 `out = Bridge{}`
+    /// （`bridge.engine == nullptr`），调用方 MUST 如实回 1005 + 现场读数，**不许假装重置成功**。
+    bool rebuildSimulation(const std::string& kindName, const std::string& wireType,
+                           const std::string& host, int port, std::string& error);
+#endif  // MA_WITH_SIM_SOURCE && MA_WITH_INGEST
+
     /// 把就绪状态写进账本（顺序 = 装配顺序）。
     void report(Registry& reg) const;
 

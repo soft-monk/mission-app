@@ -25,6 +25,8 @@ import { ExecuteScreen } from './screens/ExecuteScreen'
 import { TargetsScreen } from './screens/TargetsScreen'
 import { StrikeScreen } from './screens/StrikeScreen'
 import { StrikeConfirmScreen } from './screens/StrikeConfirmScreen'
+import { GuidanceScreen } from './screens/GuidanceScreen'
+import { SummaryScreen } from './screens/SummaryScreen'
 import { MapStage } from './MapStage'
 
 function param(name: string): string | null {
@@ -205,6 +207,23 @@ export function App() {
               onSelectPlan={setStrikePlanId}
               onBack={() => goto(8)}
             />
+          </StageOverlay>
+        )}
+
+        {/* 步 10 协同执行与引导（T6-1 实时态势 / T6-2 引导控制）：目标处置
+            （`exec.run` / `exec.abort`）逐条回执 + `target.state` 事件驱动的状态与**地图变灰**
+            （颜色只由引擎状态决定）+ 回传画面（`media.channels`）。 */}
+        {step === 10 && (
+          <StageOverlay>
+            <GuidanceScreen state={state} flow={flow} onNext={() => goto(11)} />
+          </StageOverlay>
+        )}
+
+        {/* 步 11 任务总结（T7-1 毁伤评估 / T7-2 结果汇总）：`report.generate` 的报告卡
+            （分组/字段/缺失原因全部以返回结构为准）+ phase-engine 的时间轴 + 预警计数 + JSON 复看。 */}
+        {step === 11 && (
+          <StageOverlay>
+            <SummaryScreen state={state} flow={flow} onBack={() => goto(10)} />
           </StageOverlay>
         )}
       </div>

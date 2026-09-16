@@ -204,6 +204,24 @@ private:
     /// 返回回执片段（含"已自动起飞"的说明）；已 running → 幂等命中。
     nlohmann::json autoStartSimLocked();
 
+    // ---- P7：一键串联（`sim.reset` / `flow.runAll`）----
+    //
+    // 两条贯穿这段代码的口径：
+    //   ① **重置必须发生在引擎对象层**：只清计数器/只清任务不算重置（仿真本身回不到起点）。
+    //      所以 `sim.reset` 走 `Engines::rebuildSimulation`（停旧驱动 → 重建引擎/出口/驱动
+    //      → 重建探测适配器），宿主只负责"重建后把线接回去"（探测出口、累加器、倍速/运行态）。
+    //   ② **串联不许抄近路**：`flow.runAll` 的每一步都调 `command(...)`（与前端/验收脚本**同
+    //      一个入口**），MUST NOT 复制一份"更快的实现"绕开引擎。失败就停在那一步并如实报因。
+
+    /// P7 `sim.reset`：把仿真源重建到初始状态（见 Engines::rebuildSimulation）。**要求已持 `mtx_`**；
+    /// 回执 data 由它给出，`code` = 0 / 1005（失败时 data 里带现场读数，不假装重置成功）。
+    nlohmann::json rebuildSimLocked(int& code);
+
+    /// P7 `flow.runAll`：按 Excel 步序把 11 步一次跑完（每一步都走真实命令入口）。
+    /// **不持 `mtx_`**（它逐个调 `command()`，由那些入口各自加锁）。
+    /// 返回 `{prepare, steps[], speedDemos[], summary{ok,failedStep,totalMs,speed}, flow, notes}`。
+    nlohmann::json runAll(const std::string& verb, const nlohmann::json& params);
+
     // ---- 步 7：探测 → 台账（探测线程写入，独立锁）----
     /// 目标身份表：实体 id → 机型键（`typeKey`，来自场景数据）。
     std::map<std::string, std::string> targetTypeKeysLocked() const;
@@ -250,6 +268,55 @@ private:
     /// 所有几何来自 `strikeGeometryLocked()` 或台账；所有时刻都带 `basis`。要求已持 `mtx_`。
     nlohmann::json buildGuidancePlanLocked(const std::string& planId, const nlohmann::json& params,
                                            int& code);
+
+    // ---- 步 10–11（P6）：协同执行与引导 / 任务总结报告 ----
+    //
+    // 三条贯穿这段代码的口径：
+    //   ① **动作与状态一律由引擎裁决**：目标动作走 entity-ledger 的 `applyAction`（动作键与
+    //      `requires` 取自规则包 `entityTypes.json` 的**生效内容**），状态推进走 `setDynamicState`
+    //      （未声明的迁移引擎回 1003，宿主照实回执）。宿主只在**规则包声明的顺序**上补前置动作，
+    //      MUST NOT 绕过引擎的 Gate（其它内建守卫与宿主闸门一概不代劳）。
+    //   ② **命中判定必须由仿真读数派生**：`sim-source` 没有"命中"事件，宿主用 `SimSource::entities()`
+    //      的**逐帧读数**（平台位置/高度/速度）与台账里目标的**权威位置**做三维最近接近判定，
+    //      判据与输入全部进 `basis`（脚本可独立复算）。MUST NOT 写死"命中了"。
+    //   ③ 拿不到的一律留空 + `notes` / `dataGaps` 点名（P3 起的纪律，继续遵守）。
+
+    /// 步 10：按方案打击一个目标（目标动作 → 状态推进 → 仿真侧俯冲/命中派生 → 步 10）。
+    /// **要求已持 `mtx_`**；返回 `data`（`code` 由引擎裁决原样带出）。
+    nlohmann::json execRunLocked(const std::string& entityId, const nlohmann::json& params, int& code);
+
+    /// 步 10：撤销一次执行（`undoAction` / `removeFromSequence` / `setDynamicState` 回退）。
+    /// 能退到哪由引擎裁决 —— 退不动就**如实**回 1003 并把引擎的 `unmet[]` 原样带出。要求已持 `mtx_`。
+    nlohmann::json execAbortLocked(const std::string& entityId, const nlohmann::json& params, int& code);
+
+    /// 步 11：任务总结报告（report-engine `generate` + 时间轴 + 预警计数 + 台账汇总 + 留存层读数）。
+    /// **要求已持 `mtx_`**。
+    nlohmann::json buildReportLocked(const nlohmann::json& params, int& code);
+
+    /// `phase::durations(missionId)` 的**原样**读数（`durationsRaw` = 引擎 JSON 的逐字字符串）。
+    /// /api/state、`mission.timeline`、`report.generate` 三处共用它 → 三处逐字相等是构造保证。
+    /// 要求已持 `mtx_`。
+    nlohmann::json phaseDurationsLocked() const;
+
+    /// report-engine 规则包路径（`<MA_WEBMAP_ROOT>/report-engine/policies/mapapp/reportFields.json`）。
+    /// 读不到 → 空串（回执会如实点名，MUST NOT 用 `loadPoliciesFile` 那个恒失败的占位）。
+    static std::string reportPoliciesPath();
+
+    /// 一次 `exec.run` 的事实（`exec.abort` 与 `/api/state` 复用）。**只记引擎给过的东西**。
+    struct ExecRecord {
+        std::string entityId;
+        std::string missionId;
+        std::string planId;                     ///< 当时确认过的打击方案（IP 点几何的来源）
+        std::string stateBefore;                ///< exec.run 前的台账状态（原样）
+        std::string stateAfter;                 ///< exec.run 后的台账状态（原样）
+        std::string hitPlatformId;              ///< 读数派生出来的命中平台（空 = 未派生到命中）
+        std::vector<std::string> appliedActions;  ///< 执行成功的动作键（按序；撤销按逆序）
+        bool followedSequence = false;          ///< 是否由宿主补过 `addToSequence`（`$in-sequence`）
+        int64_t atMs = 0;
+        bool aborted = false;
+        nlohmann::json lastRun = nlohmann::json::object();   ///< exec.run 的原样回执
+        nlohmann::json lastAbort = nlohmann::json::object(); ///< exec.abort 的原样回执
+    };
 
     Engines& engines_;
     Registry& reg_;
@@ -365,6 +432,17 @@ private:
     /// 用途只有一个：步 9 的引导连线要取**台账里那台平台**的坐标（引擎仍是台账的唯一权威），
     /// 而不是让宿主从 deployment.json 另取一份（那样"台账里的位置"永远进不了界面）。
     std::map<std::string, std::string> entityIdOfDevice_;
+
+    // ---- 步 10–11（P6）：执行记录 + 最近一次报告回执 ----
+    /// 逐实体的执行事实（键 = entityId）。`exec.abort` 靠它知道"该撤哪些动作、退回哪个状态"。
+    std::map<std::string, ExecRecord> execRecords_;
+    /// 仿真侧俯冲剖面的施加次数与最近一次的说明（重复 `exec.run` 不重复改场景）。
+    int execDiveCount_ = 0;
+    /// 最近一次 `report.generate` 的**原样**回执（`/api/state` 给前端挂载时用，不重算）。
+    nlohmann::json lastReportRun_ = nlohmann::json::object();
+    /// 最近一次 `phase::durations()` 的逐字字符串（`/api/state` 与 `mission.timeline` 共用）
+    mutable std::string phaseDurationsRaw_;
+    mutable int64_t phaseDurationsAt_ = 0;
 };
 
 }  // namespace ma
