@@ -4948,8 +4948,8 @@ nlohmann::json FlowEngine::buildReportLocked(const nlohmann::json& params, int& 
 //   ③ **读数全部留痕**：每步记 `{step,verb,code,ms,key}`，另记该步每条命令的 code/ms/关键读数；
 //      倍速演示的每次 `sim.state` 读数原样进 `speedDemos`（脚本据此判"倍速确实变过"）。
 //
-// 入参：`{from?:1..11, to?:1..11, speed?:1|8|60, pacingMs?:number, reset?:bool, planId?:string,
-//        bootWaitMs?, targetsWaitMs?}`
+// 入参：`{from?:1..11, to?:1..11, speed?:1|8|60, pacingMs?:number, stepPacingMs?:number,
+//        reset?:bool, planId?:string, bootWaitMs?, targetsWaitMs?}`
 //   · `speed` 在第 6 步经 `sim.speed` 生效，并在同一步演示一次变速（默认 8 → 60 → 1；
 //     三次都记 `sim.state` 读数，串完回到请求的倍速）；
 //   · `reset`（默认 true）= 先 `sim.reset` + `mission.reset` + `boot.reset` 造一个**真起点**
@@ -4960,6 +4960,10 @@ nlohmann::json FlowEngine::runAll(const std::string& verb, const nlohmann::json&
     const int to = intOr(params, "to", 11);
     const int speed = intOr(params, "speed", 8);
     const int pacingMs = intOr(params, "pacingMs", 0);
+    // 步与步之间的停顿（默认 0 = 全速）：**只为演示"看得清"**（每一步跑完停一下，让界面把这一屏
+    // 渲染出来）。它只影响节奏，不影响任何取值：`steps[].ms` 仍是那一步的**纯工作时长**，
+    // 停顿不计进去（也不影响 code/读数）。
+    const int stepPacingMs = intOr(params, "stepPacingMs", 0);
     const bool doReset = params.value("reset", true);
     const int bootWaitMs = intOr(params, "bootWaitMs", 90000);
     const int targetsWaitMs = intOr(params, "targetsWaitMs", 90000);
@@ -4974,6 +4978,21 @@ nlohmann::json FlowEngine::runAll(const std::string& verb, const nlohmann::json&
     if (speed != 1 && speed != 8 && speed != 60) {
         return badRequest(verb, "speed 只接受 1 / 8 / 60（引擎 SimSource::setSpeed 的取值域）");
     }
+
+    // ---- 并发闸门：同一条流程上只允许一条串联 -------------------------------------------
+    // 前端连点两次"一键"、或脚本与页面同时发 → 两条串联会交叉驱动同一条流程（步骤/阶段/方案
+    // 指针互相踩），回执全都不可信。1002 = 互斥冲突（协议 §3 里 1002 唯一的用途）。
+    // RAII 释放：本函数有多处提前 return（准备失败/异常），漏一处就会把闸门永久锁死。
+    struct BusyGuard {
+        std::atomic<bool>* flag;
+        ~BusyGuard() { flag->store(false); }
+    };
+    if (runAllBusy_.exchange(true)) {
+        return reply(verb, 1002,
+                     {{"message", "已有一条 flow.runAll 在执行（互斥：同一条流程不能被两条串联交叉驱动）"},
+                      {"note", "等它跑完再发；要看当前进度就 GET /api/state"}});
+    }
+    BusyGuard busyGuard{&runAllBusy_};
 
     const int64_t t0 = wallClockMs();
     nlohmann::json prepare = nlohmann::json::object();
@@ -5020,10 +5039,18 @@ nlohmann::json FlowEngine::runAll(const std::string& verb, const nlohmann::json&
                 const auto it = d.find(k);
                 if (it != d.end() && !it->is_object() && !it->is_array()) o[k] = *it;
             }
-            for (const char* k : {"items", "targets", "areas", "zones", "steps", "channels",
-                                  "links", "dataGaps", "failures"}) {
+            for (const char* k : {"items", "targets", "areas", "zones", "platforms", "steps",
+                                  "channels", "links", "dataGaps", "failures"}) {
                 const auto it = d.find(k);
                 if (it != d.end() && it->is_array()) o[std::string(k) + "Count"] = it->size();
+            }
+            if (d.contains("before") && d["before"].is_object()) {
+                // `sim.reset` 的"重建前"现场读数（对照用：证明真的回到了起点）
+                const nlohmann::json b = d["before"];
+                for (const char* k : {"simElapsedMs", "speed", "running", "paused", "emitted",
+                                      "ticks"}) {
+                    if (b.contains(k)) o[std::string("before.") + k] = b[k];
+                }
             }
             if (d.contains("state") && d["state"].is_object()) {
                 for (const char* k : {"running", "paused", "speed", "simElapsedMs", "platforms",
@@ -5239,16 +5266,23 @@ nlohmann::json FlowEngine::runAll(const std::string& verb, const nlohmann::json&
             // ---------------------------------------------------------------- 步 4 编组方案
             if (step == 4) {
                 primary = "alloc.plans";
-                code = run(calls, "alloc.plans", {{"side", "group"}, {"count", 3}}, r);
-                const nlohmann::json d4 = r.value("data", nlohmann::json::object());
-                groupPlanId = planIdOf(d4);
-                detail["planId"] = groupPlanId;
-                detail["items"] = arrSize(d4, "items");
-                if (code == 0 && groupPlanId.empty()) {
-                    code = 1004;
-                    detail["message"] = "alloc.plans 没给出可用 planId（recommendedId 与 "
-                                        "items[0].candidate.id 都取不到）→ 第 5 步无从采纳"
-                                        "（宿主不编方案 id）";
+                // 阶段与步骤的对应（`stepForPhase`）：步 4 = T1。先**合法推进**到 T1 再出方案 ——
+                // 直接跳到 T2（步 6）会被 phase-engine 的阶段图拒（实测：非 force 的那次回 1000），
+                // 那样的"串联"看起来跑通了，实际上是靠 force 越过了阶段。
+                code = run(calls, "mission.advance", {{"to", "T1"}}, r);
+                detail["advanceToT1"] = code;
+                if (code == 0) {
+                    code = run(calls, "alloc.plans", {{"side", "group"}, {"count", 3}}, r);
+                    const nlohmann::json d4 = r.value("data", nlohmann::json::object());
+                    groupPlanId = planIdOf(d4);
+                    detail["planId"] = groupPlanId;
+                    detail["items"] = arrSize(d4, "items");
+                    if (groupPlanId.empty()) {
+                        code = 1004;
+                        detail["message"] = "alloc.plans 没给出可用 planId（recommendedId 与 "
+                                            "items[0].candidate.id 都取不到）→ 第 5 步无从采纳"
+                                            "（宿主不编方案 id）";
+                    }
                 }
             }
 
@@ -5512,6 +5546,9 @@ nlohmann::json FlowEngine::runAll(const std::string& verb, const nlohmann::json&
                                 "后面的步骤没有跑（MUST NOT 跳过或重试到成功）");
                 break;
             }
+            if (stepPacingMs > 0 && step < to) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(stepPacingMs));
+            }
         }
     } catch (const std::exception& e) {
         // 串联里任何未预期的异常都要变成**可读失败**，不许把半截回执丢掉
@@ -5545,6 +5582,7 @@ nlohmann::json FlowEngine::runAll(const std::string& verb, const nlohmann::json&
     summary["to"] = to;
     summary["stepsRun"] = static_cast<int>(steps.size());
     summary["reset"] = doReset;
+    summary["stepPacingMs"] = stepPacingMs;
 
     nlohmann::json out = nlohmann::json::object();
     out["ok"] = ok;

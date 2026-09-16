@@ -486,7 +486,7 @@ foreach(_pair IN ITEMS
     message(STATUS "[mission-app]   ${_n} : 未装配（开关关闭）")
   endif()
 endforeach()
-if(MA_HAVE_SIMSRC)
+if(MA_HAVE_SIM_SOURCE)
   message(STATUS "[mission-app]   sim-source : 已装配（条件包含）")
 else()
   message(STATUS "[mission-app]   sim-source : 未装配（模块尚未落地）")

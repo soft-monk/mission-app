@@ -220,6 +220,7 @@ private:
     /// P7 `flow.runAll`：按 Excel 步序把 11 步一次跑完（每一步都走真实命令入口）。
     /// **不持 `mtx_`**（它逐个调 `command()`，由那些入口各自加锁）。
     /// 返回 `{prepare, steps[], speedDemos[], summary{ok,failedStep,totalMs,speed}, flow, notes}`。
+    /// 并发保护：同一条流程上只允许一条串联（第二条回 1002 互斥冲突，见 runAll 里的 BusyGuard）。
     nlohmann::json runAll(const std::string& verb, const nlohmann::json& params);
 
     // ---- 步 7：探测 → 台账（探测线程写入，独立锁）----
@@ -341,6 +342,10 @@ private:
 
     std::atomic<bool> bootRunning_{false};
     std::thread bootThread_;
+
+    /// P7：`flow.runAll` 的并发闸门（前端连点两次"一键"就会撞上）。
+    /// 两条串联交叉驱动同一条流程 → 步骤/阶段/方案指针互相踩 → 回执全是假的。所以第二条回 1002。
+    std::atomic<bool> runAllBusy_{false};
 
     // ---- 流程状态 ----
     int step_ = 1;
