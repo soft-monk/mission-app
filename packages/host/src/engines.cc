@@ -155,6 +155,21 @@ Engines::Engines() {
     }
 #endif
 
+#if MA_WITH_VIEW_COMPOSER
+    {
+        // 态势组图引擎：**没有业务配置**（业务全在规则包 viewModes.json / layerMapping.json）。
+        //
+        // `map2dImplementedTools` 刻意留空 = 不做宿主侧收敛：引擎在清单为空时回落规则包
+        // `tools.map2dImplemented`（view-composer/src/resolve.cc:310），也就是"工具可不可用"
+        // 的权威来源是规则包，不是宿主写死的清单。
+        view_composer::ViewComposerOptions opt;
+        viewComposer = std::make_unique<view_composer::ViewComposer>(opt);
+    }
+    // ★ 规则包不在这里装：装载只有一处 = `policies_loader.cc`（它的既有职责，且失败要进
+    //   /stats —— F3）。engines.cc 再装一遍只是把同一份文件读两次，同一 kind 会被整体替换，
+    //   结果一样但多一份重复；所以这里只保证"对象已实例化"。
+#endif
+
     // ---------------------------------------------------------------- geo-data（托管瓦片）
     //
     // ★ 装配**不在这里**：瓦片包要从 `config.json` 的 `tiles` 段来，而构造函数拿不到配置。
@@ -409,6 +424,21 @@ void Engines::report(Registry& reg) const {
     reg.set("selfcheck", MA_WITH_SELFCHECK != 0 && selfCheckEngine != nullptr,
             selfCheckEngine != nullptr,
             selfCheckEngine ? "options: clock+sink 注入" : "模块未装配");
+#if MA_WITH_VIEW_COMPOSER
+    {
+        // 真实读数（不是"编译过了"）：规则包装没装 + 模式清单 + 图层组数全取自引擎。
+        std::string note = "模块未装配";
+        if (viewComposer) {
+            note = std::string("options: 规则包由 policies_loader 装载；policiesLoaded=") +
+                   (viewComposer->policiesLoaded() ? "1" : "0") + " modes=" +
+                   std::to_string(viewComposer->availableModes().size()) + " layers=" +
+                   std::to_string(viewComposer->layerGroups().size());
+        }
+        reg.set("viewComposer", true, viewComposer != nullptr, note);
+    }
+#else
+    reg.set("viewComposer", false, false, "模块未装配");
+#endif
 
     // ---- 已链接但未实例化（装配骨架分期如实上报）
     {
@@ -483,6 +513,9 @@ void Engines::stop() {
         gateway->stop();
         gatewayRunning = false;
     }
+#endif
+#if MA_WITH_VIEW_COMPOSER
+    viewComposer.reset();  // 构造顺序里它在 selfcheck 之后 → 逆序先放它
 #endif
 #if MA_WITH_SELFCHECK
     selfCheckEngine.reset();

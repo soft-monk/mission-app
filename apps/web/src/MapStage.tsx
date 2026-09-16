@@ -189,7 +189,17 @@ export function MapStage({ phase, bottomBar }: { phase?: string; bottomBar?: Rea
     let alive = true
     fetch('/health')
       .then((r) => (r.ok ? r.text() : Promise.reject(new Error(String(r.status)))))
-      .then((t) => { if (alive) setHealth(t) })
+      // ★ 只留一行摘要：`/health` 现在是 selfcheck 的**完整聚合负载**（好几 KB），
+      //   原样塞进顶部信息条会把地图挤下去。全文仍可直接打开 http://127.0.0.1:8099/health 看。
+      .then((t) => {
+        if (!alive) return
+        try {
+          const j = JSON.parse(t) as { status?: string; checkedAt?: string; wsClients?: number }
+          setHealth(`${j.status ?? '?'} · ${j.checkedAt ?? '?'} · ws=${j.wsClients ?? '?'}`)
+        } catch {
+          setHealth(`${t.slice(0, 40)}…`)
+        }
+      })
       .catch((e: unknown) => { if (alive) setHealth(`不可达（${String(e)}）`) })
     return () => { alive = false }
   }, [])
@@ -253,8 +263,8 @@ export function MapStage({ phase, bottomBar }: { phase?: string; bottomBar?: Rea
       basemap: { tileUrlTemplate: tileTemplate, attribution: 'geo-data' },
     },
     scenarioKey: 'scenario-1',
-    // 阶段由**流程层**给出（Excel 步 ↔ T0–T7 的对应见 host 的 flow.cc）；\r
-    // 空值回落 T4 = map-2d 阶段规则下无人机/目标/扫描/脉冲可见。\r
+    // 阶段由**流程层**给出（Excel 步 ↔ T0–T7 的对应见 host 的 flow.cc）；
+    // 空值回落 T4 = map-2d 阶段规则下无人机/目标/扫描/脉冲可见。
     phase: ((phase && phase.trim()) ? phase : 'T4') as MapData['phase'],
     targets: [],
     groups: [],
@@ -303,7 +313,7 @@ export function MapStage({ phase, bottomBar }: { phase?: string; bottomBar?: Rea
           {lastSeenAgo === null ? '尚未收到遥测' : `最近数据 ${(lastSeenAgo / 1000).toFixed(1)}s 前`}
         </span>
         <span>engines 就绪 {keys.length ? `${readyCount}/${keys.length}` : '—'}</span>
-        <span>/health {health}</span>
+        <span title={health}>/health {health}</span>
         <span style={{ color: '#8fb0cc' }}>style {styleSource}</span>
         <span style={{ color: '#8fb0cc' }}>通道 {wsUrl}</span>
       </div>

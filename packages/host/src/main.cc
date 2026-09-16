@@ -268,12 +268,23 @@ json capabilitySnapshot(const ma::HostConfig& cfg, ma::Engines& e, ma::Registry&
     c["networkReachable"] = true;
 
     // ---- 系统就绪 / 遥测存活（状态条用）
+    //
+    // 口径与"系统完整性"一致：核心子系统在位 + 接入层真的在跑。**不能**用"全部 entries 都
+    // instantiated"——账本里的 `sensorModel`（P4 才接）与 `ingest`（后置 start()）会把它永久
+    // 判成 false，症状是底部状态条一直显示"系统状态 故障"。
     {
-        bool allReady = true;
+        bool coreReady = true;
         for (const auto& row : reg.entries()) {
-            if (!row.instantiated) allReady = false;
+            if (row.key == "sensorModel") continue;
+#if MA_WITH_INGEST
+            if (row.key == "ingest") {
+                if (!e.gatewayRunning) coreReady = false;
+                continue;
+            }
+#endif
+            if (!row.instantiated) coreReady = false;
         }
-        c["systemReady"] = allReady;
+        c["systemReady"] = coreReady;
         c["uavTelemetryAlive"] = c.value("linkUdpReceiving", false);
     }
 

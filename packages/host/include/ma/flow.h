@@ -117,6 +117,29 @@ private:
     /// 把流程状态（步 + 阶段）广播出去
     void broadcastFlowState();
 
+    /// 当前阶段视图：**唯一的取法**是 phase-engine 的 `phaseContext(missionId)`（公开头 :594）；
+    /// 引擎查不到时回落宿主流程层自己的记录（`fromEngine=false` 如实标出来）。要求已持 `mtx_`。
+    struct PhaseView {
+        std::string missionId;
+        std::string phaseKey;
+        int seq = 0;
+        std::string scenarioKey;
+        int64_t enteredAt = 0;
+        bool fromEngine = false;
+    };
+    PhaseView phaseViewLocked() const;
+
+    /// 复位任务与阶段（回第 1 步）。**要求已持 `mtx_`**。
+    ///
+    /// 为什么需要它：`flow.enter` 的阶段**以引擎台账为准**（不硬写 T0）—— 所以"重跑一遍"
+    /// 不能只把 step 置 1，必须把当前任务清掉，让下一次 `flow.enter` 建**新任务**（新 missionId）。
+    /// 台账与实体都按 missionId 隔离，因此新任务天然是干净的一份，旧任务数据保留（可追溯）。
+    void resetMissionLocked();
+
+    /// entity-ledger 台账的只读快照（喂给 view-composer 的 `entitySnapshot`；空台账 = 空对象）。
+    /// 要求已持 `mtx_`。
+    nlohmann::json ledgerSnapshotLocked() const;
+
     Engines& engines_;
     Registry& reg_;
     const HostConfig& cfg_;
@@ -146,6 +169,20 @@ private:
     std::string phase_;   // "" = 未进入任务
     std::string missionId_;
     int64_t enteredAtMs_ = 0;
+    /// 上次重采能力快照的时刻（`/api/state` 按 5 s 节流重采；见 flow.cc 的 stateJson 注释）
+    int64_t lastCapabilityMs_ = 0;
+
+    // ---- 步 3–5（P3）：编组三方案 → 确认 → 编成实体 ----
+    //
+    // 只存"引擎刚给过的原样结果"（推荐方案 id 与推荐百分比），用途有两个：
+    //   ① `alloc.adopt` 的 deviated 标注（非推荐方案被采纳时由引擎标 deviated）；
+    //   ② 幂等判断（同一方案重复采纳 → 引擎回 idempotent=true）。
+    // ★ MUST NOT 在这里重算分数、补百分比：数值只有一个来源 = `ScoreResult`。
+    bool hasPlanScore_ = false;
+    std::string lastPlanRecommendation_;
+    int lastPlanRecommendedPercent_ = 0;
+    std::string adoptedPlanId_;
+    std::string confirmedPlanId_;
 };
 
 }  // namespace ma

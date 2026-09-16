@@ -44,6 +44,9 @@
 #if MA_WITH_SELFCHECK
 #include "selfcheck/selfcheck.h"
 #endif
+#if MA_WITH_VIEW_COMPOSER
+#include "view_composer/view_composer.h"
+#endif
 #if MA_WITH_GEO
 #include "geo_data/clock.h"
 #include "geo_data/fs.h"
@@ -131,6 +134,11 @@ struct Engines {
 #endif
 #if MA_WITH_SELFCHECK
     std::unique_ptr<selfcheck::SelfCheckEngine> selfCheckEngine;
+#endif
+#if MA_WITH_VIEW_COMPOSER
+    /// 态势组图引擎（VWC）：规则包由 `policies_loader` 统一装载（`view-composer/policies/mapapp`），
+    /// 装配期只构造（见 engines.cc 的注释：装载只有一处，MUST NOT 两处各装一遍）。
+    std::unique_ptr<view_composer::ViewComposer> viewComposer;
 #endif
 #if MA_WITH_GEO
     std::shared_ptr<geo_data::NativeHostFs> geoFs;

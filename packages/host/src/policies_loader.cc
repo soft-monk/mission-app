@@ -173,11 +173,21 @@ PolicyLoadReport loadEnginePolicies(Engines& engines, const std::string& webMapR
 #endif
 
     // ---- view-composer：目录（viewModes.json + layerMapping.json）
+    //
+    // 注意字段名与本仓其它引擎**不一样**：`view_composer::PoliciesResult` 是
+    // `{ok, code(ErrorCode 枚举), reason, issues[], warnings[], info, loadedFileCount}` ——
+    // 没有 `message`，可读原因在 `reason` 里（头 view_composer.h:471-479）。
 #if MA_WITH_VIEW_COMPOSER
     if (engines.viewComposer) {
         const std::string d = dir("view-composer");
         const auto r = engines.viewComposer->loadPoliciesDir(d);
-        push("viewComposer", d, r.code, r.message);
+        std::string note = r.reason.empty() ? std::string("ok") : r.reason;
+        if (!r.ok) {
+            for (const auto& i : r.issues) {
+                note += " " + i.path + "." + i.field + ":" + i.reason;
+            }
+        }
+        push("viewComposer", d, static_cast<int>(r.code), note);
     }
 #endif
 

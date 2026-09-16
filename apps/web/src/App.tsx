@@ -11,11 +11,16 @@
 // 排障后门：`?stage=map` 直接进地图台（P1 的 live-check 用它，跳过启动/自检两屏）。
 import { useCallback, useMemo, useState, type CSSProperties } from 'react'
 import { useFlow } from './flow/useFlow'
+import { useGoto } from './flow/useSituation'
 import { DEFAULT_WS_URL } from './telemetry'
 import { C, statusColor } from './theme'
 import { TopBar } from './screens/Chrome'
 import { BootScreen } from './screens/BootScreen'
 import { SelfCheckScreen } from './screens/SelfCheckScreen'
+import { SituationScreen } from './screens/SituationScreen'
+import { GroupingScreen } from './screens/GroupingScreen'
+import { GroupConfirmScreen } from './screens/GroupConfirmScreen'
+import { StageOverlay } from './screens/StageOverlay'
 import { MapStage } from './MapStage'
 
 function param(name: string): string | null {
@@ -25,8 +30,14 @@ function param(name: string): string | null {
 export function App() {
   const wsUrl = param('ws') ?? DEFAULT_WS_URL
   const stageOverride = param('stage')
-  const { state, error, send, lastReply } = useFlow(wsUrl)
+  const flow = useFlow(wsUrl)
+  // 步 3–5 三屏要发自己的 verb（`situation.snapshot` / `view.compose` / `alloc.*`），
+  // 所以整个句柄往下传；命令面仍然只有 `flow.send` → `POST /api/command` 这一条路。
+  const { state, error, send, lastReply } = flow
   const [busy, setBusy] = useState(false)
+  // 步 4 → 步 5 只带一个"用户选了哪个方案"。切步本身一律发 `flow.goto`（step 归宿主）。
+  const [planId, setPlanId] = useState<string | null>(null)
+  const goto = useGoto(send)
 
   const run = useCallback(async (verb: string, params: Record<string, unknown> = {}) => {
     setBusy(true)
@@ -111,7 +122,41 @@ export function App() {
         )}
 
         {step >= 3 && (
-          <MapStage phase={state.phase} bottomBar={bottomBar} />
+          /* `data-ma-stagestrip` 是给 index.html 里那条 CSS 用的选择器锚点（截断 /health 原文，
+             免得它换行把地图挤下去）；不改 MapStage 的 JSX。 */
+          <div data-ma-stagestrip="1" style={{ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0 }}>
+            <MapStage phase={state.phase} bottomBar={bottomBar} />
+          </div>
+        )}
+
+        {/* 步 3–5 是**覆盖层**（不是整页替换）：地图台照常跑，各屏只往上摆面板。
+            摆成 MapStage 的**兄弟节点**（不是 children）——MapStage 是主 agent 的文件，
+            步 6–9 的屏幕也要走同一个插槽，所以这里不动它，只用 z-index 叠上去。
+            第 6 步起由 C/D 两组写者的屏幕接管这一层。 */}
+        {step === 3 && (
+          <StageOverlay>
+            <SituationScreen state={state} flow={flow} onNext={() => goto(4)} />
+          </StageOverlay>
+        )}
+        {step === 4 && (
+          <StageOverlay>
+            <GroupingScreen
+              state={state}
+              flow={flow}
+              onNext={(id) => { setPlanId(id); goto(5) }}
+              onSelectPlan={setPlanId}
+            />
+          </StageOverlay>
+        )}
+        {step === 5 && (
+          <StageOverlay>
+            <GroupConfirmScreen
+              state={state}
+              flow={flow}
+              selectedPlanId={planId}
+              onPickPlan={setPlanId}
+            />
+          </StageOverlay>
         )}
       </div>
 

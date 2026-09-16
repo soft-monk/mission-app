@@ -49,6 +49,7 @@ set(MA_SIMSRC_DIR    "${ASM_WEBMAP_DIR}/sim-source"      CACHE PATH "sim-source 
 set(MA_SENSORMODEL_DIR "${ASM_WEBMAP_DIR}/sensor-model"  CACHE PATH "sensor-model 源码目录（另一个 agent 在写）")
 set(MA_MAP2D_DIR     "${ASM_WEBMAP_DIR}/map-2d"          CACHE PATH "map-2d 源码目录（npm 包，Vite 别名引用，不是 CMake 目标）")
 set(MA_MEDIAPLAYER_DIR "${ASM_WEBMAP_DIR}/media-player"  CACHE PATH "media-player 源码目录（npm 包，不是 CMake 目标）")
+set(MA_VIEW_COMPOSER_DIR "${ASM_WEBMAP_DIR}/view-composer" CACHE PATH "view-composer 源码目录（态势组图引擎）")
 
 foreach(_mod IN ITEMS
     "${MA_PHASE_DIR}/include/phase/phase_engine.h"
@@ -62,6 +63,7 @@ foreach(_mod IN ITEMS
     "${MA_GEO_DIR}/include/geo_data/server/service.h"
     "${MA_INGEST_DIR}/include/device_ingest/gateway.h"
     "${MA_STORE_DIR}/include/telemetry_store/store.h"
+    "${MA_VIEW_COMPOSER_DIR}/include/view_composer/view_composer.h"
     "${MA_HUB_DIR}/server/include/realtime_hub/hub.h")
   if(NOT EXISTS "${_mod}")
     message(FATAL_ERROR
@@ -92,6 +94,7 @@ option(MA_BUILD_TOPOLOGY  "装配 topology"         ON)
 option(MA_BUILD_ALERT     "装配 alert-engine"     ON)
 option(MA_BUILD_REPORT    "装配 report-engine"    ON)
 option(MA_BUILD_SELFCHECK "装配 selfcheck"        ON)
+option(MA_BUILD_VIEW_COMPOSER "装配 view-composer（态势组图）" ON)
 option(MA_BUILD_GEO       "装配 geo-data"         ON)
 option(MA_BUILD_INGEST    "装配 device-ingest"    ON)
 option(MA_BUILD_STORE     "装配 telemetry-store"  ON)
@@ -244,6 +247,23 @@ else()
   set(MA_HAVE_HUB OFF)
 endif()
 
+# ================================================================ 依赖 13：view-composer（态势组图）
+#
+# 纯声明式引擎（VWC-NFR-04：只依赖 nlohmann/json），但**宿主此前完全没接**：
+# 无目录变量、无 add_subdirectory、无链接、无 include。这一节补齐装配。
+#
+# 它的 `VIEW_COMPOSER_OBJECT_LIB` 默认 ON（供模块自己的验收扫产物）；本仓只验装配，
+# 关掉以免同一批源文件编两遍。
+if(MA_BUILD_VIEW_COMPOSER)
+  set(VIEW_COMPOSER_BUILD_TESTS    ${_MA_OFF} CACHE BOOL "" FORCE)
+  set(VIEW_COMPOSER_BUILD_EXAMPLES ${_MA_OFF} CACHE BOOL "" FORCE)
+  set(VIEW_COMPOSER_OBJECT_LIB     ${_MA_OFF} CACHE BOOL "" FORCE)
+  add_subdirectory("${MA_VIEW_COMPOSER_DIR}" "${CMAKE_BINARY_DIR}/modules/view-composer")
+  set(MA_HAVE_VIEW_COMPOSER ON)
+else()
+  set(MA_HAVE_VIEW_COMPOSER OFF)
+endif()
+
 # ================================================================ 条件包含：sim-source / sensor-model
 #
 # 这两个仓由另一个 agent 在写。用 if(EXISTS ...) 条件包含：
@@ -327,7 +347,8 @@ endif()
 # 哪些模块真的装进来了 —— 编成宏给宿主用，宿主据此决定实例化谁。
 # 这样"模块不在"是**编译期事实**，宿主里不需要写任何运行期兜底分支。
 foreach(_flag IN ITEMS PHASE RESOURCE SCORING LEDGER TOPOLOGY ALERT REPORT SELFCHECK GEO
-                       INGEST STORE HUB PROBES_MAPAPP SIM_SOURCE SENSOR_MODEL SIM_BRIDGE)
+                       INGEST STORE HUB PROBES_MAPAPP SIM_SOURCE SENSOR_MODEL SIM_BRIDGE
+                       VIEW_COMPOSER)
   if(MA_HAVE_${_flag})
     target_compile_definitions(mission_host PRIVATE "MA_WITH_${_flag}=1")
   else()
@@ -358,6 +379,9 @@ if(MA_HAVE_REPORT)
 endif()
 if(MA_HAVE_SELFCHECK)
   target_link_libraries(mission_host PRIVATE selfcheck::selfcheck)
+endif()
+if(MA_HAVE_VIEW_COMPOSER)
+  target_link_libraries(mission_host PRIVATE view_composer::view_composer)
 endif()
 # 探针包是**规则侧**的目标（selfcheck 自己产出）；它在不在直接看 TARGET，不绕变量。
 if(TARGET probes_mapapp)
@@ -433,6 +457,7 @@ foreach(_pair IN ITEMS
     "alert-engine|MA_HAVE_ALERT"
     "report-engine|MA_HAVE_REPORT"
     "selfcheck|MA_HAVE_SELFCHECK"
+    "view-composer|MA_HAVE_VIEW_COMPOSER"
     "geo-data|MA_HAVE_GEO"
     "device-ingest|MA_HAVE_INGEST"
     "telemetry-store|MA_HAVE_STORE"

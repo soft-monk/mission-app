@@ -7,6 +7,16 @@
     <style>
       html, body, #root { height: 100%; margin: 0; background: #04182f; color: #cfe3f7; }
       body { font: 13px/1.6 system-ui, "Segoe UI", "Microsoft YaHei", sans-serif; }
+
+      /* 地图台顶部自证信息条里，有几项天然很长：`/health` 的**原始文本**（实测 3.6 KB 一行）、
+         `style` 文件路径、`通道` 地址。它们一旦换行就会把那条 flex 行撑到十几行高、把地图挤下去
+         （截图里表现为"覆盖层面板糊在一堆 JSON 上"）。
+         这里只加省略号截断——不改 MapStage 的 JSX、不改任何语义；排障后门 `?stage=map`
+         看到的仍是同一条信息条（鼠标悬停可看完整值）。
+         选择器锚点：那条信息条是 wrap 排版的（`flex-wrap: wrap` + 半透明底），页面里仅此一条。 */
+      [data-ma-stagestrip] div[style*="flex-wrap: wrap"] > span {
+        max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
     </style>
   </head>
   <body>

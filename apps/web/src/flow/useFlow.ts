@@ -19,6 +19,14 @@ export interface UseFlow {
   send: <T = unknown>(verb: string, params?: Record<string, unknown>) => Promise<CommandReply<T>>
   /** 最近一次命令回执（界面用来显示"为什么没动"） */
   lastReply: CommandReply | null
+  /**
+   * 按 verb 留存的最近一次回执。
+   *
+   * 用途：各屏要显示"这条 verb 到底成没成、宿主给了什么"，而**只有一条** `lastReply` 会被
+   * 别的动作覆盖（比如"进入编组"发完 `flow.state` 就把 `alloc.plans` 的回执挤掉了）。
+   * 保留最近一次 = 界面回执不会因为无关命令而闪没。
+   */
+  replies: Record<string, CommandReply>
   refresh: () => void
 }
 
@@ -28,6 +36,7 @@ export function useFlow(wsUrl: string): UseFlow {
   const [state, setState] = useState<FlowState | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [lastReply, setLastReply] = useState<CommandReply | null>(null)
+  const [replies, setReplies] = useState<Record<string, CommandReply>>({})
   const stateRef = useRef<FlowState | null>(null)
   stateRef.current = state
 
@@ -99,9 +108,10 @@ export function useFlow(wsUrl: string): UseFlow {
   const send = useCallback(async <T,>(verb: string, params: Record<string, unknown> = {}) => {
     const reply = await command<T>(verb, params)
     setLastReply(reply)
+    setReplies((prev) => ({ ...prev, [verb]: reply }))
     if (reply.code === 0) void pull()
     return reply
   }, [pull])
 
-  return { state, error, send, lastReply, refresh: () => void pull() }
+  return { state, error, send, lastReply, replies, refresh: () => void pull() }
 }

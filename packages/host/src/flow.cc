@@ -419,6 +419,22 @@ void FlowEngine::broadcastFlowState() {
 }
 
 nlohmann::json FlowEngine::stateJson() {
+    // 能力快照要**跟着现实走**：探针注册时按值捕获快照，只在启动加载时重采的话，
+    // 底部状态条会永远停在"启动那一刻"的读数（例如 数据链路 一直显示"中断"，
+    // 哪怕包早就在收了）。这里按 5 s 节流重采一次 —— 前端 500 ms 轮询也不会打爆它。
+    {
+        const int64_t now = wallClockMs();
+        bool refresh = false;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (now - lastCapabilityMs_ >= 5000) {
+                lastCapabilityMs_ = now;
+                refresh = true;
+            }
+        }
+        if (refresh) refreshCapabilities();
+    }
+
     nlohmann::json out = nlohmann::json::object();
     out["version"] = "mission-app 0.2.0";
     out["ts"] = wallClockMs();
@@ -559,7 +575,381 @@ nlohmann::json badRequest(const std::string& verb, const std::string& message) {
     return reply(verb, 1000, {{"message", message}});
 }
 
+// ============================================================================
+// 步 3–5（P3）共用工具：**只做形状翻译**（宿主层唯一被允许做的事）
+//
+// 三条口径（与文件头三条一一对应）：
+//   ① 数值一律来自引擎（台账 `statsJson` / 评分 `ScoreResult` / 场景配置 / 阶段引擎负载），
+//      宿主不算分、不补百分比、不填假数；缺输入 → 按缺项回执并在 `notes` 里如实标注。
+//   ② 引擎之间**刻意不互相 include**（protocol P1），所以跨引擎的入参映射只能由宿主写：
+//      `phase` / `resource_alloc` / `scoring` 各有一份自己的 `PhaseContext`（同形五字段），
+//      view-composer 同理 —— 本层就是那本映射。
+//   ③ 所有引擎调用都在 `FlowEngine::mtx_` 里（**调用方持锁**，见各工具函数的注释）。
+// ============================================================================
+
+/// 阶段 key → Excel 步骤号。只做映射：**能不能进由 phase-engine 的 Gate 裁决**，宿主不判。
+int stepForPhase(const std::string& phaseKey) {
+    if (phaseKey == "T0") return 3;
+    if (phaseKey == "T1") return 4;
+    if (phaseKey == "T2" || phaseKey == "T3") return 6;
+    if (phaseKey == "T4") return 7;
+    if (phaseKey == "T5") return 8;
+    if (phaseKey == "T6") return 10;
+    if (phaseKey == "T7") return 11;
+    return 0;  // 未声明 → 保持当前步（不猜）
+}
+
+/// 场景键 = 场景目录名（`ScenarioData::scenarioKey` 的口径，见 scenario_dataset.h:172）。
+std::string scenarioKeyOf(const Engines& e) {
+#if MA_WITH_SIM_SOURCE && MA_WITH_INGEST
+    if (!e.scenarioData.scenarioKey.empty()) return e.scenarioData.scenarioKey;
+#else
+    (void)e;
+#endif
+    return {};
+}
+
+/// 场景里的一台我方平台（**逐字段来自 deployment.json**，宿主不加工数值）。
+///
+/// 结构体本身不带场景类型，所以**无条件声明**：`scenario-data` 没装配时它只是个空容器，
+/// "没有平台"这件事由调用方如实标注，而不是靠编译期把整段代码抹掉。
+struct PlatformRow {
+    std::string deviceId;
+    std::string model;      // deployment.json 的 typeKey（= resource-alloc 的型号 key）
+    std::string groupKey;
+    std::string groupName;
+    std::string homeArea;
+    std::string taskArea;
+    double lng = 0;
+    double lat = 0;
+    double alt = 0;
+    double speed = 0;
+    double battery = 0;
+    std::vector<std::string> payload;
+};
+
+#if MA_WITH_SIM_SOURCE && MA_WITH_INGEST
+
+/// 场景编制里"编组 key → 显示名"的清单（= deployment.json groups[]）。
+std::vector<std::pair<std::string, std::string>> scenarioGroupsOf(const Engines& e) {
+    std::vector<std::pair<std::string, std::string>> out;
+    for (const auto& g : e.scenarioData.groups) out.emplace_back(g.key, g.name);
+    return out;
+}
+
+/// 场景编制的平台清单 + 编组显示名（调用方持锁；这里只读装配期装载好的配置）。
+std::vector<PlatformRow> platformsOf(const Engines& e) {
+    std::vector<PlatformRow> rows;
+    const auto& sd = e.scenarioData;
+    for (const auto& a : sd.aircraft) {
+        PlatformRow r;
+        r.deviceId = a.deviceId;
+        r.model = a.typeKey;
+        r.groupKey = a.groupKey;
+        for (const auto& g : sd.groups) {
+            if (g.key == a.groupKey) r.groupName = g.name;
+        }
+        r.homeArea = a.homeArea;
+        r.taskArea = a.taskArea;
+        r.lng = a.stationLng;
+        r.lat = a.stationLat;
+        r.alt = a.altM;
+        r.speed = a.speedMps;
+        r.battery = a.battery;
+        r.payload = a.payload;
+        rows.push_back(std::move(r));
+    }
+    return rows;
+}
+
+#endif  // MA_WITH_SIM_SOURCE && MA_WITH_INGEST
+
+#if MA_WITH_VIEW_COMPOSER
+
+/// 五字段同形映射：宿主手里的"当前阶段" → `view_composer::PhaseContext`。
+/// 只映射，不解释：`phaseKey` / `seq` / `scenarioKey` / `enteredAt` / `missionId` 一一对应。
+view_composer::PhaseContext toViewPhaseContext(const std::string& phaseKey, int seq,
+                                               const std::string& scenarioKey, int64_t enteredAt,
+                                               const std::string& missionId) {
+    view_composer::PhaseContext out;
+    out.phaseKey = phaseKey;
+    out.seq = seq;
+    out.scenarioKey = scenarioKey;
+    out.enteredAt = enteredAt;
+    out.missionId = missionId;
+    return out;
+}
+
+#endif  // MA_WITH_VIEW_COMPOSER
+
+#if MA_WITH_SCORING
+
+/// 同上：`scoring::PhaseContext` 也是本仓的本地镜像（scoring.h:71-77）。
+scoring::PhaseContext toScoringPhaseContext(const std::string& phaseKey, int seq,
+                                            const std::string& scenarioKey, int64_t enteredAt,
+                                            const std::string& missionId) {
+    scoring::PhaseContext out;
+    out.phaseKey = phaseKey;
+    out.seq = seq;
+    out.scenarioKey = scenarioKey;
+    out.enteredAt = enteredAt;
+    out.missionId = missionId;
+    return out;
+}
+
+#endif  // MA_WITH_SCORING
+
+#if MA_WITH_RESOURCE
+
+/// 同上：`resource_alloc::PhaseContext` 也是本仓的本地镜像（resource_alloc.h:66-72）。
+resource_alloc::PhaseContext toResourcePhaseContext(const std::string& phaseKey, int seq,
+                                                    const std::string& scenarioKey,
+                                                    int64_t enteredAt, const std::string& missionId) {
+    resource_alloc::PhaseContext out;
+    out.phaseKey = phaseKey;
+    out.seq = seq;
+    out.scenarioKey = scenarioKey;
+    out.enteredAt = enteredAt;
+    out.missionId = missionId;
+    return out;
+}
+
+/// 台账初始化（**幂等**口径由宿主守住）。
+///
+/// ⚠️ 引擎的 `initializeLedger(targetId, scenarioKey)`（resource_alloc.h:645）是"**重建**型号行"：
+/// 它把 `allocated` 清零、`clusters` 清空（src/policies_ops.cc:266-288）。所以"幂等初始化"
+/// 的正确做法是 **先查台账在不在**（`statsJson` 目标不存在 → `nullopt`），不在才初始化 ——
+/// 每次请求都调一遍会把已经生效的编组抹掉。
+struct LedgerInit {
+    int code = 0;
+    std::string message;
+    bool created = false;
+};
+
+LedgerInit ensureLedger(Engines& e, const std::string& targetId, const std::string& scenarioKey) {
+    LedgerInit out;
+    if (!e.resource) {
+        out.code = 1005;
+        out.message = "resource-alloc 未装配";
+        return out;
+    }
+    if (targetId.empty()) {
+        out.code = 1003;
+        out.message = "targetId 为空（台账按任务隔离：先 flow.enter）";
+        return out;
+    }
+    if (e.resource->statsJson(targetId).has_value()) {
+        out.message = "台账已存在（未重建：initializeLedger 会清零已分配量）";
+        return out;
+    }
+    const resource_alloc::PoliciesResult r = e.resource->initializeLedger(targetId, scenarioKey);
+    out.code = r.code;
+    out.message = r.message;
+    out.created = (r.code == 0);
+    if (r.code != 0) {
+        for (const auto& i : r.issues) out.message += " " + i.path + "." + i.field + ":" + i.reason;
+    }
+    return out;
+}
+
+#endif  // MA_WITH_RESOURCE
+
+#if MA_WITH_RESOURCE && MA_WITH_SCORING
+
+/// 集群用量（`scoring::ClusterUsage`，scoring.h:271-277）的**真填**：
+///   ① 台账里已经有集群（编组执行过）→ 取 resource-alloc 的统计视图 `statsJson().clusters[]`
+///      （`total` = 该集群已分配器材件数、`clusterId` = 集群 key）；
+///   ② 台账里还没有集群（首次编组前）→ 取**场景编制**（`ScenarioData.groups[]` × 各集群平台数）。
+/// 两条都是真实数据（一条来自引擎、一条来自场景配置），谁被用了写进 `notes`。
+std::vector<scoring::ClusterUsage> clusterUsageOf(Engines& e, const std::string& targetId,
+                                                   const std::string& phaseKey,
+                                                   nlohmann::json& notes) {
+    std::vector<scoring::ClusterUsage> out;
+#if MA_WITH_RESOURCE
+    if (e.resource) {
+        const auto stats = e.resource->statsJson(targetId);
+        if (stats.has_value()) {
+            const auto it = stats->find("clusters");
+            if (it != stats->end() && it->is_array() && !it->empty()) {
+                for (const auto& c : *it) {
+                    scoring::ClusterUsage u;
+                    u.clusterId = c.value("clusterId", std::string());
+                    u.phaseKey = phaseKey;
+                    u.total = static_cast<int>(c.value("allocatedTotal", static_cast<int64_t>(0)));
+                    u.available = true;
+                    u.present = true;
+                    out.push_back(std::move(u));
+                }
+                notes.push_back("resources.clusters 来源：resource-alloc 台账 statsJson().clusters[]（"
+                                "total = 该集群已分配件数），共 " + std::to_string(out.size()) + " 个集群");
+                return out;
+            }
+        }
+    }
+#endif
+#if MA_WITH_SIM_SOURCE && MA_WITH_INGEST
+    {
+        const auto rows = platformsOf(e);
+        const auto& sd = e.scenarioData;
+        for (const auto& g : sd.groups) {
+            scoring::ClusterUsage u;
+            u.clusterId = g.key;  // 集群 key（CTR-PL-08：MUST NOT 用显示名当 key）
+            u.phaseKey = phaseKey;
+            int n = 0;
+            for (const auto& r : rows) {
+                if (r.groupKey == g.key) ++n;
+            }
+            u.total = n;
+            u.available = true;
+            u.present = true;
+            out.push_back(std::move(u));
+        }
+        if (!out.empty()) {
+            notes.push_back("resources.clusters 来源：场景编制（deployment.json groups[] × 各集群平台数），"
+                            "共 " + std::to_string(out.size()) + " 个集群（台账尚未编组）");
+            return out;
+        }
+    }
+#endif
+    notes.push_back("resources.clusters 为空：台账无集群且场景编制不可用（scenario-data 未装配）");
+    return out;
+}
+
+/// 评分输入快照（`scoring::ScoringSnapshot`，scoring.h:319-328）的真填。
+/// 每个字段要么来自引擎/场景的真实读数，要么**留空并在 `notes` 里点名**（MUST NOT 编造）。
+scoring::ScoringSnapshot buildSnapshot(Engines& e, const std::string& targetId,
+                                       const scoring::PhaseContext& phase,
+                                       const std::string& scenarioKey, nlohmann::json& notes) {
+    scoring::ScoringSnapshot snap;
+    snap.missionId = targetId;
+    snap.phase = phase;
+
+    // ---- resources：真填（集群用量 + 利用率）
+    scoring::ResourceSnapshot res;
+    res.phase = phase;
+    res.clusters = clusterUsageOf(e, targetId, phase.phaseKey, notes);
+    res.present = !res.clusters.empty();
+    snap.resources = res;
+
+    // ---- resourceUtilization：台账的真实读数（`StatsView.utilization`，口径由引擎规则包定）
+    bool hasUtil = false;
+    double util = 0.0;
+#if MA_WITH_RESOURCE
+    if (e.resource) {
+        const auto stats = e.resource->statsJson(targetId);
+        if (stats.has_value()) {
+            util = stats->value("utilization", 0.0);
+            hasUtil = true;
+        }
+    }
+#endif
+    snap.resourceUtilization = util;
+    snap.hasResourceUtilization = hasUtil;
+    notes.push_back(hasUtil ? ("resourceUtilization = 台账实测 " + std::to_string(util) +
+                               "（statsJson().utilization）")
+                            : "resourceUtilization 留空：台账未初始化");
+
+    // ---- targets：来自 entity-ledger 的只读台账；空台账 = **present=false**（不假造目标）
+    bool hasTargets = false;
+#if MA_WITH_LEDGER
+    if (e.entityLedger) {
+        const auto rows = e.entityLedger->listEntities(entity_ledger::EntityQuery{targetId});
+        if (!rows.empty()) {
+            scoring::TargetList tl;
+            tl.phase = phase;
+            tl.present = true;
+            for (const auto& r : rows) {
+                tl.targetIds.push_back(r.id);
+                tl.confidences.push_back(static_cast<int>(r.confidence * 100.0 + 0.5));
+            }
+            tl.modelCount = static_cast<int>(rows.size());
+            snap.targets = tl;
+            hasTargets = true;
+        }
+    }
+#endif
+    if (!hasTargets) {
+        notes.push_back("targets 留空（present=false）：entity-ledger 台账当前没有实体 —— "
+                        "相关指标按规则包中性值/baseline 处理并标 missingMarker，评分不失败");
+    } else {
+        notes.push_back("targets 来源：entity-ledger 台账快照 " +
+                        std::to_string(snap.targets->targetIds.size()) + " 条（真实台账，不是宿主造的清单）");
+    }
+
+    // ---- topology：**刻意不填**（链路评估腿未接；引擎按规则包 neutralOnMissing 处理）
+    notes.push_back("topology 留空（present=false）：宿主尚未把 topology 的链路评估喂进来 —— "
+                    "linkStability 等项走规则包 baseline + missingMarker=link-eval-missing");
+
+    // ---- extra：宿主附加（引擎原样进审计三件套，不解释）
+    nlohmann::json extra = nlohmann::json::object();
+    extra["scenarioKey"] = scenarioKey;
+    extra["phaseKey"] = phase.phaseKey;
+    extra["targetId"] = targetId;
+    extra["source"] = "ma::FlowEngine（宿主装配层：resource-alloc 台账 + 场景编制 + entity-ledger 快照）";
+    snap.extra = extra;
+    return snap;
+}
+
+#endif  // MA_WITH_RESOURCE && MA_WITH_SCORING
+
 }  // namespace
+
+// ============================================================================
+// 当前阶段 / 台账快照（其它引擎要的"当前阶段"只能经这里取）
+// ============================================================================
+
+void FlowEngine::resetMissionLocked() {
+    // 只清**宿主侧的当前任务指针**与流程状态；引擎里的旧任务/旧台账/旧实体**一律保留**
+    // （按 missionId 隔离，删了反而丢掉可追溯性）。下一次 flow.enter 会建新任务。
+    missionId_.clear();
+    phase_.clear();
+    enteredAtMs_ = 0;
+    adoptedPlanId_.clear();
+    confirmedPlanId_.clear();
+    hasPlanScore_ = false;
+    lastPlanRecommendation_.clear();
+    lastPlanRecommendedPercent_ = 0;
+    step_ = 1;
+}
+
+FlowEngine::PhaseView FlowEngine::phaseViewLocked() const {    PhaseView v;
+    v.missionId = missionId_;
+    v.phaseKey = phase_;
+    v.enteredAt = enteredAtMs_;
+    v.scenarioKey = scenarioKeyOf(engines_);
+#if MA_WITH_PHASE
+    // 权威来源：phase-engine 的 `phaseContext(missionId)`（公开头 :594，其它引擎取"当前阶段"的唯一来源）
+    if (engines_.phase && !missionId_.empty()) {
+        const std::optional<phase::PhaseContext> ctx = engines_.phase->phaseContext(missionId_);
+        if (ctx.has_value()) {
+            v.missionId = ctx->missionId.empty() ? missionId_ : ctx->missionId;
+            v.phaseKey = ctx->phaseKey;
+            v.seq = ctx->seq;
+            if (!ctx->scenarioKey.empty()) v.scenarioKey = ctx->scenarioKey;
+            v.enteredAt = ctx->enteredAt;
+            v.fromEngine = true;
+        }
+    }
+    // seq 缺席（引擎里还没这个任务）时从定义查一次；查不到就保持 0（不猜）
+    if (!v.fromEngine && !v.phaseKey.empty() && engines_.phase) {
+        const std::optional<phase::PhaseDef> def = engines_.phase->phaseDef(v.phaseKey);
+        if (def.has_value()) v.seq = def->seq;
+    }
+#endif
+    return v;
+}
+
+nlohmann::json FlowEngine::ledgerSnapshotLocked() const {
+#if MA_WITH_LEDGER
+    // 只读快照：引擎自己对 `IEntityStore::save` 收到的形状（entity_ledger.h:1342）。
+    // 空台账 → 空对象：view-composer 收到空快照 = **放弃 id 校验**（不算失败，VWC-NFR-02）。
+    if (engines_.entityLedger && !missionId_.empty()) {
+        const entity_ledger::json snap = engines_.entityLedger->ledgerSnapshot(missionId_);
+        return nlohmann::json::parse(snap.dump());
+    }
+#endif
+    return nlohmann::json::object();
+}
 
 nlohmann::json FlowEngine::command(const std::string& verb, const nlohmann::json& params) {
     if (verb.empty()) return badRequest(verb, "缺少 verb");
@@ -609,7 +999,7 @@ nlohmann::json FlowEngine::command(const std::string& verb, const nlohmann::json
             hasReport_ = false;
             lastReport_ = selfcheck::Report{};
             lastBoot_ = nlohmann::json::object();
-            if (step_ > 1) step_ = 1;
+            resetMissionLocked();   // 见下方：复位任务与阶段（否则再进任务会沿用旧阶段）
         }
         broadcastFlowState();
         if (reloadCode != 0) {
@@ -619,12 +1009,31 @@ nlohmann::json FlowEngine::command(const std::string& verb, const nlohmann::json
 #else
         {
             std::lock_guard<std::mutex> lk(mtx_);
-            if (step_ > 1) step_ = 1;
+            resetMissionLocked();
         }
         broadcastFlowState();
 #endif
         nlohmann::json d = nlohmann::json::object();
         d["reset"] = true;
+        d["note"] = "已复位到第 1 步：任务与阶段清空（下次 flow.enter 会建**新任务**）、"
+                    "自检报告清空、启动进度归零";
+        return reply(verb, 0, d);
+    }
+
+    // ---------------------------------------------------------------- 全流程复位（P7 一键重跑用）
+    if (verb == "mission.reset") {
+        // 与 `boot.reset` 的区别：这里**只动任务状态**，不碰自检/启动进度（用于"再来一遍任务"）。
+        // 语义：清空当前任务与阶段 + 已采纳/已确认方案 → 回第 1 步。
+        // 台账/实体按 missionId 隔离，所以新任务天然是干净的一份（MUST NOT 去删旧任务的数据）。
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            resetMissionLocked();
+        }
+        broadcastFlowState();
+        nlohmann::json d = nlohmann::json::object();
+        d["reset"] = true;
+        d["step"] = step_;
+        d["note"] = "任务与阶段已清空（台账/实体按 missionId 隔离，旧任务数据保留）";
         return reply(verb, 0, d);
     }
 
@@ -707,7 +1116,99 @@ nlohmann::json FlowEngine::command(const std::string& verb, const nlohmann::json
 
     // ---------------------------------------------------------------- 流程推进
     if (verb == "flow.enter") {
-        // 【进入任务】：步 3 + 阶段 T0。阶段的**语义**归 phase-engine，这里只对齐取值。
+        // 【引擎】phase::PhaseEngine::createMission(const CreateMissionInput&)（公开头 phase_engine.h:568）
+        //        + phase::PhaseEngine::advance(const AdvanceRequest&)（公开头 :577，显式进 T0）
+        //
+        // 入参怎么构造：`name` / `scenarioKey` 取自 scenario-data 的**真实场景数据**
+        // （`scenarioData.mission.name`、`scenarioData.scenarioKey` = 场景目录名，见
+        // scenario_dataset.h:172）；两者任缺时回落"配置里那个场景目录的目录名"——它就是这个
+        // 约定的取值来源，不是我编的字符串。引擎要求两者非空，否则 1000。
+        //
+        // 幂等：已有任务 → **不重复 createMission**（每次都会造新 missionId），只回执现状。
+#if MA_WITH_PHASE
+        if (!engines_.phase) {
+            return reply(verb, 1005, {{"message", "phase-engine 未装配（编译期 MA_WITH_PHASE=0）"}});
+        }
+        nlohmann::json d = nlohmann::json::object();
+        int code = 0;
+        bool changed = false;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            std::string scene = params.value("scenarioKey", std::string());
+            if (scene.empty()) scene = scenarioKeyOf(engines_);
+            if (scene.empty()) {
+                const std::filesystem::path p(cfg_.resolveScenarioDir());
+                scene = p.filename().string();
+            }
+            std::string name = params.value("name", std::string());
+#if MA_WITH_SIM_SOURCE && MA_WITH_INGEST
+            if (name.empty()) name = engines_.scenarioData.mission.name;
+#endif
+            if (name.empty()) name = scene;
+
+            if (!missionId_.empty()) {
+                // 已经有任务：**幂等**（引擎不重复 createMission），阶段一律以引擎台账为准 ——
+                // 这里 MUST NOT 硬写 "T0"：引擎可能早就走到 T1/T2 了，谎报阶段会让前端切错屏。
+                const PhaseView v = phaseViewLocked();
+                if (!v.phaseKey.empty()) phase_ = v.phaseKey;
+                const int s = stepForPhase(phase_);
+                if (s > 0) step_ = s;  // 落屏到"当前阶段对应的那一步"
+                if (v.enteredAt != 0) enteredAtMs_ = v.enteredAt;
+                changed = true;
+                d["step"] = step_;
+                d["phase"] = phase_;
+                d["missionId"] = missionId_;
+                d["scenarioKey"] = v.scenarioKey;
+                d["enteredAt"] = enteredAtMs_;
+                d["idempotent"] = true;
+                d["note"] = "任务已存在（flow.enter 幂等：不重复建任务）；阶段以引擎台账为准，推进用 mission.advance";
+            } else if (name.empty() || scene.empty()) {
+                code = 1003;
+                d["message"] = "建任务缺少 name/scenarioKey（scenario-data 未装配？用 --scenario 指定场景目录）";
+            } else {
+                phase::CreateMissionInput in;
+                in.name = name;
+                in.scenarioKey = scene;
+                in.type = params.value("type", std::string());
+                in.area = params.value("area", std::string());
+                in.operatorId = params.value("operatorId", std::string("host"));
+                const phase::CreateResult cr = engines_.phase->createMission(in);
+                if (cr.code != 0) {
+                    code = cr.code;
+                    d["message"] = cr.message;
+                } else {
+                    missionId_ = cr.data.id;
+                    // ② 进 T0：显式调 advance（create 已落在唯一起始阶段 T0 → 引擎回
+                    //    AlreadyThere + idempotent=true，零副作用；这里要的是**回执**，
+                    //    不是"再进一次"）。
+                    phase::AdvanceRequest ar;
+                    ar.missionId = missionId_;
+                    ar.to = "T0";
+                    ar.reason = "host:flow.enter";
+                    ar.operatorId = in.operatorId;
+                    const phase::TransitionResult tr = engines_.phase->advance(ar);
+                    const PhaseView v = phaseViewLocked();
+                    phase_ = v.phaseKey.empty() ? std::string("T0") : v.phaseKey;
+                    step_ = 3;
+                    enteredAtMs_ = v.enteredAt != 0 ? v.enteredAt : wallClockMs();
+                    changed = true;
+                    code = tr.code;
+                    d["step"] = step_;
+                    d["phase"] = phase_;
+                    d["missionId"] = missionId_;
+                    d["missionName"] = name;
+                    d["scenarioKey"] = scene;
+                    d["enteredAt"] = enteredAtMs_;
+                    d["create"] = cr.toJson();        // 引擎负载原样
+                    d["transition"] = tr.dataJson();  // 引擎负载原样（含 skippedGates/unmet）
+                    if (tr.idempotent) d["idempotent"] = true;
+                }
+            }
+        }
+        if (changed) broadcastFlowState();
+        return reply(verb, code, d);
+#else
+        // 没装配 phase-engine：只把宿主流程状态推到"第 3 步 + T0"，并如实标注（不假装引擎给过）。
         {
             std::lock_guard<std::mutex> lk(mtx_);
             step_ = 3;
@@ -720,7 +1221,738 @@ nlohmann::json FlowEngine::command(const std::string& verb, const nlohmann::json
         d["step"] = step_;
         d["phase"] = phase_;
         d["missionId"] = missionId_;
+        d["note"] = "phase-engine 未装配：阶段由宿主流程层代理（无引擎回执）";
         return reply(verb, 0, d);
+#endif
+    }
+
+    // ---------------------------------------------------------------- 步 3：任务态势
+    if (verb == "mission.advance") {
+        // 【引擎】phase::PhaseEngine::advance(const AdvanceRequest&)（公开头 phase_engine.h:577）
+        //   入参：missionId（宿主台账里的当前任务）、to（T0..T7，取值由规则包 phases.json 定义）、
+        //         force、reason/operatorId。判据（Gate）与拒绝语义全在引擎里 —— 宿主只转发。
+        //   回执：`TransitionResult::dataJson()` 原样（内含 status/unmet/skippedGates/state）。
+        const std::string to = params.value("to", std::string());
+        if (to.empty()) return badRequest(verb, "缺少 to（T0..T7）");
+#if MA_WITH_PHASE
+        if (!engines_.phase) {
+            return reply(verb, 1005, {{"message", "phase-engine 未装配（编译期 MA_WITH_PHASE=0）"}});
+        }
+        nlohmann::json d = nlohmann::json::object();
+        int code = 0;
+        bool moved = false;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (missionId_.empty()) {
+                return reply(verb, 1003,
+                             {{"message", "尚未进入任务：先 flow.enter（它会 createMission + 进 T0）"}});
+            }
+            phase::AdvanceRequest req;
+            req.missionId = missionId_;
+            req.to = to;
+            req.expectFrom = params.value("expectFrom", std::string());
+            req.reason = params.value("reason", std::string("host:mission.advance"));
+            req.operatorId = params.value("operatorId", std::string("host"));
+            req.force = params.value("force", false);
+            req.definitionVersion = params.value("definitionVersion", std::string());
+            const phase::TransitionResult tr = engines_.phase->advance(req);
+            code = tr.code;
+            d = tr.dataJson();
+            if (tr.idempotent) d["idempotent"] = true;
+            if (tr.code == 0) {
+                const PhaseView v = phaseViewLocked();
+                phase_ = v.phaseKey.empty() ? to : v.phaseKey;
+                enteredAtMs_ = v.enteredAt != 0 ? v.enteredAt : enteredAtMs_;
+                const int s = stepForPhase(phase_);
+                if (s > 0) step_ = s;
+                moved = true;
+            }
+        }
+        if (moved) broadcastFlowState();
+        return reply(verb, code, d);
+#else
+        return reply(verb, 1005, {{"message", "phase-engine 未装配（编译期 MA_WITH_PHASE=0）"}});
+#endif
+    }
+
+    // ---------------------------------------------------------------- 步 3：静态态势
+    if (verb == "situation.snapshot") {
+        // 【数据源】scenario-data 的本地配置（`ScenarioData`，scenario_dataset.h:170-218）：
+        //   areas    ← task-areas.json 的 areas[] + deployment.json 的 areas[]（标 areaKind 区分）
+        //   zones    ← airspace.json 的 zones[]（kind=no-fly/threat/geofence/corridor；通道就是 corridor）
+        //   platforms/groups/targets ← deployment.json 与 targets.json
+        // 【systemOverview】← selfcheck 最近一次报告的 `overview` 项（与 /api/state 同一份口径）
+        nlohmann::json d = nlohmann::json::object();
+        nlohmann::json areas = nlohmann::json::array();
+        nlohmann::json zones = nlohmann::json::array();
+        nlohmann::json platforms = nlohmann::json::array();
+        nlohmann::json groups = nlohmann::json::array();
+        nlohmann::json targets = nlohmann::json::array();
+        nlohmann::json notes = nlohmann::json::array();
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+#if MA_WITH_SIM_SOURCE && MA_WITH_INGEST
+            const auto& sd = engines_.scenarioData;
+            d["scenarioKey"] = sd.scenarioKey;
+            d["scenarioDir"] = sd.dir;
+            d["schemaVersion"] = sd.schemaVersion;
+            d["wireType"] = sd.wireType;
+            if (sd.hasMission) {
+                d["mission"] = {{"name", sd.mission.name},
+                                {"type", sd.mission.type},
+                                {"region", sd.mission.region},
+                                {"startAt", sd.mission.startAt},
+                                {"timeRequirement", sd.mission.timeRequirement}};
+            }
+            if (sd.hasCenter) d["center"] = {sd.center.first, sd.center.second};
+            d["zoom"] = sd.zoom;
+            d["minZoom"] = sd.minZoom;
+            d["maxZoom"] = sd.maxZoom;
+
+            auto ring = [](const std::vector<std::pair<double, double>>& poly) {
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& p : poly) arr.push_back({p.first, p.second});
+                return arr;
+            };
+            for (const auto& a : sd.taskAreas) {
+                areas.push_back({{"key", a.key},
+                                 {"name", a.name},
+                                 {"role", a.role},
+                                 {"color", a.color},
+                                 {"areaKind", "task"},
+                                 {"polygon", ring(a.polygon)}});
+            }
+            for (const auto& a : sd.deployAreas) {
+                nlohmann::json row = {{"key", a.key},
+                                      {"name", a.name},
+                                      {"role", a.role},
+                                      {"areaKind", "deploy"},
+                                      {"polygon", ring(a.polygon)}};
+                if (a.position.has_value()) row["position"] = {a.position->first, a.position->second};
+                areas.push_back(std::move(row));
+            }
+            for (const auto& z : sd.zones) {
+                zones.push_back({{"key", z.key},
+                                 {"name", z.name},
+                                 {"kind", z.kind},
+                                 {"hardness", z.hardness},
+                                 {"level", z.level},
+                                 {"action", z.action},
+                                 {"color", z.color},
+                                 {"dashed", z.dashed},
+                                 {"widthM", z.widthM},
+                                 {"polygon", ring(z.polygon)},
+                                 {"line", ring(z.line)}});
+            }
+            for (const auto& g : sd.groups) {
+                int n = 0;
+                for (const auto& a : sd.aircraft) {
+                    if (a.groupKey == g.key) ++n;
+                }
+                groups.push_back({{"key", g.key},
+                                  {"name", g.name},
+                                  {"role", g.role},
+                                  {"groupId", sd.groupIdOf(g.key)},
+                                  {"platformCount", n}});
+            }
+            for (const auto& a : sd.aircraft) {
+                std::string groupName;
+                for (const auto& g : sd.groups) {
+                    if (g.key == a.groupKey) groupName = g.name;
+                }
+                platforms.push_back({{"deviceId", a.deviceId},
+                                     {"typeKey", a.typeKey},
+                                     {"groupKey", a.groupKey},
+                                     {"groupName", groupName},
+                                     {"homeArea", a.homeArea},
+                                     {"taskArea", a.taskArea},
+                                     {"lng", a.stationLng},
+                                     {"lat", a.stationLat},
+                                     {"altM", a.altM},
+                                     {"speedMps", a.speedMps},
+                                     {"battery", a.battery},
+                                     {"payload", a.payload}});
+            }
+            for (const auto& t : sd.targets) {
+                nlohmann::json row = {{"no", t.no},
+                                      {"id", t.id},
+                                      {"typeKey", t.typeKey},
+                                      {"name", t.name},
+                                      {"motion", t.motion},
+                                      {"route", ring(t.route)},
+                                      {"speedMps", t.speedMps},
+                                      {"loop", t.loop},
+                                      {"startOffsetMs", t.startOffsetMs},
+                                      {"confidence", t.confidence},
+                                      {"features", t.features},
+                                      {"threat", t.threat},
+                                      {"valueTag", t.valueTag}};
+                if (t.position.has_value()) row["position"] = {t.position->first, t.position->second};
+                targets.push_back(std::move(row));
+            }
+            notes.push_back("areas/zones/platforms/groups/targets 全部来自 scenario-data 的本地配置"
+                            "（task-areas / airspace / deployment / targets），宿主不做任何数值加工");
+#else
+            notes.push_back("场景数据未装配（sim-source/接入层未编译进来）：区域/空域/平台清单为空");
+#endif
+        }
+        d["areas"] = std::move(areas);
+        d["zones"] = std::move(zones);
+        d["platforms"] = std::move(platforms);
+        d["groups"] = std::move(groups);
+        d["targets"] = std::move(targets);
+
+        // systemOverview：复用 selfcheck 的最近一次报告（`report()` 自己取锁 → 不在这把锁里调）
+        nlohmann::json overview = nlohmann::json::array();
+#if MA_WITH_SELFCHECK
+        if (selfCheckReady_) {
+            const selfcheck::Report& rep = report(true);
+            overview = itemsJson(rep.overview);
+            d["overviewSource"] = "selfcheck::Report.overview（最近一次自检；规则包 overview 段）";
+        } else {
+            notes.push_back("systemOverview 为空：" + selfCheckNote_);
+        }
+#else
+        notes.push_back("systemOverview 为空：selfcheck 未装配");
+#endif
+        d["overview"] = std::move(overview);
+        d["notes"] = std::move(notes);
+        return reply(verb, 0, d);
+    }
+
+    // ---------------------------------------------------------------- 步 3：态势组图
+    if (verb == "view.compose") {
+        // 【引擎】view_composer::ViewComposer::composeJson(const PhaseContext&, userHiddenGroups,
+        //   userHiddenTools, userHiddenControls, entitySnapshot)（公开头 view_composer.h:730-734）
+        //   入参构造：① 阶段五字段 ← phase-engine 的 `phaseContext()` → **同形五字段**映射
+        //              （两仓刻意不互相 include，映射必须由宿主写，见 D.1 第 4 条）；
+        //            ② entitySnapshot ← entity-ledger 的只读 `ledgerSnapshot(missionId)`（空 = 引擎放弃校验）；
+        //            ③ modeKey → 先 `setModeOverride`（未知 key → 引擎 1004，原样回执）。
+        //   回执：引擎的 JSON **原样**（`view_composer::json` = ordered_json，键序稳定可逐字节比对）。
+#if MA_WITH_VIEW_COMPOSER
+        if (!engines_.viewComposer) {
+            return reply(verb, 1005, {{"message", "view-composer 未装配（编译期 MA_WITH_VIEW_COMPOSER=0）"}});
+        }
+        const std::vector<std::string> hiddenGroups =
+            params.value("hiddenGroups", std::vector<std::string>{});
+        const std::vector<std::string> hiddenTools =
+            params.value("hiddenTools", std::vector<std::string>{});
+        const std::string modeKey = params.value("modeKey", std::string());
+        std::lock_guard<std::mutex> lk(mtx_);
+        const PhaseView v = phaseViewLocked();
+        const view_composer::PhaseContext vc =
+            toViewPhaseContext(v.phaseKey, v.seq, v.scenarioKey, v.enteredAt, v.missionId);
+        if (!modeKey.empty()) {
+            const view_composer::ModeResolution mr = engines_.viewComposer->setModeOverride(vc, modeKey);
+            if (!mr.ok) {
+                return reply(verb, 1004, {{"message", mr.reason}, {"modeKey", modeKey}});
+            }
+        }
+        const view_composer::json vcSnap = view_composer::json::parse(ledgerSnapshotLocked().dump());
+        const view_composer::json composed =
+            engines_.viewComposer->composeJson(vc, hiddenGroups, hiddenTools, {}, vcSnap);
+        return reply(verb, 0, nlohmann::json::parse(composed.dump()));
+#else
+        return reply(verb, 1005, {{"message", "view-composer 未装配（编译期 MA_WITH_VIEW_COMPOSER=0）"}});
+#endif
+    }
+
+    if (verb == "view.mode") {
+        // 【引擎】view_composer::ViewComposer::setModeOverride / clearModeOverride
+        //   （公开头 view_composer.h:656 / :658）—— 手动覆盖显示模式（三态可查：modeState）。
+        //   `{modeKey}` 指定 / `{clear:true}` 解除；未声明组合回落"未指定"而不报错。
+#if MA_WITH_VIEW_COMPOSER
+        if (!engines_.viewComposer) {
+            return reply(verb, 1005, {{"message", "view-composer 未装配（编译期 MA_WITH_VIEW_COMPOSER=0）"}});
+        }
+        const std::string modeKey = params.value("modeKey", std::string());
+        const bool clear = params.value("clear", false);
+        std::lock_guard<std::mutex> lk(mtx_);
+        const PhaseView v = phaseViewLocked();
+        const view_composer::PhaseContext vc =
+            toViewPhaseContext(v.phaseKey, v.seq, v.scenarioKey, v.enteredAt, v.missionId);
+        const view_composer::ModeResolution mr =
+            clear ? engines_.viewComposer->clearModeOverride(vc)
+                  : engines_.viewComposer->setModeOverride(vc, modeKey);
+        nlohmann::json d = nlohmann::json::parse(view_composer::toJson(mr).dump());
+        if (!mr.ok) return reply(verb, 1004, d);
+        return reply(verb, 0, d);
+#else
+        return reply(verb, 1005, {{"message", "view-composer 未装配（编译期 MA_WITH_VIEW_COMPOSER=0）"}});
+#endif
+    }
+
+    // ---------------------------------------------------------------- 步 4：库存台账
+    if (verb == "alloc.inventory") {
+        // 【引擎】resource_alloc::ResourceEngine::initializeLedger(targetId, scenarioKey)
+        //   （公开头 resource_alloc.h:645；基线取值来自规则包 deviceTypes.json 的 baselines 段）
+        //        + ResourceEngine::statsJson(targetId)（公开头 :671，目标不存在 → nullopt）
+        //   幂等由宿主守住：台账已存在就**不重建**（引擎的 initializeLedger 会清零已分配量）。
+#if MA_WITH_RESOURCE
+        if (!engines_.resource) {
+            return reply(verb, 1005, {{"message", "resource-alloc 未装配（编译期 MA_WITH_RESOURCE=0）"}});
+        }
+        std::lock_guard<std::mutex> lk(mtx_);
+        const std::string targetId =
+            params.value("targetId", missionId_.empty() ? std::string() : missionId_);
+        if (targetId.empty()) {
+            return reply(verb, 1003, {{"message", "尚未进入任务：先 flow.enter（台账按任务隔离）"}});
+        }
+        const std::string scene = scenarioKeyOf(engines_);
+        const LedgerInit init = ensureLedger(engines_, targetId, scene);
+        if (init.code != 0) {
+            return reply(verb, init.code, {{"message", init.message}, {"targetId", targetId}});
+        }
+        const std::optional<resource_alloc::json> stats = engines_.resource->statsJson(targetId);
+        if (!stats.has_value()) {
+            return reply(verb, 1004, {{"message", "台账不存在：" + targetId}});
+        }
+        nlohmann::json d = nlohmann::json::parse(stats->dump());
+        d["idempotent"] = !init.created;
+        d["ledgerInit"] = {{"targetId", targetId},
+                           {"scenarioKey", scene},
+                           {"created", init.created},
+                           {"code", init.code},
+                           {"message", init.message}};
+        return reply(verb, 0, d);
+#else
+        return reply(verb, 1005, {{"message", "resource-alloc 未装配（编译期 MA_WITH_RESOURCE=0）"}});
+#endif
+    }
+
+    // ---------------------------------------------------------------- 步 4：编组三方案
+    if (verb == "alloc.plans") {
+        // 【引擎】scoring::ScoringEngine::generateCandidates(const CandidateRequest&)（scoring.h:822）
+        //        + scoring::ScoringEngine::score(const CandidateRequest&)（scoring.h:824）
+        //   入参：side（默认 "group"）、scene = 场景键、snapshot = **真填**的 ScoringSnapshot
+        //        （集群用量 ← 台账 statsJson().clusters[] 或场景编制；利用率 ← 台账实测；
+        //          链路评估/目标清单拿不到 → 留空并在 notes 里点名，MUST NOT 编造）
+        //   回执：候选与评分**原样**（Candidate::toJson / CandidateScore::toJson），
+        //        外加推荐 id / 推荐百分比 / 理由 / 领先值 —— 全部来自 ScoreResult。
+#if MA_WITH_SCORING && MA_WITH_RESOURCE
+        if (!engines_.scoringEngine) {
+            return reply(verb, 1005, {{"message", "scoring 未装配（编译期 MA_WITH_SCORING=0）"}});
+        }
+        const std::string side = params.value("side", std::string("group"));
+        const int want = intOr(params, "count", 3);
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (missionId_.empty()) {
+            return reply(verb, 1003, {{"message", "尚未进入任务：先 flow.enter（台账/评分按任务隔离）"}});
+        }
+        const std::string targetId = missionId_;
+        std::string scene = params.value("scene", std::string());
+        if (scene.empty()) scene = scenarioKeyOf(engines_);
+        const LedgerInit init = ensureLedger(engines_, targetId, scene);
+        if (init.code != 0) {
+            return reply(verb, init.code, {{"message", init.message}, {"targetId", targetId}});
+        }
+        nlohmann::json notes = nlohmann::json::array();
+        notes.push_back(std::string("台账：") + (init.created ? "本次初始化（" : "已存在，未重建（") +
+                        init.message + "）");
+
+        const PhaseView v = phaseViewLocked();
+        const scoring::PhaseContext pc =
+            toScoringPhaseContext(v.phaseKey, v.seq, scene, v.enteredAt, targetId);
+        scoring::CandidateRequest req;
+        req.missionId = targetId;
+        req.phase = pc;
+        req.side = side;
+        req.scene = scene;
+        req.includeInapplicable = true;  // SCD-CAND-02：不适用 MUST 标注而非静默丢弃
+        req.dedupe = true;               // SCD-CAND-04：内容等价的候选合并并标注
+        req.snapshot = buildSnapshot(engines_, targetId, pc, scene, notes);
+
+        const std::vector<scoring::Candidate> cands = engines_.scoringEngine->generateCandidates(req);
+        const scoring::ScoreResult sr = engines_.scoringEngine->score(req);
+        if (sr.code != 0) {
+            return reply(verb, sr.code,
+                         {{"message", sr.message}, {"notes", notes}, {"scene", scene}, {"side", side}});
+        }
+
+        nlohmann::json items = nlohmann::json::array();
+        int taken = 0;
+        for (const auto& cs : sr.candidates) {
+            if (taken >= want) break;
+            items.push_back({{"candidate", nlohmann::json::parse(cs.candidate.toJson().dump())},
+                             {"score", nlohmann::json::parse(cs.toJson().dump())}});
+            ++taken;
+        }
+        nlohmann::json candidatesRaw = nlohmann::json::array();
+        for (const auto& c : cands) candidatesRaw.push_back(nlohmann::json::parse(c.toJson().dump()));
+        nlohmann::json reasons = nlohmann::json::array();
+        for (const auto& rs : sr.reasons) reasons.push_back(nlohmann::json::parse(rs.toJson().dump()));
+        nlohmann::json missing = nlohmann::json::array();
+        for (const auto& m : sr.missingInputs) missing.push_back(m);
+
+        // 本次真填进去的快照摘要（可复核"哪些字段是空的、空在哪"）
+        nlohmann::json snapJson = nlohmann::json::object();
+        {
+            nlohmann::json rj = nlohmann::json::object();
+            rj["present"] = req.snapshot.resources.has_value() && req.snapshot.resources->present;
+            nlohmann::json cl = nlohmann::json::array();
+            if (req.snapshot.resources.has_value()) {
+                for (const auto& c : req.snapshot.resources->clusters) {
+                    cl.push_back({{"clusterId", c.clusterId},
+                                  {"phaseKey", c.phaseKey},
+                                  {"total", c.total},
+                                  {"available", c.available},
+                                  {"present", c.present}});
+                }
+            }
+            rj["clusters"] = cl;
+            snapJson["resources"] = rj;
+            snapJson["topology"] = {{"present", false}, {"note", "未填（链路评估腿未接）"}};
+            snapJson["targets"] = {{"present", req.snapshot.targets.has_value()},
+                                   {"note", req.snapshot.targets.has_value()
+                                                ? "来自 entity-ledger 台账快照"
+                                                : "未填（台账为空）"}};
+            snapJson["resourceUtilization"] = req.snapshot.resourceUtilization;
+            snapJson["hasResourceUtilization"] = req.snapshot.hasResourceUtilization;
+            snapJson["missionId"] = req.snapshot.missionId;
+            snapJson["phase"] = {{"phaseKey", pc.phaseKey}, {"seq", pc.seq}, {"scenarioKey", pc.scenarioKey}};
+        }
+
+        nlohmann::json d = nlohmann::json::object();
+        d["side"] = side;
+        d["scene"] = sr.scene.empty() ? scene : sr.scene;
+        d["missionId"] = targetId;
+        d["count"] = taken;
+        d["requestedCount"] = want;
+        d["items"] = std::move(items);              // 候选 + 评分（原样）
+        d["candidates"] = std::move(candidatesRaw);  // generateCandidates 的原样输出
+        d["recommendedId"] = sr.recommendedId;
+        d["hasRecommended"] = sr.hasRecommended;
+        d["recommendedPercent"] = sr.recommendedPercent;
+        d["nextId"] = sr.nextId;
+        d["nextPercent"] = sr.nextPercent;
+        d["leadOverNext"] = sr.leadOverNext;
+        d["leadOverNextPercent"] = sr.leadOverNextPercent;
+        d["reasons"] = std::move(reasons);
+        d["missingInputs"] = std::move(missing);
+        d["snapshot"] = std::move(snapJson);
+        d["metricsDigest"] = sr.metricsDigest;
+        d["templatesDigest"] = sr.templatesDigest;
+        d["auditDigest"] = sr.auditDigest;
+        d["notes"] = std::move(notes);
+        if (sr.hasRecommended) {
+            hasPlanScore_ = true;
+            lastPlanRecommendation_ = sr.recommendedId;
+            lastPlanRecommendedPercent_ = sr.recommendedPercent;
+        }
+        return reply(verb, 0, d);
+#else
+        return reply(verb, 1005, {{"message", "scoring/resource-alloc 未装配（编译期开关关闭）"}});
+#endif
+    }
+
+    // ---------------------------------------------------------------- 步 5：采纳 / 确认
+    if (verb == "alloc.adopt" || verb == "alloc.confirm") {
+        // 【引擎】scoring::ScoringEngine::adopt(const AdoptRequest&)（scoring.h:834）
+        //        / scoring::ScoringEngine::confirm(const ConfirmRequest&)（scoring.h:836）
+        //   前置策略在规则包 `confirmPrecondition`（未采纳直接确认 → 1003）；
+        //   同侧互斥、幂等（code=0 + idempotent）、非推荐方案的 deviated 标注全由引擎裁决。
+        //   回执：`DecideResult::dataJson()` 原样（`event` 字段就是 `plan.state` 的负载，
+        //         广播由 adapters.cc 的 PlanSink 做，宿主不重复广播）。
+#if MA_WITH_SCORING
+        if (!engines_.scoringEngine) {
+            return reply(verb, 1005, {{"message", "scoring 未装配（编译期 MA_WITH_SCORING=0）"}});
+        }
+        const std::string planId = params.value("planId", std::string());
+        if (planId.empty()) return badRequest(verb, "缺少 planId");
+        const std::string side = params.value("side", std::string("group"));
+        nlohmann::json d = nlohmann::json::object();
+        int code = 0;
+        bool stepChanged = false;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (missionId_.empty()) {
+                return reply(verb, 1003, {{"message", "尚未进入任务：先 flow.enter"}});
+            }
+            const std::string scene = scenarioKeyOf(engines_);
+            const PhaseView v = phaseViewLocked();
+            const scoring::PhaseContext pc =
+                toScoringPhaseContext(v.phaseKey, v.seq, scene, v.enteredAt, missionId_);
+            if (verb == "alloc.adopt") {
+                scoring::AdoptRequest req;
+                req.missionId = missionId_;
+                req.phase = pc;
+                req.planId = planId;
+                req.side = side;
+                req.operatorId = params.value("operatorId", std::string("host"));
+                req.reason = params.value("reason", std::string("host:alloc.adopt"));
+                req.hasRecommendedContext = hasPlanScore_;
+                req.recommendedId = lastPlanRecommendation_;
+                req.recommendedPercent = lastPlanRecommendedPercent_;
+                req.planPercent = (planId == lastPlanRecommendation_) ? lastPlanRecommendedPercent_ : 0;
+#if MA_WITH_RESOURCE
+                {
+                    nlohmann::json notes = nlohmann::json::array();
+                    req.snapshot = buildSnapshot(engines_, missionId_, pc, scene, notes);
+                }
+#endif
+                const scoring::DecideResult res = engines_.scoringEngine->adopt(req);
+                code = res.code;
+                d = nlohmann::json::parse(res.dataJson().dump());
+                if (res.idempotent) d["idempotent"] = true;
+                if (res.code == 0) {
+                    adoptedPlanId_ = planId;
+                    if (step_ < 4) {
+                        step_ = 4;  // 步 4 = 编组方案（采纳发生在这一步的卡片上）
+                        stepChanged = true;
+                    }
+                }
+            } else {
+                scoring::ConfirmRequest req;
+                req.missionId = missionId_;
+                req.phase = pc;
+                req.planId = planId;
+                req.side = side;
+                req.operatorId = params.value("operatorId", std::string("host"));
+                req.reason = params.value("reason", std::string("host:alloc.confirm"));
+                const scoring::DecideResult res = engines_.scoringEngine->confirm(req);
+                code = res.code;
+                d = nlohmann::json::parse(res.dataJson().dump());
+                if (res.idempotent) d["idempotent"] = true;
+                if (res.code == 0) {
+                    confirmedPlanId_ = planId;
+                    if (step_ < 5) {
+                        step_ = 5;  // 步 5 = 编组确认
+                        stepChanged = true;
+                    }
+                }
+            }
+        }
+        if (stepChanged) broadcastFlowState();
+        return reply(verb, code, d);
+#else
+        return reply(verb, 1005, {{"message", "scoring 未装配（编译期 MA_WITH_SCORING=0）"}});
+#endif
+    }
+
+    // ---------------------------------------------------------------- 步 5：执行编组（编成实体）
+    if (verb == "alloc.assign") {
+        // 【引擎】① resource_alloc::ResourceEngine::assignAllocation(const AssignRequest&)
+        //           （公开头 resource_alloc.h:657；原子：全成功或全不生效）
+        //        ② entity_ledger::EntityLedger::registerEntity(const RegisterInput&)
+        //           （公开头 entity_ledger.h:1233；编成实体）
+        //   入参怎么构造：
+        //     · 方案内容（集群清单）← scoring::generateCandidates(onlyTemplateKeys={planId})（scoring.h:822）
+        //     · clusterId = **场景编组 key**（deployment.json groups[].key；CTR-PL-08 禁止拿显示名当 key）
+        //     · allocation = 逐型号量：该集群下**真实平台**按型号计数（平台来自 deployment.json）
+        //     · reason = planId（透传进 resource.allocation.changed，便于审计）
+        //     · 实体入参：typeKey = 平台型号 key、obsKey = deviceId、坐标 = 场景站位、confidence=1.0
+        //       （场景配置即权威来源，不是估计值）；其余进 attributes。
+#if MA_WITH_RESOURCE && MA_WITH_SCORING
+        const std::string planId = params.value("planId", std::string());
+        if (planId.empty()) return badRequest(verb, "缺少 planId");
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (missionId_.empty()) {
+            return reply(verb, 1003, {{"message", "尚未进入任务：先 flow.enter"}});
+        }
+        if (adoptedPlanId_ != planId && confirmedPlanId_ != planId) {
+            return reply(verb, 1003,
+                         {{"message", "编组前置未满足：先 alloc.adopt → alloc.confirm"},
+                          {"planId", planId},
+                          {"adopted", adoptedPlanId_},
+                          {"confirmed", confirmedPlanId_}});
+        }
+        const std::string targetId = missionId_;
+        const std::string scene = scenarioKeyOf(engines_);
+        const LedgerInit init = ensureLedger(engines_, targetId, scene);
+        if (init.code != 0) {
+            return reply(verb, init.code, {{"message", init.message}, {"targetId", targetId}});
+        }
+        nlohmann::json notes = nlohmann::json::array();
+        notes.push_back(std::string("台账：") + (init.created ? "本次初始化" : "已存在，未重建"));
+
+        const PhaseView v = phaseViewLocked();
+        const scoring::PhaseContext pc =
+            toScoringPhaseContext(v.phaseKey, v.seq, scene, v.enteredAt, targetId);
+        scoring::CandidateRequest req;
+        req.missionId = targetId;
+        req.phase = pc;
+        req.side = params.value("side", std::string("group"));
+        req.scene = scene;
+        req.onlyTemplateKeys = {planId};
+        req.includeInapplicable = true;
+        req.dedupe = false;  // 只取一个模板，不做等价合并
+        {
+            nlohmann::json tmp = nlohmann::json::array();
+            req.snapshot = buildSnapshot(engines_, targetId, pc, scene, tmp);
+        }
+        const std::vector<scoring::Candidate> cands = engines_.scoringEngine->generateCandidates(req);
+        const scoring::Candidate* plan = nullptr;
+        for (const auto& c : cands) {
+            if (c.key == planId || c.id == planId) plan = &c;
+        }
+        if (plan == nullptr) {
+            nlohmann::json ks = nlohmann::json::array();
+            for (const auto& c : cands) ks.push_back(c.key);
+            return reply(verb, 1004, {{"message", "未找到方案模板：" + planId}, {"knownTemplates", ks}});
+        }
+
+        nlohmann::json allocations = nlohmann::json::array();
+        nlohmann::json entities = nlohmann::json::array();
+        nlohmann::json clusterMap = nlohmann::json::array();
+        int allocatedClusters = 0;
+        int registered = 0;
+        bool allIdempotent = true;
+        int entityAttempts = 0;
+#if MA_WITH_SIM_SOURCE && MA_WITH_INGEST
+        const std::vector<std::pair<std::string, std::string>> scenarioGroups = scenarioGroupsOf(engines_);
+        const std::vector<PlatformRow> allPlatforms = platformsOf(engines_);
+#else
+        const std::vector<std::pair<std::string, std::string>> scenarioGroups;
+        const std::vector<PlatformRow> allPlatforms;
+#endif
+        for (const auto& planCluster : plan->clusters) {
+            // 计划里的集群名 ↔ 场景编组显示名（deployment.json groups[].name，精确匹配）
+            std::string groupKey;
+            for (const auto& g : scenarioGroups) {
+                if (g.second == planCluster) {
+                    groupKey = g.first;
+                    break;
+                }
+            }
+            if (groupKey.empty()) {
+                clusterMap.push_back({{"planCluster", planCluster},
+                                      {"matched", false},
+                                      {"reason", "场景编组里没有同名集群 → 不编入任何平台"}});
+                continue;
+            }
+            std::vector<PlatformRow> members;
+            for (const auto& r : allPlatforms) {
+                if (r.groupKey == groupKey) members.push_back(r);
+            }
+            resource_alloc::AssignRequest ar;
+            ar.targetId = targetId;
+            ar.phase = toResourcePhaseContext(pc.phaseKey, pc.seq, pc.scenarioKey, pc.enteredAt, targetId);
+            ar.clusterId = groupKey;
+            ar.reason = planId;
+            // 型号顺序 = 引擎声明顺序（models()），同一份编组每次提交同一向量
+            for (const auto& m : engines_.resource->models()) {
+                int64_t n = 0;
+                for (const auto& p : members) {
+                    if (p.model == m.key) ++n;
+                }
+                if (n > 0) ar.allocation.push_back(resource_alloc::BaselineItem{m.key, n});
+            }
+            const resource_alloc::AllocationResult ar2 = engines_.resource->assignAllocation(ar);
+            allocations.push_back({{"clusterId", groupKey},
+                                   {"planCluster", planCluster},
+                                   {"allocation", [&ar] {
+                                        nlohmann::json a = nlohmann::json::array();
+                                        for (const auto& b : ar.allocation) {
+                                            a.push_back({{"model", b.model}, {"count", b.total}});
+                                        }
+                                        return a;
+                                    }()},
+                                   {"code", ar2.code},
+                                   {"message", ar2.message},
+                                   {"idempotent", ar2.idempotent},
+                                   {"applied", ar2.applied},
+                                   {"allocatedTotal", ar2.allocatedTotal},
+                                   {"items", nlohmann::json::parse(ar2.items.dump())}});
+            if (ar2.code != 0) {
+                allIdempotent = false;
+                notes.push_back("集群 " + groupKey + " 分配被拒（code=" + std::to_string(ar2.code) +
+                                "）：" + ar2.message);
+                continue;
+            }
+            ++allocatedClusters;
+            if (!ar2.idempotent) allIdempotent = false;
+            clusterMap.push_back({{"planCluster", planCluster},
+                                  {"matched", true},
+                                  {"groupKey", groupKey},
+                                  {"platforms", static_cast<int>(members.size())}});
+#if MA_WITH_LEDGER
+            // 编成实体：**分配成功的集群**下的每一台真实平台登记一次
+            for (const auto& p : members) {
+                entity_ledger::RegisterInput ri;
+                ri.missionId = targetId;
+                ri.typeKey = p.model;  // 平台型号 key（resource-alloc deviceTypes.json 的 items[].key）
+                ri.lng = p.lng;
+                ri.lat = p.lat;
+                ri.alt = p.alt;
+                ri.confidence = 1.0;   // 场景配置即权威来源（不是估计值）
+                ri.obsKey = p.deviceId;  // 去重主键（规则 dedup.keys 含 obsKey）
+                ri.operatorId = "host:alloc.assign";
+                nlohmann::json attrs = {{"model", p.model},
+                                        {"groupKey", p.groupKey},
+                                        {"planCluster", planCluster},
+                                        {"planId", planId},
+                                        {"homeArea", p.homeArea},
+                                        {"taskArea", p.taskArea},
+                                        {"speedMps", p.speed},
+                                        {"battery", p.battery}};
+                attrs["payload"] = p.payload;
+                ri.attributes = attrs;
+                ++entityAttempts;
+                nlohmann::json row = {{"deviceId", p.deviceId},
+                                      {"model", p.model},
+                                      {"clusterId", p.groupKey},
+                                      {"typeKey", p.model}};
+                if (engines_.entityLedger) {
+                    const entity_ledger::RegisterResult rr = engines_.entityLedger->registerEntity(ri);
+                    row["code"] = rr.code;
+                    row["message"] = rr.message;
+                    row["status"] = rr.status;
+                    row["ok"] = (rr.code == 0);
+                    if (rr.code == 0) {
+                        row["entityId"] = rr.data.id;
+                        row["no"] = rr.data.no;
+                        row["dynamicState"] = rr.data.dynamicState;
+                        ++registered;
+                    }
+                } else {
+                    row["code"] = 1005;
+                    row["message"] = "entity-ledger 未装配";
+                    row["ok"] = false;
+                }
+                entities.push_back(std::move(row));
+            }
+#endif
+        }
+
+        nlohmann::json d = nlohmann::json::object();
+        d["planId"] = planId;
+        d["missionId"] = targetId;
+        d["clusterCount"] = static_cast<int>(plan->clusters.size());
+        d["allocatedClusters"] = allocatedClusters;
+        d["allocation"] = std::move(allocations);
+        d["clusterMapping"] = std::move(clusterMap);
+        d["entities"] = std::move(entities);
+        d["registered"] = registered;
+        d["entityAttempts"] = entityAttempts;
+        d["idempotent"] = (allocatedClusters > 0 && allIdempotent);
+        if (entityAttempts > 0 && registered == 0) {
+            // **如实上报**：编组分配成功了，但实体登记被引擎逐个拒绝 —— 把引擎的原话与它认的
+            // 类型清单一起交出去（这是规则包/数据侧的缺口，不是宿主能自己"绕"过去的事）。
+            nlohmann::json known = nlohmann::json::array();
+#if MA_WITH_LEDGER
+            if (engines_.entityLedger) {
+                for (const auto& k : engines_.entityLedger->entityTypeKeys()) known.push_back(k);
+            }
+#endif
+            d["blocked"] = {{"stage", "entity-ledger.registerEntity"},
+                            {"reason", "引擎拒绝了全部登记：平台型号 key 必须出现在 entityTypes.json 的 "
+                                       "items 里（未知类型 → 1000）"},
+                            {"knownEntityTypes", known},
+                            {"needs", "entity-ledger/policies/mapapp/entityTypes.json 声明对应平台类型"
+                                      "（属模块仓规则包；host 侧 MUST NOT 自造型号 key 绕过）"}};
+            notes.push_back("实体登记 0/" + std::to_string(entityAttempts) +
+                            " 成功：见 blocked（规则包缺口，宿主未自造型号 key）");
+        }
+        if (allocatedClusters == 0) {
+            notes.push_back(allocations.empty()
+                                ? "方案声明的集群与场景编组无同名项（逐条理由见 clusterMapping）"
+                                : "全部集群的分配都被引擎拒绝（见 allocation[].code/message）");
+        }
+        d["notes"] = std::move(notes);
+        return reply(verb, allocatedClusters > 0 ? 0 : 1003, d);
+#else
+        return reply(verb, 1005, {{"message", "resource-alloc/scoring 未装配（编译期开关关闭）"}});
+#endif
     }
 
     if (verb == "flow.goto") {
