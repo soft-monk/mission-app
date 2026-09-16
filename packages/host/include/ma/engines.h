@@ -14,6 +14,8 @@
 #include <memory>
 #include <string>
 
+#include <nlohmann/json.hpp>
+
 #include "ma/adapters.h"
 #include "ma/config.h"
 #include "ma/registry.h"
@@ -54,6 +56,16 @@
 #include "telemetry_store/backends/memory_backend.h"
 #include "telemetry_store/policy.h"
 #include "telemetry_store/store.h"
+#endif
+#if MA_WITH_SIM_SOURCE && MA_WITH_INGEST
+#include "ma/scenario/scenario_dataset.h"
+#include "ma/sim_bridge/sim_bridge.h"
+#endif
+#ifndef MA_WITH_SIM_SOURCE
+#define MA_WITH_SIM_SOURCE 0
+#endif
+#ifndef MA_WITH_INGEST
+#define MA_WITH_INGEST 0
 #endif
 
 namespace ma {
@@ -128,6 +140,30 @@ struct Engines {
 #if MA_WITH_INGEST
     std::unique_ptr<device_ingest::Gateway> gateway;
     std::string gatewayNote;
+    /// 接入层是否真的 start() 了（false = 只链接、或起不来）。
+    bool gatewayRunning = false;
+#endif
+
+#if MA_WITH_SIM_SOURCE && MA_WITH_INGEST
+    // ---------------------------------------------------------------- 仿真源
+    //
+    // 装配顺序就是数据流向：本地配置 → 中立结构 → 引擎 → 一行报文 → 接入层 → 广播。
+    ma::scenario::ScenarioData scenarioData;
+    ma::sim_bridge::Bridge bridge;
+    std::string simNote;
+    /// 配置目录（默认 <dataDir>/scenario-1）。
+    std::string scenarioDir;
+    /// 线格式那一端（接入点）的落点，日志与 /stats 都要报。
+    std::string ingestEndpoint;
+
+    /// 读本地配置并装配仿真源。**不启动节拍**（radar 由 main 按参数决定起不起）。
+    bool loadSimulation(const std::string& dir, const std::string& kindName,
+                        const std::string& wireType, const std::string& host, int port,
+                        std::string& error);
+
+    /// 仿真 + 接入的读数（/stats 里那两行）。
+    nlohmann::json simStatsJson() const;
+    nlohmann::json ingestStatsJson() const;
 #endif
 
     /// 把就绪状态写进账本（顺序 = 装配顺序）。

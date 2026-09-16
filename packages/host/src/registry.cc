@@ -35,7 +35,8 @@ std::string Registry::readyLine() const {
     return line;
 }
 
-std::string Registry::statsJson(const std::string& version) const {
+std::string Registry::statsJson(const std::string& version,
+                                const nlohmann::json& extra) const {
     std::lock_guard<std::mutex> lk(mtx_);
     nlohmann::ordered_json out;
     out["version"] = version;
@@ -47,6 +48,13 @@ std::string Registry::statsJson(const std::string& version) const {
         row["ok"] = e.ok;
         if (!e.note.empty()) row["note"] = e.note;
         out["engines"][e.key] = std::move(row);
+    }
+    // 附加段：本账本不认识它们的内容，只负责原样带上（键不覆盖 engines）。
+    if (extra.is_object()) {
+        for (auto it = extra.begin(); it != extra.end(); ++it) {
+            if (it.key() == "engines" || it.key() == "version") continue;
+            out[it.key()] = it.value();
+        }
     }
     return out.dump();
 }

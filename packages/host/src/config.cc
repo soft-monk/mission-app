@@ -64,6 +64,11 @@ std::string HostConfig::resolvePath(const std::string& p) const {
     return (base / path).lexically_normal().string();
 }
 
+std::string HostConfig::resolveScenarioDir() const {
+    if (!scenarioDir.empty()) return resolvePath(scenarioDir);
+    return (fs::path(resolvePath(dataDir)) / "scenario-1").lexically_normal().string();
+}
+
 bool HostConfig::loadFile(const std::string& path, HostConfig& out, std::string& error) {
     std::ifstream in(path, std::ios::binary);
     if (!in) {
@@ -114,8 +119,75 @@ bool HostConfig::loadFile(const std::string& path, HostConfig& out, std::string&
     if (!getString(sc, "policies", out.selfcheckPolicies, error)) return false;
     if (!getString(sc, "capabilities", out.selfcheckCapabilities, error)) return false;
 
+    // ---- ingest（接入点）：ingest.points[] = { id, group, port, parserId, deviceType, topic }
+    {
+        const auto& ing = sub(j, "ingest", scratch);
+        if (!getBool(ing, "enabled", out.ingest.enabled, error)) return false;
+        if (!getInt(ing, "mergeWindowMs", out.ingest.mergeWindowMs, error)) return false;
+        if (ing.contains("points")) {
+            if (!ing["points"].is_array()) {
+                error = "ingest.points 必须是数组";
+                return false;
+            }
+            for (std::size_t i = 0; i < ing["points"].size(); ++i) {
+                const auto& node = ing["points"][i];
+                if (!node.is_object()) {
+                    error = "ingest.points[" + std::to_string(i) + "] 必须是对象";
+                    return false;
+                }
+                IngestPoint p;
+                const std::string base = "ingest.points[" + std::to_string(i) + "]";
+                auto guard = [&](bool ok) { return ok; };
+                if (!guard(getString(node, "id", p.id, error))) return false;
+                if (!guard(getString(node, "group", p.group, error))) return false;
+                if (!guard(getInt(node, "port", p.port, error))) return false;
+                if (!guard(getString(node, "iface", p.iface, error))) return false;
+                if (!guard(getString(node, "parserId", p.parserId, error))) return false;
+                if (!guard(getString(node, "deviceType", p.deviceType, error))) return false;
+                if (!guard(getString(node, "topic", p.topic, error))) return false;
+                if (!guard(getBool(node, "enabled", p.enabled, error))) return false;
+                if (p.id.empty()) {
+                    error = base + ".id 不能为空";
+                    return false;
+                }
+                if (p.port <= 0 || p.port > 65535) {
+                    error = base + ".port 超出范围（1..65535）：" + std::to_string(p.port);
+                    return false;
+                }
+                if (p.parserId.empty()) {
+                    error = base + ".parserId 不能为空";
+                    return false;
+                }
+                for (const auto& seen : out.ingest.points) {
+                    if (seen.port == p.port) {
+                        error = base + ".port 与接入点 " + seen.id +
+                                " 重复（一个端口只归一个接入点）：" + std::to_string(p.port);
+                        return false;
+                    }
+                }
+                out.ingest.points.push_back(std::move(p));
+            }
+        }
+    }
+
+    if (!getString(j, "ingestHost", out.ingestHost, error)) return false;
+    if (!getString(j, "simKind", out.simKind, error)) return false;
+    if (!getString(j, "simWireType", out.simWireType, error)) return false;
+    if (!getInt(j, "simSpeed", out.simSpeed, error)) return false;
+    if (!getBool(j, "simAutoStart", out.simAutoStart, error)) return false;
+    if (!getString(j, "scenarioDir", out.scenarioDir, error)) return false;
+
     if (out.port <= 0 || out.port > 65535) {
         error = "server.port 超出范围（1..65535）：" + std::to_string(out.port);
+        return false;
+    }
+    // 倍速只认三个值（与引擎的 setSpeed 口径一致；配错了当场可见，不静默回落）。
+    if (out.simSpeed != 1 && out.simSpeed != 8 && out.simSpeed != 60) {
+        error = "simSpeed 只接受 1 / 8 / 60：" + std::to_string(out.simSpeed);
+        return false;
+    }
+    if (out.ingest.points.empty()) {
+        error = "ingest.points 不能为空（仿真那条流要有落点）";
         return false;
     }
     if (out.threads <= 0) out.threads = 1;

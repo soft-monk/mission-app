@@ -274,6 +274,27 @@ foreach(_pair IN ITEMS "sim-source|sim_source|${MA_SIMSRC_DIR}|${MA_BUILD_SIM_SO
   endif()
 endforeach()
 
+# ================================================================ 宿主侧的包（packages/）
+#
+# 这两个包是**宿主自己的代码**（不是模块仓，MUST NOT 被当成模块）：
+#   scenario-data  本地配置 → 中立结构（喂 sim-source）
+#   sim-bridge     中立结构 → 线上格式 → 真实链路（UDP / 节拍驱动）
+#
+# 它们只 include 模块的**公开头**（sim_source/sim_source.h、device_ingest/*.h），
+# 与宿主可执行文件同一条纪律：不碰模块内部实现。
+set(MA_PKG_SCENARIO_DIR   "${CMAKE_CURRENT_SOURCE_DIR}/packages/scenario-data")
+set(MA_PKG_SIMBRIDGE_DIR  "${CMAKE_CURRENT_SOURCE_DIR}/packages/sim-bridge")
+
+if(MA_HAVE_SIM_SOURCE AND TARGET sim_source)
+  set(MA_HAVE_SIM_BRIDGE ON)
+  add_subdirectory("${MA_PKG_SCENARIO_DIR}"  "${CMAKE_BINARY_DIR}/packages/scenario-data")
+  add_subdirectory("${MA_PKG_SIMBRIDGE_DIR}" "${CMAKE_BINARY_DIR}/packages/sim-bridge")
+else()
+  # sim-source 不在 → 这两个包没有可依赖的中立结构，整段跳过（编译期事实）。
+  set(MA_HAVE_SIM_BRIDGE OFF)
+  message(STATUS "[mission-app] 跳过 scenario-data / sim-bridge：sim-source 未装配")
+endif()
+
 # ================================================================ 依赖：Drogon
 if(NOT TARGET Drogon::Drogon)
   find_package(Drogon CONFIG REQUIRED)
@@ -287,17 +308,24 @@ add_executable(mission_host
   packages/host/src/registry.cc
   packages/host/src/adapters.cc
   packages/host/src/engines.cc
-  packages/host/src/host_server.cc)
+  packages/host/src/host_server.cc
+  packages/host/src/drogon_transport.cc
+  packages/host/src/hub_engine.cc)
 
 target_include_directories(mission_host PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/packages/host/include")
 
 target_link_libraries(mission_host PRIVATE Drogon::Drogon)
 
+# 宿主侧的两个包：装配了 sim-source 才有（否则它们根本不存在 → 也就不用链接）。
+if(MA_HAVE_SIM_BRIDGE)
+  target_link_libraries(mission_host PRIVATE ma_scenario_data ma_sim_bridge)
+endif()
+
 # 哪些模块真的装进来了 —— 编成宏给宿主用，宿主据此决定实例化谁。
 # 这样"模块不在"是**编译期事实**，宿主里不需要写任何运行期兜底分支。
 foreach(_flag IN ITEMS PHASE RESOURCE SCORING LEDGER TOPOLOGY ALERT REPORT SELFCHECK GEO
-                       INGEST STORE HUB PROBES_MAPAPP SIM_SOURCE SENSOR_MODEL)
+                       INGEST STORE HUB PROBES_MAPAPP SIM_SOURCE SENSOR_MODEL SIM_BRIDGE)
   if(MA_HAVE_${_flag})
     target_compile_definitions(mission_host PRIVATE "MA_WITH_${_flag}=1")
   else()
@@ -425,6 +453,11 @@ if(MA_HAVE_SENSOR_MODEL)
   message(STATUS "[mission-app]   sensor-model : 已装配（条件包含）")
 else()
   message(STATUS "[mission-app]   sensor-model : 未装配（模块尚未落地）")
+endif()
+if(MA_HAVE_SIM_BRIDGE)
+  message(STATUS "[mission-app]   scenario-data / sim-bridge : 已装配（本地配置 → 仿真 → UDP → 接入层）")
+else()
+  message(STATUS "[mission-app]   scenario-data / sim-bridge : 未装配（依赖 sim-source）")
 endif()
 message(STATUS "[mission-app]   map-2d / media-player : npm 包，由 apps/web 经 Vite 别名原地引用")
 message(STATUS "[mission-app]   构建类型 : ${CMAKE_BUILD_TYPE}")

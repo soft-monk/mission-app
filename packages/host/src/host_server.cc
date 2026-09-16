@@ -3,13 +3,19 @@
 
 #include <filesystem>
 #include <fstream>
+#include <map>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <vector>
 
+#include <drogon/DrClassMap.h>
 #include <drogon/HttpAppFramework.h>
 #include <drogon/HttpRequest.h>
 #include <drogon/HttpResponse.h>
+#include <drogon/WebSocketConnection.h>
+#include <drogon/WebSocketController.h>
+#include <drogon/utils/HttpConstraint.h>
 #include <nlohmann/json.hpp>
 #include <trantor/utils/Logger.h>
 
@@ -92,7 +98,79 @@ fs::path webDistDir(const std::string& webDist) {
 
 }  // namespace
 
-// ================================================================ 构造 / 析构
+}  // namespace ma —— 下面的控制器必须在全局命名空间
+
+// ================================================================ WS 控制器
+//
+// Drogon 1.9 的 WS 路由只接受"控制器类名"（内部按反射构造实例），没有 lambda 重载。
+// 于是这里放一个薄控制器，把三个回调转给一张**按路由名索引**的表。
+// 表里存的是 shared_ptr<WsCallbacks>：路由的生命周期比任何一次函数调用都长。
+namespace {
+
+std::mutex& wsRegistryMutex() {
+    static std::mutex m;
+    return m;
+}
+
+std::map<std::string, std::shared_ptr<ma::WsCallbacks>>& wsRegistry() {
+    static std::map<std::string, std::shared_ptr<ma::WsCallbacks>> table;
+    return table;
+}
+
+std::shared_ptr<ma::WsCallbacks> lookupWsCallbacks(const std::string& name) {
+    std::lock_guard<std::mutex> lk(wsRegistryMutex());
+    const auto it = wsRegistry().find(name);
+    return it == wsRegistry().end() ? nullptr : it->second;
+}
+
+}  // namespace
+
+    // ---- 反射控制器必须在**全局命名空间**（Drogon 的 DrClassMap 按裸类名登记）
+    //
+    // AutoCreation=false → 由 registerController() 显式交出实例并调 initPathRouting()，
+    // 路径在 WS_PATH_ADD 里写死（app().run() 之前完成）。
+class MaWsRouteController : public drogon::WebSocketController<MaWsRouteController, true> {
+public:
+    // ★ AutoCreation **必须**是 true，路径登记只能发生在**静态期**：
+    //   Drogon 的 HttpControllersRouter::init()（在 app().run() 里跑）会先
+    //   `wsCtrlMap_.clear()`，之后再登记的路由会被清掉 —— 症状是"HTTP 路由好好的、
+    //   WS 路由却怎么也进不去"（握手成功但三个回调一个都不来，静默失败）。
+    //   WS_PATH_ADD 展开出的静态成员就是在 main 之前完成这件事的。
+    WS_PATH_LIST_BEGIN
+    WS_PATH_ADD("/ws", drogon::Get);
+    WS_PATH_LIST_END
+
+    void handleNewConnection(const drogon::HttpRequestPtr&,
+                             const drogon::WebSocketConnectionPtr& conn) override {
+        const auto cb = lookupWsCallbacks(className());
+        if (cb && cb->onAccepted) cb->onAccepted(conn);
+    }
+
+    void handleNewMessage(const drogon::WebSocketConnectionPtr& conn, std::string&& message,
+                          const drogon::WebSocketMessageType& type) override {
+        if (type != drogon::WebSocketMessageType::Text &&
+            type != drogon::WebSocketMessageType::Binary) {
+            return;  // ping / pong / close 帧由框架自己处理
+        }
+        const auto cb = lookupWsCallbacks(className());
+        if (cb && cb->onMessage) cb->onMessage(conn, std::move(message));
+    }
+
+    void handleConnectionClosed(const drogon::WebSocketConnectionPtr& conn) override {
+        const auto cb = lookupWsCallbacks(className());
+        if (cb && cb->onClosed) cb->onClosed(conn);
+    }
+};
+
+// 回到 ma：下面全是宿主自己的定义。
+namespace ma {
+
+// Drogon 的反射登记发生在 DrObject<T> 的静态成员**被实例化**时；
+// 取一次类名就把它实例化出来（否则 app().run() 会报 "controller class not found"）。
+const std::string& wsControllerTypeName() {
+    static const std::string name = MaWsRouteController::classTypeName();
+    return name;
+}
 
 HostServer::HostServer(const HostConfig& cfg, Registry& reg, Engines& engines)
     : cfg_(cfg), reg_(reg), engines_(engines) {}
@@ -106,6 +184,17 @@ void HostServer::refreshIndexHint() {
     const fs::path index = webDistDir(cfg_.webDist) / "index.html";
     indexHint_ = fs::exists(index) ? std::string() : index.string();
 }
+
+namespace {
+
+/// 把一份回调登记进表。**键必须是控制器类名**（控制器实例用 className() 取它），
+/// 不能是路由别名 —— 用别名会静默失败：握手照旧成功，三个回调一个都不来。
+void registerWsCallbacks(const std::string& controllerName, const WsCallbacks& callbacks) {
+    std::lock_guard<std::mutex> lk(wsRegistryMutex());
+    wsRegistry()[controllerName] = std::make_shared<WsCallbacks>(callbacks);
+}
+
+}  // namespace
 
 // ================================================================ 路由
 
@@ -121,12 +210,20 @@ void HostServer::registerRoutes() {
         },
         {drogon::Get});
 
-    // ---- /stats：各引擎是否就绪（就绪账本的原样导出）
+    // ---- /stats：各引擎是否就绪（就绪账本的原样导出）+ 真实链路读数
     app.registerHandler(
         "/stats",
         [this](const drogon::HttpRequestPtr&,
                std::function<void(const drogon::HttpResponsePtr&)>&& cb) {
-            cb(jsonResponse(reg_.statsJson(kVersion)));
+            nlohmann::json extra = nlohmann::json::object();
+            if (ws_.statsExtra) {
+                try {
+                    extra = ws_.statsExtra();
+                } catch (const std::exception& e) {
+                    LOG_WARN << "[host] /stats 附加段生成失败：" << e.what();
+                }
+            }
+            cb(jsonResponse(reg_.statsJson(kVersion, extra)));
         },
         {drogon::Get});
 
@@ -142,6 +239,23 @@ void HostServer::registerRoutes() {
             cb(jsonResponse(out.dump()));
         },
         {drogon::Get});
+
+    // ---- /ws-close（POST）：把当前 WS 连接按 peer 片段强断。
+    //      用途：验收与运维要**确定性地**制造一次断开（否则只能干等心跳判死，
+    //      而"客户端先走、扫描恰好发现"那种断开会污染心跳判死计数）。
+    //      走的是 hub 的那条路：ITransport::close() → shutdown + forceClose。
+    app.registerHandler(
+        "/ws-close",
+        [this](const drogon::HttpRequestPtr& req,
+               std::function<void(const drogon::HttpResponsePtr&)>&& cb) {
+            const std::string peer = req->getParameter("peer");
+            const std::size_t n = ws_.closeByPeer ? ws_.closeByPeer(peer) : 0;
+            nlohmann::ordered_json out;
+            out["requested"] = peer;
+            out["closed"] = n;
+            cb(jsonResponse(out.dump()));
+        },
+        {drogon::Post});
 
 #if MA_WITH_GEO
     // ---- 瓦片路由：归一请求 → geo-data 的 TileService → 写回
@@ -199,6 +313,20 @@ void HostServer::registerRoutes() {
 #endif
 
     refreshIndexHint();
+
+    // ---- WS /ws：握手 → 登记；入站 → 喂看门狗 + 交给 hub；断开 → 注销
+    //
+    // ★ 三条路径的**唯一**出口都是同一份回调集合，所以"登记了就必须注销"是结构上保证的，
+    //   不靠调用方记得。Drogon 的 WS 控制器按"类名"反射构造，因此路由名与回调集合
+    //   经一张进程内表对应起来（表在 app().run() 之前就填好了）。
+    if (ws_.onAccepted) {
+        // ★ 路径登记**不在这里**：它必须是**静态期**的事（见 MaWsRouteController 注释）。
+        //   这里也**绝不能**再调一次 registerWebSocketController —— 它会把 wsCtrlMap_ 里
+        //   那条已经绑定好控制器的条目**整个换掉**（新条目的 controller_ 要等主循环里排到
+        //   队列尾才填），症状同样是"握手成功、回调不来"。这一条是踩过的坑。
+        registerWsCallbacks(wsControllerTypeName(), ws_);
+        LOG_INFO << "[host] WS 路由: /ws（controller=" << wsControllerTypeName() << "）";
+    }
 
     // ---- "/"：产物存在 → 直接读 index.html 回；不存在 → 一张可读的提示页
     //

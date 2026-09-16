@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 namespace ma {
 
 /// 一个子系统的就绪条目。
@@ -31,7 +33,12 @@ public:
     std::string readyLine() const;
 
     /// `/stats` 的 JSON 主体。
-    std::string statsJson(const std::string& version) const;
+    ///
+    /// `extra` 是**可选的附加段**（仿真链路 / 接入 / 广播的读数）：宿主把它们的实时
+    /// 读数塞进来，就绪账本本身不认识它们（账本只管"这个引擎对象构造成功了吗"）。
+    /// 传空对象 = 只有 engines 段。
+    std::string statsJson(const std::string& version,
+                          const nlohmann::json& extra = nlohmann::json::object()) const;
 
     std::vector<EngineEntry> entries() const;
 

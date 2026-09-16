@@ -1,4 +1,4 @@
-﻿// mission-app · packages/host/include/ma/config.h
+// mission-app · packages/host/include/ma/config.h
 //
 // 宿主配置：只读 mission-app/config.json。
 // 这个文件里没有任何业务判断 —— 它只回答"监听哪个端口、数据放哪、瓦片模板是什么"。
@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace ma {
 
@@ -35,6 +36,38 @@ struct HostConfig {
     std::string selfcheckPolicies;
     std::string selfcheckCapabilities;
 
+    // ---- 接入点（ingest.points[]）：仿真那条 UDP 流落到这里
+    struct IngestPoint {
+        std::string id = "ingest-uav";
+        std::string group;       // 组播地址；空 = 收单播
+        int port = 45500;
+        std::string iface;
+        std::string parserId = "legacy.kind.v1";
+        std::string deviceType = "uav";
+        std::string topic;
+        bool enabled = true;
+    };
+    struct IngestSettings {
+        bool enabled = true;
+        int mergeWindowMs = 100;
+        std::vector<IngestPoint> points;
+    };
+    IngestSettings ingest;
+
+    /// 本地上路的**落点**：仿真把报文打到 ingest.points[0] 的地址端口。
+    std::string ingestHost = "127.0.0.1";
+
+    // ---- 事件 kind（**由装配层注入引擎**；引擎自己的中立占位是 sim.pos）
+    std::string simKind = "uav.pos";
+    /// 过线类型（线格式里的 `type`）
+    std::string simWireType = "uav";
+    /// 仿真起手倍速（1 | 8 | 60）
+    int simSpeed = 1;
+    /// 起手是否立刻跑节拍
+    bool simAutoStart = true;
+    /// 本地配置目录（相对路径锚定在配置文件旁边；空 = <dataDir>/scenario-1）
+    std::string scenarioDir;
+
     // ---- 前端产物目录（相对仓库根或绝对路径）
     std::string webDist = "apps/web/dist";
 
@@ -44,6 +77,11 @@ struct HostConfig {
 
     /// 把配置里的相对路径锚定到配置文件旁边。
     std::string resolvePath(const std::string& p) const;
+
+    /// 本地上路的落点端口（= ingest.points[0].port；没有接入点 → 0）。
+    int ingestPort() const { return ingest.points.empty() ? 0 : ingest.points.front().port; }
+    /// 本地配置目录的绝对路径（scenarioDir 为空 → <dataDir 绝对路径>/scenario-1）。
+    std::string resolveScenarioDir() const;
 
     /// 读配置。找不到文件 → false（调用方回落内置默认值）。
     /// 文件存在但 JSON 非法 / 端口越界 → false 且 error 给出可读原因。

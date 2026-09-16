@@ -1,232 +1,242 @@
 {
-  "schemaVersion": "1.0.0",
-  "note": "场景一 · 我方部署。坐标落在北京西南山区（门头沟/房山），与本地瓦片覆盖一致。",
-  "areas": [
-    {
-      "key": "friendly-assembly-a",
-      "name": "我方集结区 A",
-      "role": "assembly",
-      "polygon": [
-        [
-          116.595,
-          39.735
-        ],
-        [
-          116.625,
-          39.735
-        ],
-        [
-          116.625,
-          39.755
-        ],
-        [
-          116.595,
-          39.755
-        ]
-      ]
-    },
-    {
-      "key": "friendly-forward-node",
-      "name": "前沿指挥节点",
-      "role": "forward-node",
-      "position": [
-        116.61,
-        39.745
-      ]
-    }
-  ],
-  "groups": [
-    {
-      "key": "recon-1",
-      "name": "前出侦察集群",
-      "role": "recon"
-    },
-    {
-      "key": "recon-2",
-      "name": "侧翼侦察集群",
-      "role": "recon"
-    },
-    {
-      "key": "radar-1",
-      "name": "雷达探测集群",
-      "role": "radar"
-    },
-    {
-      "key": "relay-1",
-      "name": "通信中继集群",
-      "role": "relay"
-    },
-    {
-      "key": "ew-1",
-      "name": "电子压制集群",
-      "role": "ew"
-    },
-    {
-      "key": "reserve-1",
-      "name": "机动预备集群",
-      "role": "reserve"
-    }
-  ],
-  "aircraft": [
-    {
-      "deviceId": "uav-opt-001",
-      "typeKey": "optical",
-      "groupKey": "recon-1",
-      "homeArea": "friendly-assembly-a",
-      "station": [
-        116.6,
-        39.74
-      ],
-      "altM": 300,
-      "speedMps": 25,
-      "battery": 100,
-      "payload": [
-        "camera"
-      ]
-    },
-    {
-      "deviceId": "uav-opt-002",
-      "typeKey": "optical",
-      "groupKey": "recon-1",
-      "homeArea": "friendly-assembly-a",
-      "station": [
-        116.602,
-        39.742
-      ],
-      "altM": 300,
-      "speedMps": 25,
-      "battery": 100,
-      "payload": [
-        "camera"
-      ]
-    },
-    {
-      "deviceId": "uav-opt-003",
-      "typeKey": "optical",
-      "groupKey": "recon-2",
-      "homeArea": "friendly-assembly-a",
-      "station": [
-        116.616,
-        39.738
-      ],
-      "altM": 320,
-      "speedMps": 24,
-      "battery": 100,
-      "payload": [
-        "camera"
-      ]
-    },
-    {
-      "deviceId": "uav-opt-004",
-      "typeKey": "optical",
-      "groupKey": "recon-2",
-      "homeArea": "friendly-assembly-a",
-      "station": [
-        116.618,
-        39.74
-      ],
-      "altM": 320,
-      "speedMps": 24,
-      "battery": 100,
-      "payload": [
-        "camera"
-      ]
-    },
-    {
-      "deviceId": "uav-rad-001",
-      "typeKey": "radar",
-      "groupKey": "radar-1",
-      "homeArea": "friendly-assembly-a",
-      "station": [
-        116.606,
-        39.744
-      ],
-      "altM": 400,
-      "speedMps": 22,
-      "battery": 100,
-      "payload": [
-        "sar"
-      ]
-    },
-    {
-      "deviceId": "uav-rad-002",
-      "typeKey": "radar",
-      "groupKey": "radar-1",
-      "homeArea": "friendly-assembly-a",
-      "station": [
-        116.608,
-        39.746
-      ],
-      "altM": 400,
-      "speedMps": 22,
-      "battery": 100,
-      "payload": [
-        "sar"
-      ]
-    },
-    {
-      "deviceId": "uav-com-001",
-      "typeKey": "comm",
-      "groupKey": "relay-1",
-      "homeArea": "friendly-assembly-a",
-      "station": [
-        116.612,
-        39.748
-      ],
-      "altM": 500,
-      "speedMps": 20,
-      "battery": 100,
-      "payload": [
-        "relay"
-      ]
-    },
-    {
-      "deviceId": "uav-ew-001",
-      "typeKey": "electronic",
-      "groupKey": "ew-1",
-      "homeArea": "friendly-assembly-a",
-      "station": [
-        116.604,
-        39.736
-      ],
-      "altM": 350,
-      "speedMps": 23,
-      "battery": 100,
-      "payload": [
-        "jammer"
-      ]
-    },
-    {
-      "deviceId": "uav-ew-002",
-      "typeKey": "electronic",
-      "groupKey": "ew-1",
-      "homeArea": "friendly-assembly-a",
-      "station": [
-        116.607,
-        39.738
-      ],
-      "altM": 350,
-      "speedMps": 23,
-      "battery": 100,
-      "payload": [
-        "jammer"
-      ]
-    },
-    {
-      "deviceId": "uav-opt-005",
-      "typeKey": "optical",
-      "groupKey": "reserve-1",
-      "homeArea": "friendly-assembly-a",
-      "station": [
-        116.62,
-        39.732
-      ],
-      "altM": 300,
-      "speedMps": 26,
-      "battery": 100,
-      "payload": [
-        "camera"
-      ]
-    }
-  ]
+    "schemaVersion":  "1.0.0",
+    "note":  "场景一 · 我方部署。坐标落在北京西南山区（门头沟/房山），与本地瓦片覆盖一致。taskArea 指定各平台的任务区（见 task-areas.json）。",
+    "areas":  [
+                  {
+                      "key":  "friendly-assembly-a",
+                      "name":  "我方集结区 A",
+                      "role":  "assembly",
+                      "polygon":  [
+                                      [
+                                          116.595,
+                                          39.735
+                                      ],
+                                      [
+                                          116.625,
+                                          39.735
+                                      ],
+                                      [
+                                          116.625,
+                                          39.755
+                                      ],
+                                      [
+                                          116.595,
+                                          39.755
+                                      ]
+                                  ]
+                  },
+                  {
+                      "key":  "friendly-forward-node",
+                      "name":  "前沿指挥节点",
+                      "role":  "forward-node",
+                      "position":  [
+                                       116.61,
+                                       39.745
+                                   ]
+                  }
+              ],
+    "groups":  [
+                   {
+                       "key":  "recon-1",
+                       "name":  "前出侦察集群",
+                       "role":  "recon"
+                   },
+                   {
+                       "key":  "recon-2",
+                       "name":  "侧翼侦察集群",
+                       "role":  "recon"
+                   },
+                   {
+                       "key":  "radar-1",
+                       "name":  "雷达探测集群",
+                       "role":  "radar"
+                   },
+                   {
+                       "key":  "relay-1",
+                       "name":  "通信中继集群",
+                       "role":  "relay"
+                   },
+                   {
+                       "key":  "ew-1",
+                       "name":  "电子压制集群",
+                       "role":  "ew"
+                   },
+                   {
+                       "key":  "reserve-1",
+                       "name":  "机动预备集群",
+                       "role":  "reserve"
+                   }
+               ],
+    "aircraft":  [
+                     {
+                         "deviceId":  "uav-opt-001",
+                         "typeKey":  "optical",
+                         "groupKey":  "recon-1",
+                         "homeArea":  "friendly-assembly-a",
+                         "station":  [
+                                         116.6,
+                                         39.74
+                                     ],
+                         "altM":  300,
+                         "speedMps":  25,
+                         "battery":  100,
+                         "payload":  [
+                                         "camera"
+                                     ],
+                         "taskArea":  "area-c"
+                     },
+                     {
+                         "deviceId":  "uav-opt-002",
+                         "typeKey":  "optical",
+                         "groupKey":  "recon-1",
+                         "homeArea":  "friendly-assembly-a",
+                         "station":  [
+                                         116.602,
+                                         39.742
+                                     ],
+                         "altM":  300,
+                         "speedMps":  25,
+                         "battery":  100,
+                         "payload":  [
+                                         "camera"
+                                     ],
+                         "taskArea":  "area-c"
+                     },
+                     {
+                         "deviceId":  "uav-opt-003",
+                         "typeKey":  "optical",
+                         "groupKey":  "recon-2",
+                         "homeArea":  "friendly-assembly-a",
+                         "station":  [
+                                         116.616,
+                                         39.738
+                                     ],
+                         "altM":  320,
+                         "speedMps":  24,
+                         "battery":  100,
+                         "payload":  [
+                                         "camera"
+                                     ],
+                         "taskArea":  "area-c"
+                     },
+                     {
+                         "deviceId":  "uav-opt-004",
+                         "typeKey":  "optical",
+                         "groupKey":  "recon-2",
+                         "homeArea":  "friendly-assembly-a",
+                         "station":  [
+                                         116.618,
+                                         39.74
+                                     ],
+                         "altM":  320,
+                         "speedMps":  24,
+                         "battery":  100,
+                         "payload":  [
+                                         "camera"
+                                     ],
+                         "taskArea":  "area-c"
+                     },
+                     {
+                         "deviceId":  "uav-rad-001",
+                         "typeKey":  "radar",
+                         "groupKey":  "radar-1",
+                         "homeArea":  "friendly-assembly-a",
+                         "station":  [
+                                         116.606,
+                                         39.744
+                                     ],
+                         "altM":  400,
+                         "speedMps":  22,
+                         "battery":  100,
+                         "payload":  [
+                                         "sar"
+                                     ],
+                         "taskArea":  "area-b"
+                     },
+                     {
+                         "deviceId":  "uav-rad-002",
+                         "typeKey":  "radar",
+                         "groupKey":  "radar-1",
+                         "homeArea":  "friendly-assembly-a",
+                         "station":  [
+                                         116.608,
+                                         39.746
+                                     ],
+                         "altM":  400,
+                         "speedMps":  22,
+                         "battery":  100,
+                         "payload":  [
+                                         "sar"
+                                     ],
+                         "taskArea":  "area-b"
+                     },
+                     {
+                         "deviceId":  "uav-com-001",
+                         "typeKey":  "comm",
+                         "groupKey":  "relay-1",
+                         "homeArea":  "friendly-assembly-a",
+                         "station":  [
+                                         116.612,
+                                         39.748
+                                     ],
+                         "altM":  500,
+                         "speedMps":  20,
+                         "battery":  100,
+                         "payload":  [
+                                         "relay"
+                                     ],
+                         "taskArea":  "area-b"
+                     },
+                     {
+                         "deviceId":  "uav-ew-001",
+                         "typeKey":  "electronic",
+                         "groupKey":  "ew-1",
+                         "homeArea":  "friendly-assembly-a",
+                         "station":  [
+                                         116.604,
+                                         39.736
+                                     ],
+                         "altM":  350,
+                         "speedMps":  23,
+                         "battery":  100,
+                         "payload":  [
+                                         "jammer"
+                                     ],
+                         "taskArea":  "area-a"
+                     },
+                     {
+                         "deviceId":  "uav-ew-002",
+                         "typeKey":  "electronic",
+                         "groupKey":  "ew-1",
+                         "homeArea":  "friendly-assembly-a",
+                         "station":  [
+                                         116.607,
+                                         39.738
+                                     ],
+                         "altM":  350,
+                         "speedMps":  23,
+                         "battery":  100,
+                         "payload":  [
+                                         "jammer"
+                                     ],
+                         "taskArea":  "area-a"
+                     },
+                     {
+                         "deviceId":  "uav-opt-005",
+                         "typeKey":  "optical",
+                         "groupKey":  "reserve-1",
+                         "homeArea":  "friendly-assembly-a",
+                         "station":  [
+                                         116.62,
+                                         39.732
+                                     ],
+                         "altM":  300,
+                         "speedMps":  26,
+                         "battery":  100,
+                         "payload":  [
+                                         "camera"
+                                     ],
+                         "taskArea":  "area-c"
+                     }
+                 ]
 }

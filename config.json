@@ -8,9 +8,34 @@
   "dataDir": "data",
 
   "modules": {
-    "hub": false,
+    "hub": true,
     "tiles": true
   },
+
+  "ingest": {
+    "enabled": true,
+    "mergeWindowMs": 100,
+    "points": [
+      {
+        "id": "ingest-uav",
+        "group": "",
+        "port": 45500,
+        "iface": "",
+        "parserId": "legacy.kind.v1",
+        "deviceType": "uav",
+        "topic": "telemetry.uav.pos",
+        "enabled": true
+      }
+    ]
+  },
+
+  "ingestHost": "127.0.0.1",
+
+  "simKind": "uav.pos",
+  "simWireType": "uav",
+  "simSpeed": 1,
+  "simAutoStart": true,
+  "scenarioDir": "data/scenario-1",
 
   "tiles": {
     "template": "/tiles/{z}/{x}/{y}.jpg",

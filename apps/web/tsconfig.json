@@ -18,7 +18,8 @@
     "paths": {
       "@/*": ["./src/*"],
       "map-2d": ["../../../map-2d/src/index.ts"],
-      "media-player": ["../../../media-player/src/index.ts"]
+      "media-player": ["../../../media-player/src/index.ts"],
+      "ws-client": ["../../../realtime-hub/client/dist/index.d.ts"]
     }
   },
   "include": ["src", "vite.config.ts"]

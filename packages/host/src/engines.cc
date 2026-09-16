@@ -3,6 +3,7 @@
 // 装配 + 依赖注入 + 生命周期。**没有业务逻辑**。
 #include "ma/engines.h"
 
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -10,6 +11,9 @@
 
 #if MA_WITH_HUB
 #include "realtime_hub/hub.h"
+#endif
+#if MA_WITH_SIM_SOURCE && MA_WITH_INGEST
+#include <exception>
 #endif
 #if MA_WITH_PROBES_MAPAPP
 // 探针包是规则侧产物 probes_mapapp 的公开头（它的 PUBLIC include 目录是 selfcheck/probes）。#include "mapapp/probe_pack.h"
@@ -168,9 +172,11 @@ Engines::Engines() {
     }
 #endif
 
-    // ---------------------------------------------------------------- device-ingest（已链接，未实例化）
+    // ---------------------------------------------------------------- device-ingest
+    // 只**构造**门面（不开线程、不绑端口）；真正 start() 由 main 在做完 WS 装配后调。
 #if MA_WITH_INGEST
-    gatewayNote = "linked-only（需要接入点配置与真实 endpoints，接入是后续分期的事）";
+    gateway = std::make_unique<device_ingest::Gateway>();
+    gatewayNote = "已构造（start() 由 main 在 WS 装配完成后调）";
 #endif
 
 #if MA_WITH_HUB
@@ -187,6 +193,155 @@ telemetry_store::Status Engines::storeStatus() const {
     return store->status();
 }
 #endif
+
+#if MA_WITH_SIM_SOURCE && MA_WITH_INGEST
+
+bool Engines::loadSimulation(const std::string& dir, const std::string& kindName,
+                             const std::string& wireType, const std::string& host, int port,
+                             std::string& error) {
+    scenarioDir = dir;
+    ingestEndpoint = host + ":" + std::to_string(port);
+
+    // 1) 本地配置 → 中立结构（校验失败时 error 里是逐条可读原因）
+    ma::scenario::LoadReport loadReport;
+    sim_source::SimScenario neutralScenario;
+    if (!ma::scenario::loadScenario(dir, scenarioData, neutralScenario, loadReport)) {
+        error = "本地配置装载失败（" + dir + "）：\n  " + loadReport.toText();
+        simNote = "配置装载失败";
+        return false;
+    }
+
+    // 2) 装配：引擎 + 出口 + 时钟（不外发时段用 dryRun）
+    ma::sim_bridge::BridgeOptions opts;
+    // ★ 默认事件 kind **由装配层显式注入**（引擎自己的中立占位是 sim.pos，这里必须覆盖）。
+    opts.sim.defaultKind = kindName;
+    opts.sim.useClockWhenTickArgMissing = false;  // 时间只由 tick(nowMs) 推进
+    opts.wireType = wireType;
+    opts.sink.host = host;
+    opts.sink.port = port;
+    opts.sink.dryRun = (port <= 0);
+
+    ma::sim_bridge::BridgeReport bridgeReport;
+    if (!ma::sim_bridge::build(neutralScenario, scenarioData, opts, bridge, bridgeReport)) {
+        error = "仿真源装配失败：" + bridgeReport.toText();
+        simNote = "装配失败";
+        return false;
+    }
+
+    char buf[256];
+    std::snprintf(buf, sizeof(buf), "平台 %d / 实体 %d / 区域 %d / 归属 %d 组；kind=%s",
+                  static_cast<int>(neutralScenario.platforms.size()),
+                  static_cast<int>(neutralScenario.platforms.size() +
+                                   neutralScenario.targets.size()),
+                  static_cast<int>(neutralScenario.areas.size()),
+                  static_cast<int>(scenarioData.groupIds().size()), kindName.c_str());
+    simNote = buf;
+    return true;
+}
+
+nlohmann::json Engines::simStatsJson() const {
+    nlohmann::ordered_json out;
+    out["configDir"] = scenarioDir;
+    out["wireType"] = scenarioData.wireType;
+    out["groupIdMap"] = nlohmann::ordered_json::object();
+    for (const auto& kv : scenarioData.groupIds()) out["groupIdMap"][kv.first] = kv.second;
+    out["counts"] = nlohmann::ordered_json{
+        {"platforms", scenarioData.aircraft.size()},
+        {"groups", scenarioData.groupIds().size()},
+        {"targets", scenarioData.targets.size()},
+        {"deployAreas", scenarioData.deployAreas.size()},
+        {"taskAreas", scenarioData.taskAreas.size()},
+        {"hardNoFlyZones", scenarioData.hardNoFlyZones.size()},
+    };
+    if (bridge.engine) {
+        const sim_source::Metrics m = bridge.engine->metrics();
+        const sim_source::Capabilities cap = bridge.engine->capabilities();
+        out["running"] = bridge.driver != nullptr && bridge.driver->running();
+        out["paused"] = bridge.driver != nullptr && bridge.driver->paused();
+        out["speedMultiplier"] = cap.speedMultiplier;
+        out["simElapsedMs"] = m.simElapsedMs;
+        out["ticks"] = m.ticks;
+        out["steps"] = m.steps;
+        out["eventsEmitted"] = m.eventsEmitted;
+        out["pausedMs"] = m.pausedMs;
+        out["plan"] = nlohmann::ordered_json{
+            {"ok", bridge.plan.ok},
+            {"platforms", bridge.plan.platformIds.size()},
+            {"hardZones", bridge.plan.hardZones},
+            {"softZones", bridge.plan.softZones},
+            {"detoured", bridge.plan.detoured},
+        };
+    } else {
+        out["running"] = false;
+    }
+    if (bridge.sink) {
+        const ma::sim_bridge::UdpWireSinkStats s = bridge.sink->stats();
+        out["wire"] = nlohmann::ordered_json{
+            {"target", ingestEndpoint},
+            {"events", s.events},
+            {"frames", s.frames},
+            {"sent", s.sent},
+            {"errors", s.errors},
+            {"oversize", s.oversize},
+            {"sentBytes", s.sentBytes},
+        };
+    }
+    out["note"] = simNote;
+    return out;
+}
+
+nlohmann::json Engines::ingestStatsJson() const {
+    nlohmann::ordered_json out;
+#if MA_WITH_INGEST
+    if (!gateway) {
+        out["running"] = false;
+        return out;
+    }
+    const device_ingest::GatewayStatus st = gateway->status();
+    const device_ingest::GatewayHealth gh = gateway->gatewayHealth();
+    std::uint64_t pointsRunning = 0;
+    std::uint64_t packets = 0;
+    std::uint64_t pointEvents = 0;
+    nlohmann::ordered_json points = nlohmann::ordered_json::array();
+    for (const auto& m : gateway->allPointMetrics()) {
+        if (m.running) ++pointsRunning;
+        packets += m.packets;
+        pointEvents += m.events;
+        points.push_back(nlohmann::ordered_json{
+            {"id", m.id},
+            {"running", m.running},
+            {"port", 0},
+            {"packets", m.packets},
+            {"bytes", m.bytes},
+            {"events", m.events},
+            {"parseFailed", m.parseFailed},
+            {"dropped", m.dropped},
+            {"lastPeer", m.lastPeer},
+            {"lastRecvAt", m.lastRecvAt},
+            {"lastError", m.lastError},
+        });
+    }
+    out["running"] = st.running;
+    out["points"] = st.points;
+    out["pointsRunning"] = pointsRunning;
+    out["packets"] = packets;
+    out["events"] = st.events;
+    out["pointEvents"] = pointEvents;
+    out["devices"] = st.devices;
+    out["online"] = st.online;
+    out["dropped"] = st.dropped;
+    out["parseFailed"] = st.parseFailed;
+    out["queueDepth"] = gh.queueDepth;
+    out["queueDropped"] = gh.queueDropped;
+    out["packetsPerSec"] = gh.packetsPerSec;
+    out["hubEnabled"] = st.hubEnabled;
+    out["pointDetail"] = std::move(points);
+    out["note"] = gatewayNote;
+#endif
+    return out;
+}
+
+#endif  // MA_WITH_SIM_SOURCE && MA_WITH_INGEST
 
 void Engines::report(Registry& reg) const {
     reg.set("phase", MA_WITH_PHASE != 0 && phase != nullptr, phase != nullptr,
@@ -209,7 +364,17 @@ void Engines::report(Registry& reg) const {
             selfCheckEngine ? "options: clock+sink 注入" : "模块未装配");
 
     // ---- 已链接但未实例化（装配骨架分期如实上报）
-    reg.set("ingest", MA_WITH_INGEST != 0, false, gatewayNote.empty() ? "模块未装配" : gatewayNote);
+    {
+        std::string note = gatewayNote;
+#if MA_WITH_INGEST
+        if (gateway) {
+            const device_ingest::GatewayStatus st = gateway->status();
+            note = std::string("points=") + std::to_string(st.points) + " running=" +
+                   (st.running ? "1" : "0") + "；" + gatewayNote;
+        }
+#endif
+        reg.set("ingest", MA_WITH_INGEST != 0, false, note.empty() ? "模块未装配" : note);
+    }
     reg.set("store", MA_WITH_STORE != 0 && store != nullptr, store != nullptr,
             store ? std::string("backend=") + store->backendName() +
                         "；退出时 flush()"
@@ -221,7 +386,7 @@ void Engines::report(Registry& reg) const {
         reg.set("hub", true, true,
                 std::string("singleton + version()=") + realtime_hub::RealtimeHub::version() +
                     " clients=" + std::to_string(clients) +
-                    "；广播腿留待 P1（需要 ITransport 适配器）");
+                    "；ITransport=DrogonTransport（/ws）");
     }
 #else
     reg.set("hub", false, false, "模块未装配");
@@ -229,11 +394,23 @@ void Engines::report(Registry& reg) const {
     reg.set("tiles", MA_WITH_GEO != 0 && tileService != nullptr, tileService != nullptr,
             tileService ? tileNote : "模块未装配");
 
-    // ---- sim-source / sensor-model：条件包含，落地前不存在
+    // ---- 仿真链路：装配成功才算实例化
+#if MA_WITH_SIM_SOURCE && MA_WITH_INGEST
+    reg.set("simSource", true, bridge.engine != nullptr,
+            bridge.engine ? (simNote + "；出口 " + ingestEndpoint) : "装配失败（见启动日志）");
+    {
+        std::string note = "未装配";
+#if MA_WITH_SENSOR_MODEL
+        note = "已装配（本份配置未挂接探测模型）";
+#endif
+        reg.set("sensorModel", MA_WITH_SENSOR_MODEL != 0, false, note);
+    }
+#else
     reg.set("simSource", MA_WITH_SIM_SOURCE != 0, false,
-            MA_WITH_SIM_SOURCE != 0 ? "已装配" : "模块尚未落地（CMake if(EXISTS) 跳过）");
+            MA_WITH_SIM_SOURCE != 0 ? "已装配（未接通接入层）" : "模块尚未落地（CMake if(EXISTS) 跳过）");
     reg.set("sensorModel", MA_WITH_SENSOR_MODEL != 0, false,
             MA_WITH_SENSOR_MODEL != 0 ? "已装配" : "模块尚未落地（CMake if(EXISTS) 跳过）");
+#endif
 }
 
 void Engines::flush() {
@@ -244,6 +421,22 @@ void Engines::flush() {
 
 void Engines::stop() {
     // 装配的逆序。模块对象析构即停（各模块自己的线程在析构里收）。
+    //
+    // ★ P1 新增的两条（必须先于一切析构，因为它们是**生产者**）：
+    //   1) 节拍驱动：先停它 —— 否则引擎析构后驱动线程还会去 tick()。
+    //   2) 接入层：再停它 —— 排空队列（最后一批事件仍会走 ISink → 广播）。
+#if MA_WITH_SIM_SOURCE && MA_WITH_INGEST
+    if (bridge.driver) bridge.driver->stop();
+    bridge.driver.reset();
+    bridge.sink.reset();   // 出口在引擎之前放掉（引擎还持有 shared_ptr，不会悬空）
+    bridge.engine.reset();
+#endif
+#if MA_WITH_INGEST
+    if (gateway) {
+        gateway->stop();
+        gatewayRunning = false;
+    }
+#endif
 #if MA_WITH_SELFCHECK
     selfCheckEngine.reset();
 #endif
