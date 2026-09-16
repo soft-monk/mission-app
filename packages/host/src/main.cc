@@ -26,6 +26,7 @@
 #include "ma/flow.h"
 #include "ma/host_server.h"
 #include "ma/hub_engine.h"
+#include "ma/policies_loader.h"
 #include "ma/registry.h"
 
 #if MA_WITH_INGEST
@@ -393,6 +394,10 @@ int main(int argc, char** argv) {
     ma::Engines engines;
     ma::Registry registry;
 
+    // ---- 规则包：逐引擎调它**自己的**入口（未装载 → 凡"需规则"的入口一律 1005）
+    const ma::PolicyLoadReport policies = ma::loadEnginePolicies(engines, MA_WEBMAP_ROOT);
+    std::cout << "[host] 规则包：" << policies.summary() << "\n";
+
     // ---------------------------------------------------------------- 真实链路
     //
     // 数据流向就是这段代码的顺序：本地配置 → 中立结构 → 引擎 → 一行报文 → 接入层 → 广播。
@@ -457,6 +462,11 @@ int main(int argc, char** argv) {
     flow.setBroadcaster([&hubEngine](const std::string& type, const nlohmann::json& data) {
         hubEngine.hub().broadcast(type, data);
     });
+    // ---- 引擎出口 → WS：**所有** 7 个 Sink 都走这一个接线点（事件名见 adapters.cc）
+    ma::EventBroadcaster::instance().set(
+        [&hubEngine](const std::string& type, const nlohmann::json& data) {
+            hubEngine.hub().broadcast(type, data);
+        });
     flow.setClientCounter([&hubEngine]() { return static_cast<int>(hubEngine.hub().clientCount()); });
     flow.setCapabilityProbe([&cfg, &engines, &registry, &hubEngine]() {
         return capabilitySnapshot(cfg, engines, registry, hubEngine);
@@ -482,9 +492,10 @@ int main(int argc, char** argv) {
         [&hubEngine](const std::string& peer) -> std::size_t {
             return hubEngine.transport() ? hubEngine.transport()->forceCloseByPeer(peer) : 0;
         },
-        [&engines, &hubEngine]() {
+        [&engines, &hubEngine, &policies]() {
             nlohmann::json extra = nlohmann::json::object();
             extra["realtime"] = hubEngine.statsJson();
+            extra["policies"] = policies.toJson();
 #if MA_WITH_SIM_SOURCE && MA_WITH_INGEST
             extra["simulation"] = engines.simStatsJson();
 #endif

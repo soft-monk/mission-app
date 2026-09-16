@@ -309,6 +309,7 @@ add_executable(mission_host
   packages/host/src/adapters.cc
   packages/host/src/engines.cc
   packages/host/src/flow.cc
+  packages/host/src/policies_loader.cc
   packages/host/src/host_server.cc
   packages/host/src/drogon_transport.cc
   packages/host/src/hub_engine.cc)

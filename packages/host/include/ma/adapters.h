@@ -33,6 +33,30 @@
 
 namespace ma {
 
+/// 引擎出口 → WS 广播 的**唯一接线点**。
+///
+/// 为什么做成单例：各 Sink 由 `Engines` 在构造期就 new 出来（早于 hub 装配），
+/// 又必须"一挂上就能用"，所以把出口做成一个进程内单例：装配期 `set()` 一次，
+/// 之后任何 Sink 回调都能发事件。未接线时**静默**（不抛、不缓存）——与模块口径一致：
+/// 宿主没接广播腿不该让引擎报错。
+///
+/// ★ 纪律：这里只搬运（type + data），MUST NOT 筛事件、MUST NOT 改字段。
+///   事件名由宿主定义，必须满足 `realtime_hub::isValidEventType`（全小写 + 点号分层）。
+class EventBroadcaster {
+public:
+    using Fn = std::function<void(const std::string& type, const nlohmann::json& data)>;
+
+    static EventBroadcaster& instance();
+
+    void set(Fn fn);
+    bool wired() const;
+    void emit(const std::string& type, const nlohmann::json& data) const;
+
+private:
+    mutable std::mutex mtx_;
+    Fn fn_;
+};
+
 /// 注入路径的**证据**：每次进 Sink 就 +1（内容一概不看、不存、不转发）。
 class InvocationMeter {
 public:

@@ -28,30 +28,108 @@ std::string InjectionEvidence::summary() const {
 std::int64_t GeoClock::nowMs() const { return wallClockMs(); }
 std::int64_t StoreClock::nowMs() const { return wallClockMs(); }
 
-// ================================================================ Sink（全部空转）
+// ================================================================ 事件出口接线
 
-void PhaseSink::onPhaseChanged(const phase::PhaseChangeEvent&) { m_->bump(); }
-void PhaseSink::onProgress(const phase::ProgressEvent&) { m_->bump(); }
-void PhaseSink::onStatusChanged(const phase::MissionStatusEvent&) { m_->bump(); }
+EventBroadcaster& EventBroadcaster::instance() {
+    static EventBroadcaster b;
+    return b;
+}
 
-void ResourceSink::onAllocationChanged(const resource_alloc::AllocationChangeEvent&) { m_->bump(); }
-void ResourceSink::onTelemetryMerged(const resource_alloc::TelemetryMergedEvent&) { m_->bump(); }
+void EventBroadcaster::set(Fn fn) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    fn_ = std::move(fn);
+}
 
-void PlanSink::onPlanStateChanged(const scoring::json&) { m_->bump(); }
+bool EventBroadcaster::wired() const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    return static_cast<bool>(fn_);
+}
 
-void EntitySink::onEntityChanged(const entity_ledger::EntityChangeEvent&) { m_->bump(); }
-void EntitySink::onTargetState(const entity_ledger::TargetStateEvent&) { m_->bump(); }
-void EntitySink::onConsistency(const entity_ledger::ConsistencyEvent&) { m_->bump(); }
+void EventBroadcaster::emit(const std::string& type, const nlohmann::json& data) const {
+    Fn fn;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        fn = fn_;
+    }
+    if (!fn) return;  // 未接线 = 静默（装配顺序允许"先造引擎、后接广播腿"）
+    try {
+        fn(type, data);
+    } catch (const std::exception&) {
+        // 广播失败 MUST NOT 反向影响引擎（模块口径：Sink 里不抛）
+    }
+}
 
-void TopologySink::onTopologyChanged(const topology::TopologyChangedEvent&) { m_->bump(); }
+// ================================================================ Sink
+//
+// 每个回调做两件事：① 记一次"被调用过"（注入证据）；② 把**引擎给的负载原样**转成一条广播。
+// 事件名与 protocol.md §4 已登记名一致；payload 用模块自己的 `toJson()`，宿主不改字段。
+
+void PhaseSink::onPhaseChanged(const phase::PhaseChangeEvent& e) {
+    m_->bump();
+    EventBroadcaster::instance().emit("mission.phase", e.toJson());
+}
+void PhaseSink::onProgress(const phase::ProgressEvent& e) {
+    m_->bump();
+    EventBroadcaster::instance().emit("mission.progress", e.toJson());
+}
+void PhaseSink::onStatusChanged(const phase::MissionStatusEvent& e) {
+    m_->bump();
+    EventBroadcaster::instance().emit("mission.status", e.toJson());
+}
+
+void ResourceSink::onAllocationChanged(const resource_alloc::AllocationChangeEvent& e) {
+    m_->bump();
+    EventBroadcaster::instance().emit("resource.allocation.changed", e.toJson());
+}
+void ResourceSink::onTelemetryMerged(const resource_alloc::TelemetryMergedEvent& e) {
+    m_->bump();
+    EventBroadcaster::instance().emit("resource.ledger.changed", e.toJson());
+}
+
+void PlanSink::onPlanStateChanged(const scoring::json& event) {
+    m_->bump();
+    EventBroadcaster::instance().emit("plan.state", event);
+}
+
+void EntitySink::onEntityChanged(const entity_ledger::EntityChangeEvent& e) {
+    m_->bump();
+    EventBroadcaster::instance().emit("entity.changed", e.toJson());
+}
+void EntitySink::onTargetState(const entity_ledger::TargetStateEvent& e) {
+    m_->bump();
+    EventBroadcaster::instance().emit("target.state", e.toJson());
+}
+void EntitySink::onConsistency(const entity_ledger::ConsistencyEvent& e) {
+    m_->bump();
+    EventBroadcaster::instance().emit("entity.consistency", e.toJson());
+}
+
+void TopologySink::onTopologyChanged(const topology::TopologyChangedEvent& e) {
+    m_->bump();
+    EventBroadcaster::instance().emit("topology.changed", e.toJson());
+}
 void TopologySink::onStateChanged(const topology::StateChange&) { m_->bump(); }
 
-void AlertSink::onAlertRaised(const alert_engine::AlertDelivery&) { m_->bump(); }
-void AlertSink::onAlertUpdated(const alert_engine::AlertDelivery&) { m_->bump(); }
-void AlertSink::onAlertAcked(const alert_engine::AlertDelivery&) { m_->bump(); }
+void AlertSink::onAlertRaised(const alert_engine::AlertDelivery& d) {
+    m_->bump();
+    EventBroadcaster::instance().emit("alert.raised", alert_engine::toJson(d));
+}
+void AlertSink::onAlertUpdated(const alert_engine::AlertDelivery& d) {
+    m_->bump();
+    EventBroadcaster::instance().emit("alert.updated", alert_engine::toJson(d));
+}
+void AlertSink::onAlertAcked(const alert_engine::AlertDelivery& d) {
+    m_->bump();
+    EventBroadcaster::instance().emit("alert.acked", alert_engine::toJson(d));
+}
 
-void ReportSink::onReportReady(const report_engine::ReportReadyPayload&) { m_->bump(); }
+void ReportSink::onReportReady(const report_engine::ReportReadyPayload& payload) {
+    m_->bump();
+    EventBroadcaster::instance().emit("report.ready", report_engine::toJson(payload));
+}
 
+// selfcheck 的三个出口由 flow.cc 的 FlowSelfCheckSink 负责广播（它同时要更新流程状态）；
+// 这里的实现保留给"没接流程层"的场景（例如 --selftest），只记调用。
 void SelfCheckSink::onProgress(const selfcheck::ProgressEvent&) { m_->bump(); }
 void SelfCheckSink::onReady(const selfcheck::ReadyEvent&) { m_->bump(); }
 void SelfCheckSink::onDone(const selfcheck::SelfCheckDoneEvent&) { m_->bump(); }
