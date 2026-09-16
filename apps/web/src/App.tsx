@@ -1,336 +1,173 @@
 // mission-app · apps/web/src/App.tsx
 //
-// 页面做四件事，别的都不做（没有阶段规则、没有评分、没有告警逻辑）：
-//   ① 底图与视角：瓦片模板从宿主 `/runtime-config` 拿，视角用场景数据里的 center/zoom
-//   ② 静态态势：把 deployment / task-areas / airspace 的区域多边形与标注画出来（AreaItem / LabelItem）
-//   ③ 实时态势：订阅 `telemetry.uav.pos`，按 uavId 增量维护无人机与航迹，再按节拍上屏
-//   ④ 如实显示链路状态（连接中 / 已连接 / 已断开，断开时提示"数据可能已过期"）
+// 前端总入口 = **流程路由**。它只做三件事：
+//   ① 维护与宿主的状态同步（`useFlow`：轮询 + WS 事件）
+//   ② 按 `state.step` 决定显示哪一屏（Excel 11 步；第 3 步起才有地图）
+//   ③ 把用户动作翻译成命令（启动加载 / 一键自检 / 重新检测 / 进入任务）
 //
-// ★ 纪律：不改 packages/（后端）、不改其它模块仓；map-2d 用别名原地引用。
+// ★ 纪律：本文件不写任何业务文案、不编任何百分比、不判断"通过与否"——
+//   所有取值都来自 `/api/state`（其源头是各引擎 + 规则包）。
 //
-// 上屏路径说明（为什么实时数据不放进 `MapData.uavs`）：
-//   `MapData.uavs` 走的是 map-2d 的 `LayerManager.setUavs()`——那条路是"整表替换"，
-//   每来一帧就重灌一次，且不吃本批新增的位图图标能力。
-//   本页要的是"按 uavId 增量更新"，所以实时无人机与航迹统一经 `MapDraw` 上屏，
-//   `MapData.uavs` 保持空数组（两者同时用会互相覆盖同一个数据源）。
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
-import { MapDraw, MapView, mapCommands, useMapUiStore, type MapData } from 'map-2d'
-import { DEFAULT_MAP_STYLE, groupColorOf, loadMapStyle, trackStyleOf } from './map-style'
-import { DEFAULT_SCENARIO, toAreaItems, toLabelItems } from './scenario'
-import { DEFAULT_WS_URL, TelemetryStore, connectTelemetry, type LinkState } from './telemetry'
+// 排障后门：`?stage=map` 直接进地图台（P1 的 live-check 用它，跳过启动/自检两屏）。
+import { useCallback, useMemo, useState, type CSSProperties } from 'react'
+import { useFlow } from './flow/useFlow'
+import { DEFAULT_WS_URL } from './telemetry'
+import { C, statusColor } from './theme'
+import { TopBar } from './screens/Chrome'
+import { BootScreen } from './screens/BootScreen'
+import { SelfCheckScreen } from './screens/SelfCheckScreen'
+import { MapStage } from './MapStage'
 
-/** 瓦片模板缺省值（与 config.json 的 tiles.template 一致；运行时以宿主 /runtime-config 为准） */
-const DEFAULT_TILE_TEMPLATE = '/tiles/{z}/{x}/{y}.jpg'
-
-/** 上屏节拍（ms）：WS 可能 10 Hz 到达，地图不需要跟着 10 Hz 重画 */
-const FLUSH_INTERVAL_MS = 120
-/** 超过这么久没有新数据就提示"数据可能已过期" */
-const STALE_AFTER_MS = 5000
-
-interface EngineRow { linked: boolean; instantiated: boolean; ok: boolean; note?: string }
-interface RuntimeConfig {
-  version: string
-  tiles: { template: string }
-  stats: { engines: Record<string, EngineRow> }
-}
-
-/** 从 URL 取参数（`?ws=` 覆盖通道地址，`?style=` 覆盖样式配置，见 map-style.ts） */
 function param(name: string): string | null {
   try { return new URLSearchParams(window.location.search).get(name) } catch { return null }
 }
 
-const barStyle: CSSProperties = {
-  position: 'absolute', top: 0, left: 0, right: 0, zIndex: 10,
-  display: 'flex', gap: 14, alignItems: 'center', flexWrap: 'wrap',
-  padding: '6px 12px',
-  background: 'rgba(4, 24, 47, 0.82)',
-  borderBottom: '1px solid rgba(95, 176, 255, 0.25)',
-  backdropFilter: 'blur(4px)',
-  pointerEvents: 'none',
-  fontVariantNumeric: 'tabular-nums',
-  fontSize: 12,
-}
-
-/** 连接状态指示灯（颜色 + 文案；断开时页面顶部还会多一条醒目提示） */
-function LinkBadge({ link }: { link: LinkState }) {
-  const color = link.state === 'open' ? '#22c55e' : link.state === 'connecting' ? '#f59e0b' : '#ef4444'
-  const text = link.state === 'open' ? '实时通道已连接' : link.state === 'connecting' ? '实时通道连接中…' : '实时通道已断开'
-  return (
-    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-      <span style={{ width: 8, height: 8, borderRadius: '50%', background: color, boxShadow: `0 0 6px ${color}` }} />
-      <span style={{ color }}>{text}</span>
-      {link.state === 'closed' && link.willReconnect && <span style={{ color: '#8fb0cc' }}>（自动重连中）</span>}
-      {link.reconnects > 0 && <span style={{ color: '#8fb0cc' }}>重连 {link.reconnects} 次</span>}
-    </span>
-  )
-}
-
-const warnStyle: CSSProperties = {
-  position: 'absolute', top: 40, left: '50%', transform: 'translateX(-50%)', zIndex: 12,
-  padding: '6px 14px', borderRadius: 6,
-  background: 'rgba(120, 30, 20, 0.9)', border: '1px solid #ef4444',
-  color: '#ffd9d4', fontSize: 12.5, pointerEvents: 'none', whiteSpace: 'nowrap',
-}
-
-const noteStyle: CSSProperties = {
-  position: 'absolute', left: 12, bottom: 12, zIndex: 10, maxWidth: '60vw',
-  padding: '6px 10px', borderRadius: 6,
-  background: 'rgba(4, 24, 47, 0.82)', border: '1px solid rgba(95, 176, 255, 0.25)',
-  pointerEvents: 'none', fontSize: 12, color: '#cfe3f5',
-}
-
-/**
- * 图内同步层：只在 `<MapView>` 的 children 里渲染（此时地图已就绪）。
- *
- * 两个 effect 各管一件事：
- *   · 静态态势：区域 + 标注，只在数据变化时重灌一次
- *   · 实时态势：订阅 flux 的节拍回调，按"脏 uavId"增量更新，整表最多 120 ms 重建一次
- */
-function SituationLayer({ store, styleCfg }: { store: TelemetryStore; styleCfg: typeof DEFAULT_MAP_STYLE }) {
-  const scene = DEFAULT_SCENARIO
-  const areas = useMemo(() => toAreaItems(scene), [scene])
-  const labels = useMemo(() => toLabelItems(scene), [scene])
-
-  // ---- 静态态势：区域多边形 + 标注 ----
-  useEffect(() => {
-    MapDraw.set('area', areas)
-    MapDraw.set('label', labels)
-  }, [areas, labels])
-
-  // ---- 实时态势：按节拍把累积结果上屏 ----
-  useEffect(() => {
-    const trk = trackStyleOf(styleCfg)
-    let stopped = false
-
-    const flush = () => {
-      if (stopped) return
-      const dirty = store.takeDirty()
-      if (dirty.length) {
-        // batch：本批内的多次增删改**只渲染一次**（map-2d M2-API-07）
-        MapDraw.batch(() => {
-          for (const uavId of dirty) {
-            const u = store.get(uavId)
-            if (!u) continue
-            MapDraw.add('drone', {
-              id: u.uavId,
-              lng: u.lng,
-              lat: u.lat,
-              type: u.type,
-              // 编队配色取自 map-style.json 的 groupColors[groupId]
-              color: groupColorOf(styleCfg, u.groupId),
-              label: u.uavId,
-            })
-          }
-        })
-      }
-      // 航迹：map-2d 的 track 是"整类替换"，所以这里整表提交一次；
-      // 但**点列本身是增量累积的**（store 里按 uavId 追加尾点），不是每帧重算历史。
-      MapDraw.set('track', store.tracks().map((t) => {
-        const u = store.get(t.uavId)
-        return {
-          id: `TRK:${t.uavId}`,
-          points: t.points,
-          color: groupColorOf(styleCfg, u?.groupId),
-          widthPx: trk.widthPx,
-          dashed: trk.dashed,
-          opacity: trk.opacity,
-        }
-      }))
-    }
-
-    flush()
-    const timer = window.setInterval(flush, FLUSH_INTERVAL_MS)
-    return () => { stopped = true; window.clearInterval(timer) }
-  }, [store, styleCfg])
-
-  return null
-}
-
 export function App() {
-  const [cfg, setCfg] = useState<RuntimeConfig | null>(null)
-  const [health, setHealth] = useState<string>('(未探测)')
-  const [note, setNote] = useState<string>('')
-  const [styleCfg, setStyleCfg] = useState(() => DEFAULT_MAP_STYLE)
-  const [styleSource, setStyleSource] = useState('内联默认值')
-  const [link, setLink] = useState<LinkState>({ state: 'connecting', reconnects: 0 })
-  const [uavCount, setUavCount] = useState(0)
-  const [lastSeenAgo, setLastSeenAgo] = useState<number | null>(null)
-
   const wsUrl = param('ws') ?? DEFAULT_WS_URL
+  const stageOverride = param('stage')
+  const { state, error, send, lastReply } = useFlow(wsUrl)
+  const [busy, setBusy] = useState(false)
 
-  // 累积器与通道：整个页面生命周期一份（用 ref 持有，避免每次渲染新建）
-  const storeRef = useRef<TelemetryStore | null>(null)
-  if (!storeRef.current) storeRef.current = new TelemetryStore({})
-  const store = storeRef.current
-
-  // ---- 样式配置：默认内联，`?style=` 可覆盖 ----
-  useEffect(() => {
-    let alive = true
-    void loadMapStyle().then((r) => {
-      if (!alive) return
-      setStyleCfg(r.style)
-      setStyleSource(r.source)
-      if (r.warning) setNote(r.warning)
-    })
-    return () => { alive = false }
-  }, [])
-
-  // ---- 装配信息（瓦片模板 + 各引擎是否就绪）----
-  useEffect(() => {
-    let alive = true
-    fetch('/runtime-config')
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(String(r.status)))))
-      .then((j: RuntimeConfig) => { if (alive) setCfg(j) })
-      .catch((e: unknown) => { if (alive) setNote(`/runtime-config 没读到（${String(e)}）`) })
-    return () => { alive = false }
-  }, [])
-
-  useEffect(() => {
-    let alive = true
-    fetch('/health')
-      .then((r) => (r.ok ? r.text() : Promise.reject(new Error(String(r.status)))))
-      .then((t) => { if (alive) setHealth(t) })
-      .catch((e: unknown) => { if (alive) setHealth(`不可达（${String(e)}）`) })
-    return () => { alive = false }
-  }, [])
-
-  // 瓦片拉不到时给一句提示（地图自己会回落纯色缺口底色）
-  useEffect(() => {
-    const onError = (ev: Event) => {
-      const el = ev.target as HTMLElement | null
-      const src = el && 'src' in el ? String((el as HTMLImageElement).src) : ''
-      if (!src.includes('/tiles/')) return
-      setNote('底图瓦片不可达 → 地图回落纯色兜底（P0 不托管瓦片包，这是预期内的）')
+  const run = useCallback(async (verb: string, params: Record<string, unknown> = {}) => {
+    setBusy(true)
+    try {
+      await send(verb, params)
+    } finally {
+      setBusy(false)
     }
-    window.addEventListener('error', onError, true)
-    return () => window.removeEventListener('error', onError, true)
-  }, [])
+  }, [send])
 
-  // ---- 实时通道：订阅 telemetry.uav.pos，连上就累积 ----
-  useEffect(() => {
-    const { dispose } = connectTelemetry(store, {
-      url: wsUrl,
-      // **不启用节流**（`throttleMs` 不传）。
-      //
-      // 原因：`ws-client` 的 throttle 语义是「**按事件类型**全局合并，窗口内只保留最新一条」
-      // （见其 dispatch.ts 的 ThrottleConfig 注释）。而 `telemetry.uav.pos` 是**10 架无人机
-      // 共用**的一个类型、约 100 事件/秒 —— 开 50 ms 窗口会把同一窗口内其它无人机的数据
-      // 直接丢掉，表现为"地图上只有一两架无人机"，且丢哪几架是随机的。
-      //
-      // 渲染侧本来就不需要它：累积器（TelemetryStore）按 uavId 增量记录，上屏由下面的
-      // `MapDraw.batch()` + 120 ms 节拍统一合并 —— 合并该发生在**渲染**这一层，不是接收层。
-      // 节流仍可用于"每类事件只有一份状态"的场景（如 link.quality 的全局面板）。
-      onLinkChange: (s) => {
-        setLink(s)
-        // 重连成功时如实报告缺口（不补发、不伪造——补发是留存层的事）
-        if (s.state === 'open' && s.gapMs && s.gapMs > 1000) {
-          setNote(`断线 ${(s.gapMs / 1000).toFixed(1)}s 后已重连；期间的数据不会补发（协议：断了就是丢了）`)
-        }
-      },
-    })
-    return dispose
-  }, [store, wsUrl])
+  // ---- 排障后门：直接看地图台 ----
+  if (stageOverride === 'map') {
+    return (
+      <div style={{ position: 'absolute', inset: 0, background: C.bg, color: C.text }}>
+        <TopBar linkOk />
+        <div style={{ position: 'absolute', top: 42, left: 0, right: 0, bottom: 0 }}>
+          <MapStage phase="T4" />
+        </div>
+      </div>
+    )
+  }
 
-  // ---- 指标：每秒刷新一次（UAV 数 + 数据新鲜度）----
-  useEffect(() => {
-    const t = window.setInterval(() => {
-      setUavCount(store.uavs().length)
-      const seen = store.lastSeenAt()
-      setLastSeenAgo(seen === undefined ? null : Date.now() - seen)
-    }, 500)
-    return () => window.clearInterval(t)
-  }, [store])
+  // ---- 底部全局状态条（Excel 步 3 起显示；项与文案来自宿主的 statusBar）----
+  const bottomBar = useMemo(() => {
+    const items = state?.statusBar ?? []
+    if (!items.length) return null
+    return (
+      <div style={statusBarStyle}>
+        {items.map((it) => (
+          <span key={it.key} style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
+            <span style={{ color: C.textDim }}>{it.name}</span>
+            <span style={{ color: statusColor(it.status) }}>{it.text || it.status}</span>
+          </span>
+        ))}
+      </div>
+    )
+  }, [state?.statusBar])
 
-  const tileTemplate = cfg?.tiles?.template || DEFAULT_TILE_TEMPLATE
+  // ---- 首帧：还没拿到状态 ----
+  //
+  // ★ 千万别在这里用 `inset` 简写（曾经写过 `top:42, inset:42`）：这一块与下面的步容器
+  //   处在**同一棵树位置**，React 复用同一个 DOM 节点、按属性逐个 diff —— 切到步容器时
+  //   它会移除 `inset`（简写移除会连带清掉 top），而 `top:42` 因为"值没变"不会被重设，
+  //   结果整屏容器塌成 0 高、内容全跑到视口外。一律用 left/right/bottom 长写。
+  if (!state) {
+    return (
+      <div style={{ position: 'absolute', inset: 0, background: C.bg, color: C.text }}>
+        <TopBar linkOk={false} />
+        <div style={{ position: 'absolute', top: 42, left: 0, right: 0, bottom: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: 8 }}>
+          <div style={{ fontSize: 15 }}>正在连接宿主…</div>
+          <div style={{ fontSize: 12, color: C.textDim }}>通道 {wsUrl}</div>
+          {error && <div style={{ fontSize: 12, color: C.bad }}>{error}</div>}
+        </div>
+      </div>
+    )
+  }
 
-  // 地图数据：只给"地图自己的配置"与静态台账；实时无人机走 MapDraw（见文件头说明）
-  const data = useMemo<MapData>(() => ({
-    config: {
-      center: DEFAULT_SCENARIO.center,
-      zoom: DEFAULT_SCENARIO.zoom,
-      minZoom: DEFAULT_SCENARIO.minZoom,
-      maxZoom: DEFAULT_SCENARIO.maxZoom,
-      basemap: { tileUrlTemplate: tileTemplate, attribution: 'geo-data' },
-    },
-    scenarioKey: 'scenario-1',
-    // 阶段 T4：map-2d 的阶段规则下无人机/目标/扫描/脉冲可见（T0–T2 不显示无人机，那是设计如此）
-    phase: 'T4',
-    targets: [],
-    groups: [],
-    uavs: [],
-    edges: [],
-    topology: null,
-    track: [],
-  }), [tileTemplate])
-
-  const engines = cfg?.stats?.engines ?? {}
-  const keys = Object.keys(engines)
-  const readyCount = keys.filter((k) => engines[k].instantiated).length
-
-  const stale = link.state !== 'open' || (lastSeenAgo !== null && lastSeenAgo > STALE_AFTER_MS)
-  const showStaleBanner = stale && (uavCount > 0 || link.state === 'closed')
-
-  const onFlushProbe = useCallback(() => {
-    // 自证脚本用：把模块统计挂到 window 上（不改变任何渲染行为）
-    const w = window as unknown as { __maStats?: () => unknown }
-    w.__maStats = () => ({
-      uavCount: store.uavs().length,
-      trackCount: store.tracks().length,
-      tracks: store.tracks().map((t) => ({ uavId: t.uavId, points: t.points.length })),
-      updates: store.uavs().map((u) => ({ uavId: u.uavId, updates: u.updates, groupId: u.groupId, type: u.type })),
-      rejected: store.rejected,
-      unknownEventTypes: store.unknownEventTypes(),
-      drones: MapDraw.list('drone').length,
-      tracksOnMap: MapDraw.list('track').length,
-      areas: MapDraw.list('area').length,
-      labels: MapDraw.list('label').length,
-      areaIds: MapDraw.list('area').map((a) => a.id),
-      labelIds: MapDraw.list('label').map((l) => l.id),
-      link,
-      styleSource,
-    })
-  }, [store, link, styleSource])
-  useEffect(() => { onFlushProbe() }, [onFlushProbe])
+  const step = state.step
 
   return (
-    <div style={{ position: 'absolute', inset: 0 }}>
-      <div style={barStyle}>
-        <strong>mission-app</strong>
-        <LinkBadge link={link} />
-        <span>无人机 {uavCount}</span>
-        <span style={{ color: '#8fb0cc' }}>
-          {lastSeenAgo === null ? '尚未收到遥测' : `最近数据 ${(lastSeenAgo / 1000).toFixed(1)}s 前`}
-        </span>
-        <span>engines 就绪 {keys.length ? `${readyCount}/${keys.length}` : '—'}</span>
-        <span>/health {health}</span>
-        <span style={{ color: '#8fb0cc' }}>style {styleSource}</span>
-        <span style={{ color: '#8fb0cc' }}>通道 {wsUrl}</span>
+    <div style={{ position: 'absolute', inset: 0, background: C.bg, color: C.text }}>
+      <TopBar linkOk={state.wsClients > 0} />
+
+      <div style={{ position: 'absolute', top: 42, left: 0, right: 0, bottom: 0 }}>
+        {step <= 1 && (
+          <BootScreen
+            state={state}
+            running={busy}
+            onStart={() => void run('boot.run', { pacingMs: 400 })}
+          />
+        )}
+
+        {step === 2 && (
+          <SelfCheckScreen
+            state={state}
+            busy={busy}
+            reply={lastReply}
+            onRun={() => void run('selfcheck.run', { bypassCache: true })}
+            onRecheck={() => void run('selfcheck.recheck', {})}
+            onEnter={() => void run('flow.enter', {})}
+          />
+        )}
+
+        {step >= 3 && (
+          <MapStage phase={state.phase} bottomBar={bottomBar} />
+        )}
       </div>
 
-      {showStaleBanner && (
-        <div style={warnStyle}>
-          ⚠ 数据可能已过期
-          {link.state === 'closed' ? '（实时通道已断开，画面停留在断开前那一帧）' : '（已有一段时间没收到遥测）'}
-        </div>
-      )}
+      {/* 流程回执（左下角一行）：步骤 + 阶段 + 最近一条命令的结果 */}
+      <div style={flowBadgeStyle}>
+        步 {state.step}/{11} · {state.stepTitle || state.stepKey}
+        {state.phase ? ` · 阶段 ${state.phase}` : ''}
+        {lastReply && lastReply.code !== 0
+          ? ` · 命令失败 code=${lastReply.code}（${lastReply.error?.message ?? ''}）`
+          : ''}
+      </div>
 
-      <MapView data={data} style={styleCfg}>
-        <SituationLayer store={store} styleCfg={styleCfg} />
-      </MapView>
-
-      {note ? <div style={noteStyle}>{note}</div> : null}
-
-      {/* 视角复位按钮（宿主自己的控件，放在地图之上） */}
-      <button
-        onClick={() => mapCommands.resetView(data.config)}
-        style={{
-          position: 'absolute', right: 12, bottom: 12, zIndex: 11,
-          padding: '5px 11px', fontSize: 12, cursor: 'pointer', borderRadius: 6,
-          background: 'rgba(10,20,36,.78)', border: '1px solid #1d3a5c', color: '#cfe3f5',
-        }}
-      >复位视角</button>
+      {/* 自证句柄：验收脚本读它（不改渲染行为） */}
+      <Probe state={state} />
     </div>
   )
+}
+
+const statusBarStyle: CSSProperties = {
+  position: 'absolute', left: 0, right: 0, bottom: 0, height: 28, zIndex: 12,
+  display: 'flex', gap: 18, alignItems: 'center', padding: '0 14px',
+  background: 'rgba(6, 26, 47, 0.9)', borderTop: `1px solid ${C.border}`, fontSize: 12,
+}
+
+const flowBadgeStyle: CSSProperties = {
+  position: 'absolute', left: 12, bottom: 34, zIndex: 40, fontSize: 11.5,
+  color: C.textDim, background: 'rgba(6,26,47,.72)', border: `1px solid ${C.border}`,
+  borderRadius: 6, padding: '2px 8px', pointerEvents: 'none',
+}
+
+/** 把当前流程状态挂到 window 上供脚本断言（只读，不影响渲染）。 */
+function Probe({ state }: { state: NonNullable<ReturnType<typeof useFlow>['state']> }) {
+  const w = window as unknown as { __flowStats?: () => unknown }
+  w.__flowStats = () => ({
+    step: state.step,
+    stepKey: state.stepKey,
+    stepTitle: state.stepTitle,
+    phase: state.phase,
+    boot: {
+      overall: state.boot.progress?.overall ?? null,
+      complete: state.boot.complete ?? null,
+      modules: (state.boot.modules ?? []).map((m) => ({ key: m.key, name: m.name, percent: m.percent, status: m.status, detail: m.detail, metric: m.metric })),
+    },
+    selfCheck: state.selfCheck
+      ? {
+        status: state.selfCheck.status,
+        checkedAt: state.selfCheck.checkedAt,
+        elapsedMs: state.selfCheck.elapsedMs,
+        items: state.selfCheck.items.map((i) => ({ key: i.key, name: i.name, status: i.status, reason: i.reason, advice: i.advice, metric: i.metric, subs: (i.subs ?? []).map((s) => ({ probe: s.probe, status: s.status })) })),
+      }
+      : null,
+    overview: (state.systemOverview ?? []).map((o) => ({ key: o.key, text: o.text, status: o.status })),
+    statusBar: (state.statusBar ?? []).map((o) => ({ key: o.key, text: o.text, status: o.status })),
+    wsClients: state.wsClients,
+  })
+  return null
 }
 
 export default App

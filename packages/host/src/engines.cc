@@ -156,21 +156,10 @@ Engines::Engines() {
 #endif
 
     // ---------------------------------------------------------------- geo-data（托管瓦片）
-#if MA_WITH_GEO
-    {
-        geoFs = std::make_shared<geo_data::NativeHostFs>();
-        geo_data::TileServiceConfig cfg;
-        cfg.basePath = "/tiles";
-        cfg.missingStatus = 404;
-        geo_data::TileServiceCtx ctx;
-        ctx.fs = geoFs.get();
-        ctx.clock = &geoClock;
-        auto created = geo_data::createTileService(cfg, ctx);
-        tileService = created.service;
-        tileNote = tileService ? "service=ready（未挂载瓦片包）"
-                               : "service=null（" + geo_data::joinIssues(created.issues) + "）";
-    }
-#endif
+    //
+    // ★ 装配**不在这里**：瓦片包要从 `config.json` 的 `tiles` 段来，而构造函数拿不到配置。
+    //   所以与 loadSimulation 同一条路 —— 配置由 main 递进来，见 configureTiles()。
+    //   （本构造函数只保证"模块被链接、被实例化"这件事在编译期成立。）
 
     // ---------------------------------------------------------------- device-ingest
     // 只**构造**门面（不开线程、不绑端口）；真正 start() 由 main 在做完 WS 装配后调。
@@ -186,6 +175,64 @@ Engines::Engines() {
     }
 #endif
 }
+
+#if MA_WITH_GEO
+// ---------------------------------------------------------------- geo-data 装配
+//
+// 一件事：把 `config.json` 的 `tiles` 段翻译成 geo-data 的 `TileServiceConfig`，
+// 让模块去装载包。**包能不能装载由模块判定**：装不上（缺清单/清单坏）不阻止服务创建，
+// 包态与原因由 listPackages() 如实回给宿主，宿主只负责原样写进 tileNote（/stats 可见）。
+void Engines::configureTiles(const HostConfig& cfg) {
+    geoFs = std::make_shared<geo_data::NativeHostFs>();  // 读盘：模块自带的原生适配器
+
+    geo_data::TileServiceConfig tc;
+    tc.basePath = cfg.tilesBasePath.empty() ? "/tiles" : cfg.tilesBasePath;
+    tc.missingStatus = cfg.tilesMissingStatus;
+    if (!cfg.tilesSubDir.empty()) tc.tileSubDir = cfg.tilesSubDir;
+
+    // 包：三项（pkgId / version / root）缺一即不挂 —— 服务照常创建，如实标注为未挂载。
+    // 相对 root 走宿主的锚点规则（锚在配置文件旁边），与 dataDir/scenarioDir 同一口径。
+    const std::string tileRoot = cfg.resolvePath(cfg.tilesRoot);
+    if (!cfg.tilesPkgId.empty() && !cfg.tilesPkgVersion.empty() && !tileRoot.empty()) {
+        geo_data::PackageConfig pkg;
+        pkg.pkgId = cfg.tilesPkgId;
+        pkg.version = cfg.tilesPkgVersion;
+        pkg.tileRoot = tileRoot;
+        pkg.external = false;  // 本地离线底图：不是外部托管内容（无需强署名）
+        pkg.contractVersion = geo_data::kPackageContractVersion;
+        tc.packages.push_back(std::move(pkg));
+    }
+
+    geo_data::TileServiceCtx ctx;
+    ctx.fs = geoFs.get();
+    ctx.clock = &geoClock;  // 时钟由宿主注入（模块 MUST NOT 回落系统时钟）
+
+    const geo_data::CreateTileServiceResult created = geo_data::createTileService(tc, ctx);
+    tileService = created.service;
+    if (!tileService) {
+        tileNote = "service=null（" + geo_data::joinIssues(created.issues) + "）";
+        return;
+    }
+    if (tc.packages.empty()) {
+        tileNote = "service=ready（未挂载瓦片包：config.json 的 tiles.packageId/version/root 为空）";
+        return;
+    }
+
+    // 包态从模块查（宿主不自己判断目录/清单）：ready / not-ready / missing / invalid + 原因。
+    std::string detail;
+    for (const auto& p : tileService->listPackages()) {
+        if (!detail.empty()) detail += "；";
+        detail += p.pkgId + "-" + p.version + " state=" + geo_data::packageStateName(p.state);
+        if (p.state == geo_data::PackageState::Ready) {
+            detail += " z" + std::to_string(p.minZoom) + "-" + std::to_string(p.maxZoom) +
+                      " 块数=" + std::to_string(p.total);
+        } else if (!p.reasons.empty()) {
+            detail += "（" + p.reasons.front().detail + "）";
+        }
+    }
+    tileNote = "service=ready（已挂载瓦片包 " + detail + "）";
+}
+#endif
 
 #if MA_WITH_STORE
 telemetry_store::Status Engines::storeStatus() const {

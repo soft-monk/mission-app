@@ -12,6 +12,8 @@
 //   node scripts/live-check.mjs [url]
 //   url 默认 http://127.0.0.1:5190/（apps/web 的 vite dev server）
 // 前置：① 宿主在跑（127.0.0.1:8099）；② apps/web 的 dev server 在跑
+// 注：脚本会自带 `?stage=map`（直接进地图台，跳过启动/自检两屏）——那是页面给验收留的后门，
+//     否则 P2 之后页面默认停在"启动加载"屏，地图根本不会挂载。
 // 退出码：0 = 全绿；1 = 有断言失败；2 = 环境不具备（没找到 Chrome）
 import { spawn } from 'node:child_process'
 import { existsSync, mkdtempSync, rmSync } from 'node:fs'
@@ -88,7 +90,7 @@ try {
   sessionId = attached.sessionId
   await send('Runtime.enable')
   await send('Page.enable')
-  await send('Page.navigate', { url: URL_ })
+  await send('Page.navigate', { url: URL_ + (URL_.includes('?') ? '&' : '?') + 'stage=map' })
   await sleep(1500)
 
   // 等页面把 __maStats 挂上，并等无人机累积

@@ -201,14 +201,107 @@ void registerWsCallbacks(const std::string& controllerName, const WsCallbacks& c
 void HostServer::registerRoutes() {
     auto& app = drogon::app();
 
-    // ---- /health：静态占位（真正的 selfcheck 聚合是 P2 的事）
+    // ---- /health：selfcheck 的聚合负载（六个字段冻结口径：status / checkedAt / modules /
+    //      selfCheck / systemOverview / wsClients）。**不在这里算** —— 全部来自 selfcheck 引擎，
+    //      宿主只搬运。未接 flow（如 --selftest 或模块没装）时回落最小合法负载。
     app.registerHandler(
         "/health",
-        [](const drogon::HttpRequestPtr&,
-           std::function<void(const drogon::HttpResponsePtr&)>&& cb) {
-            cb(jsonResponse("{\"status\":\"ok\"}"));
+        [this](const drogon::HttpRequestPtr&,
+               std::function<void(const drogon::HttpResponsePtr&)>&& cb) {
+            if (ws_.health) {
+                try {
+                    cb(jsonResponse(ws_.health().dump()));
+                    return;
+                } catch (const std::exception& e) {
+                    LOG_WARN << "[host] /health 生成失败：" << e.what();
+                }
+            }
+            cb(jsonResponse("{\"status\":\"unknown\",\"checkedAt\":0,\"modules\":[],"
+                            "\"selfCheck\":[],\"systemOverview\":[],\"wsClients\":0}"));
         },
         {drogon::Get});
+
+    // ---- /healthz：排障用最小路由（不碰任何引擎；用来区分"服务器不响应"与"某个处理器卡住"）
+    app.registerHandler(
+        "/healthz",
+        [](const drogon::HttpRequestPtr&,
+           std::function<void(const drogon::HttpResponsePtr&)>&& cb) {
+            LOG_INFO << "[host][diag] /healthz 命中";
+            cb(jsonResponse("{\"ok\":true}"));
+        },
+        {drogon::Get});
+
+    // ---- /healthz：排障用最小路由（不碰任何引擎；用来区分"服务器不响应"与"某个处理器卡住"）
+    app.registerHandler(
+        "/healthz",
+        [](const drogon::HttpRequestPtr&,
+           std::function<void(const drogon::HttpResponsePtr&)>&& cb) {
+            LOG_INFO << "[host][diag] /healthz 命中";
+            cb(jsonResponse("{\"ok\":true}"));
+        },
+        {drogon::Get});
+
+    // ---- /api/state：流程状态 + 启动进度 + 自检结果（前端每次轮询读它）
+    app.registerHandler(
+        "/api/state",
+        [this](const drogon::HttpRequestPtr&,
+               std::function<void(const drogon::HttpResponsePtr&)>&& cb) {
+            if (!ws_.state) {
+                cb(jsonResponse("{\"code\":1005,\"error\":{\"message\":\"流程层未装配\"}}",
+                                drogon::k503ServiceUnavailable));
+                return;
+            }
+            cb(jsonResponse(ws_.state().dump()));
+        },
+        {drogon::Get});
+
+    // ---- /api/command：唯一的命令面（POST JSON `{verb, params}`）
+    //
+    // 回执统一 `{code, verb, data|error}`：`code=0` 成功；码表见 protocol §3
+    // （1000 非法请求 / 1004 未找到 / 1005 内部不可用 / 1006 版本不匹配）。
+    app.registerHandler(
+        "/api/command",
+        [this](const drogon::HttpRequestPtr& req,
+               std::function<void(const drogon::HttpResponsePtr&)>&& cb) {
+            if (!ws_.command) {
+                cb(jsonResponse("{\"code\":1005,\"verb\":\"\",\"error\":{\"message\":\"流程层未装配\"}}",
+                                drogon::k503ServiceUnavailable));
+                return;
+            }
+            std::string verb;
+            nlohmann::json params = nlohmann::json::object();
+            try {
+                const auto body = req->getBody();
+                if (!body.empty()) {
+                    const auto j = nlohmann::json::parse(std::string(body));
+                    if (!j.is_object()) {
+                        cb(jsonResponse(
+                            "{\"code\":1000,\"verb\":\"\",\"error\":{\"message\":\"请求体必须是 JSON 对象\"}}"));
+                        return;
+                    }
+                    verb = j.value("verb", std::string());
+                    if (j.contains("params") && j["params"].is_object()) params = j["params"];
+                }
+            } catch (const std::exception& e) {
+                nlohmann::json out;
+                out["code"] = 1000;
+                out["verb"] = "";
+                out["error"] = {{"message", std::string("JSON 解析失败：") + e.what()}};
+                cb(jsonResponse(out.dump()));
+                return;
+            }
+            if (verb.empty()) verb = req->getParameter("verb");
+            try {
+                cb(jsonResponse(ws_.command(verb, params).dump()));
+            } catch (const std::exception& e) {
+                nlohmann::json out;
+                out["code"] = 1005;
+                out["verb"] = verb;
+                out["error"] = {{"message", std::string("命令执行异常：") + e.what()}};
+                cb(jsonResponse(out.dump(), drogon::k500InternalServerError));
+            }
+        },
+        {drogon::Post});
 
     // ---- /stats：各引擎是否就绪（就绪账本的原样导出）+ 真实链路读数
     app.registerHandler(
@@ -260,15 +353,40 @@ void HostServer::registerRoutes() {
 #if MA_WITH_GEO
     // ---- 瓦片路由：归一请求 → geo-data 的 TileService → 写回
     //      宿主不解析坐标、不做缓存策略、不做业务判断。
+    //
+    // ★ 路由必须按**正则**注册整棵子树：drogon 的 `registerHandler(path, …)` 对不含
+    //   占位符的路径是**精确匹配**（HttpControllersRouter 的 simpleCtrlMap_），只注册
+    //   `route` 本身的后果是任何 `/tiles/...` 子路径都落到 drogon 自带的 HTML 404，
+    //   请求根本到不了 geo-data。瓦片路径按模块契约 §3.5 是
+    //   `<basePath>/<pkgId>-<version>/<subDir>/z/x/y.ext`，所以这里放行 `route` 及其
+    //   全部子路径，路径形态由模块裁决（宿主不在这里认坐标）。
     if (cfg_.enableTiles && engines_.tileService) {
         const std::string route = cfg_.tilesBasePath.empty() ? "/tiles" : cfg_.tilesBasePath;
-        app.registerHandler(
-            route,
-            [this](const drogon::HttpRequestPtr& req,
-                   std::function<void(const drogon::HttpResponsePtr&)>&& cb) {
+        // 模块的挂载前缀用 geo-data 自己的纯函数算（宿主不自己拼版本化路径）。
+        const std::string mountPrefix =
+            (cfg_.tilesPkgId.empty() || cfg_.tilesPkgVersion.empty())
+                ? std::string()
+                : geo_data::urlPrefixFor(route, cfg_.tilesPkgId, cfg_.tilesPkgVersion) + "/" +
+                      (cfg_.tilesSubDir.empty() ? "raster" : cfg_.tilesSubDir) + "/";
+        app.registerHandlerViaRegex(
+            route + "(?:/.*)?",  // 非捕获组：不给 handler 造出多余的路由参数
+            [this, route, mountPrefix](const drogon::HttpRequestPtr& req,
+                                       std::function<void(const drogon::HttpResponsePtr&)>&& cb) {
                 geo_data::TileRequest greq;
                 greq.method = req->methodString();
                 greq.url = req->getOriginalPath();
+
+                // ★ 扁平模板兼容：`config.json` 的 `tiles.template` 历史上是
+                //   `/tiles/{z}/{x}/{y}.jpg`（前端按它取图），而模块的包路径按 GEO-RTM-02
+                //   必含版本段。这里**只把路径补上挂载前缀**（`/tiles/z/x/y.jpg` →
+                //   `/tiles/<pkgId>-<version>/<subDir>/z/x/y.jpg`），命中/缺失/越界仍全部
+                //   由模块裁决 —— 不是静态路由，正文一个字节都不由宿主产生。
+                if (!mountPrefix.empty() &&
+                    greq.url.compare(0, mountPrefix.size(), mountPrefix) != 0 &&
+                    greq.url.compare(0, route.size() + 1, route + "/") == 0) {
+                    greq.url = mountPrefix + greq.url.substr(route.size() + 1);
+                }
+
                 greq.url += queryString(req->getParameters());
                 static const char* kForward[] = {"range", "if-none-match", "accept",
                                                  "accept-encoding", "user-agent"};
@@ -281,7 +399,15 @@ void HostServer::registerRoutes() {
 
                 auto resp = drogon::HttpResponse::newHttpResponse();
                 resp->setStatusCode(static_cast<drogon::HttpStatusCode>(gresp.status));
+                // ★ content-type 走 setContentTypeString（**替换**），不能只 addHeader：
+                //   drogon 的 newHttpResponse() 自带 `content-type: text/html`，追加一个
+                //   `image/jpeg` 会写出两个互相矛盾的 content-type（实测响应里两条都在），
+                //   瓦片就有被客户端按 text/html 处理的风险。其余头原样回写。
                 for (const auto& kv : gresp.headers.items()) {
+                    if (kv.first == "content-type") {
+                        resp->setContentTypeString(kv.second);
+                        continue;
+                    }
                     resp->addHeader(kv.first, kv.second);
                 }
                 switch (gresp.body.kind) {
@@ -381,7 +507,7 @@ void HostServer::registerRoutes() {
         }
     }
 
-    LOG_INFO << "[host] HTTP 路由: / /health /stats /runtime-config"
+    LOG_INFO << "[host] HTTP 路由: / /health /stats /runtime-config /api/state /api/command"
 #if MA_WITH_GEO
              << (cfg_.enableTiles && engines_.tileService ? " " + cfg_.tilesBasePath : "")
 #endif

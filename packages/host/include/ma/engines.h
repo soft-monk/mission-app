@@ -136,6 +136,13 @@ struct Engines {
     std::shared_ptr<geo_data::NativeHostFs> geoFs;
     std::shared_ptr<geo_data::TileService> tileService;
     std::string tileNote;
+
+    /// geo-data 瓦片服务：按 `config.json` 的 `tiles` 段装配（把包挂进 `cfg.packages`）。
+    ///
+    /// 与 `loadSimulation` 同一条纪律：**配置从外面递进来** —— Engines 自己不读文件。
+    /// 由 main 在装配期调用（在 `report()` 之前，/stats 才拿得到真实包态）。
+    /// 相对路径按宿主的锚点规则解析（`HostConfig::resolvePath`：锚在配置文件旁边）。
+    void configureTiles(const HostConfig& cfg);
 #endif
 #if MA_WITH_INGEST
     std::unique_ptr<device_ingest::Gateway> gateway;

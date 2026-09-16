@@ -37,6 +37,13 @@ struct WsCallbacks {
     std::function<std::size_t(const std::string&)> closeByPeer;
     /// `/stats` 的附加段（仿真链路 / 接入 / 广播的实时读数）
     std::function<nlohmann::json()> statsExtra;
+    /// `POST /api/command`：`{verb, params}` → `{code, verb, data|error}`。
+    /// 实现在 FlowEngine（流程装配层）；HostServer 只做 HTTP 与 JSON 的搬运。
+    std::function<nlohmann::json(const std::string&, const nlohmann::json&)> command;
+    /// `GET /api/state`：流程状态 + 启动进度 + 自检结果
+    std::function<nlohmann::json()> state;
+    /// `GET /health`：selfcheck 的聚合负载（六字段）。未接时回落最小合法负载。
+    std::function<nlohmann::json()> health;
 };
 
 class HostServer {

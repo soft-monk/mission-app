@@ -41,15 +41,15 @@
     "template": "/tiles/{z}/{x}/{y}.jpg",
     "basePath": "/tiles",
     "missingStatus": 404,
-    "packageId": "",
-    "version": "",
-    "root": "",
+    "packageId": "basemap",
+    "version": "v1",
+    "root": "../map-2d/tiles",
     "subDir": "raster"
   },
 
   "selfcheck": {
-    "policies": "",
-    "capabilities": ""
+    "policies": "../selfcheck/policies/mapapp/probes.json",
+    "capabilities": "../selfcheck/probes/mapapp/capabilities.json"
   },
 
   "webDist": "apps/web/dist"

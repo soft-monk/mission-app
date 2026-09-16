@@ -20,3 +20,6 @@ scripts/.*
 # 编辑器
 .vscode/
 .idea/
+
+# 宿主排障时留下的启动日志
+.baseline-host.log

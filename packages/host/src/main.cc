@@ -9,10 +9,13 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cstdint>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <iostream>
 #include <string>
+#include <system_error>
 #include <thread>
 
 #include <drogon/HttpAppFramework.h>
@@ -20,6 +23,7 @@
 
 #include "ma/config.h"
 #include "ma/engines.h"
+#include "ma/flow.h"
 #include "ma/host_server.h"
 #include "ma/hub_engine.h"
 #include "ma/registry.h"
@@ -117,6 +121,163 @@ device_ingest::IngestConfig toIngestConfig(const ma::HostConfig& cfg) {
     return out;
 }
 #endif
+
+}  // namespace
+
+// ============================================================================
+// 能力快照：把宿主的**真实读数**翻译成规则侧探针要的键值
+// ============================================================================
+//
+// ★ 这里只做"如实翻译"，不做判断：
+//   · 拿不到的能力一律写 `...Configured=false`（探针会按规则包映射成"中性态"而不是"故障"）；
+//   · 能拿到的（瓦片目录、接入是否在收包、设备台账、在线率）一律取**实测值**。
+//   换句话说：自检界面上的每一个字都能追到某个真实读数。
+namespace {
+
+using nlohmann::json;
+
+json capabilitySnapshot(const ma::HostConfig& cfg, ma::Engines& e, ma::Registry& reg,
+                        ma::HubEngine& hub) {
+    json c = json::object();
+
+    // ---- 地图引擎：瓦片包根目录是否真的存在（存在性由宿主亲自查，不猜）
+    {
+        const std::string root = cfg.tilesRoot.empty() ? std::string() : cfg.resolvePath(cfg.tilesRoot);
+        bool exists = false;
+        if (!root.empty()) {
+            std::error_code ec;
+            exists = std::filesystem::is_directory(root, ec);
+        }
+        c["mapTilesDirConfigured"] = !root.empty();
+        c["mapTilesDirExists"] = exists;
+    }
+
+    // ---- 通信链路：接入点是否真的在收包（取接入层的实测计数，不看"配了没有"）
+    {
+        bool enabled = false;
+        bool receiving = false;
+        std::uint64_t packets = 0;
+        std::uint64_t events = 0;
+        int pointsRunning = 0;
+#if MA_WITH_INGEST
+        enabled = cfg.ingest.enabled && !cfg.ingest.points.empty();
+        if (e.gateway) {
+            for (const auto& m : e.gateway->allPointMetrics()) {
+                if (m.running) ++pointsRunning;
+                packets += m.packets;
+                events += m.events;
+            }
+        }
+        receiving = e.gatewayRunning && pointsRunning > 0 && packets > 0;
+#endif
+        c["linkUdpEnabled"] = enabled;
+        c["linkUdpReceiving"] = receiving;
+        c["linkUdpPointsRunning"] = pointsRunning;
+        c["linkUdpPackets"] = packets;
+        c["linkUdpEvents"] = events;
+    }
+
+    // ---- AI 引擎：本工程没有接 AI 桥（原型的 AI 桥在 8090，未纳入本应用）
+    //      如实报"未配置" → 规则包映射成中性态（不影响启动，也不谎报在线）
+    c["aiBridgeConfigured"] = false;
+    c["aiBridgeReachable"] = false;
+
+    // ---- 集群管理：设备台账（device-ingest 的真实台账）+ 场景里的编制数
+    {
+        int online = 0;
+        int total = 0;
+#if MA_WITH_INGEST
+        if (e.gateway) {
+            for (const auto& d : e.gateway->listDevices()) {
+                ++total;
+                if (d.online) ++online;
+            }
+        }
+#endif
+        int platforms = 0;
+#if MA_WITH_SIM_SOURCE && MA_WITH_INGEST
+        platforms = static_cast<int>(e.scenarioData.aircraft.size());
+#endif
+        c["clusterLedgerAvailable"] = total > 0;
+        c["clusterLedgerRows"] = total;
+        c["clusterNodesOnline"] = online;
+        c["clusterNodesExpected"] = platforms > 0 ? platforms : total;
+        c["deviceOnlineRate"] = total > 0 ? static_cast<double>(online) / total : 0.0;
+    }
+
+    // ---- 数据服务：留存层是否装配（P0 起就是内存后端 → 可读写；这里如实报）
+    {
+        bool storeReady = false;
+        int appended = 0;
+#if MA_WITH_STORE
+        storeReady = (e.store != nullptr);
+        const auto st = e.storeStatus();
+        appended = static_cast<int>(st.appended);
+#endif
+        c["dataStoreConfigured"] = storeReady;
+        c["dataStoreWritable"] = storeReady;
+        c["dataStoreAppended"] = appended;
+    }
+
+    // ---- 与场景数据相关的实测量（自检的两项要用真实编制数）
+#if MA_WITH_SIM_SOURCE && MA_WITH_INGEST
+    c["scenarioPlatforms"] = static_cast<int>(e.scenarioData.aircraft.size());
+    c["scenarioTargets"] = static_cast<int>(e.scenarioData.targets.size());
+    c["scenarioGroups"] = static_cast<int>(e.scenarioData.groups.size());
+#endif
+
+    // ---- 定位：本工程没有接真实 GPS/北斗接收机；场景坐标来自本地配置
+    //      → 如实报"未配置"（规则包映射为中性态），不谎报已定位
+    c["gnssConfigured"] = false;
+    c["gnssFixValid"] = false;
+    c["beidouServiceUp"] = false;
+
+    // ---- 通信链路子项（自检的"卫星/数传/组网"三条）：
+    //      数传 = 接入点真的在收包；组网 = 实时广播网已起且有客户端；卫星 = 未配置
+    c["satcomLinkUp"] = false;
+    c["dataLinkUp"] = c.value("linkUdpReceiving", false);
+    c["meshLinkUp"] = hub.transport() != nullptr && hub.hub().clientCount() > 0;
+
+    // ---- 后方指控：本工程没有指控平台对接 → 未配置（中性态）
+    c["commandPlatformConfigured"] = false;
+    c["commandPlatformLinkUp"] = false;
+    c["commandDataServiceUp"] = false;
+
+    // ---- 系统安全：核心子系统**在位**才算完整性通过（可复核：逐条来自就绪账本）
+    //
+    // 口径说明：`ingest` 那一条账本记的是"只链接、start() 由 main 后置调用"，
+    // 所以这里以 `gatewayRunning` 为准；`sensorModel` 尚未装配（P4 才接）不计入核心。
+    {
+        bool coreReady = true;
+        for (const auto& row : reg.entries()) {
+            if (row.key == "sensorModel") continue;
+#if MA_WITH_INGEST
+            if (row.key == "ingest") {
+                if (!e.gatewayRunning) coreReady = false;
+                continue;
+            }
+#endif
+            if (!row.instantiated) coreReady = false;
+        }
+        c["systemIntegrityOk"] = coreReady;
+        c["securityGuardActive"] = coreReady;
+    }
+
+    // ---- 网络可达：能回答这个请求本身就说明 HTTP 服务可达（真实）
+    c["networkReachable"] = true;
+
+    // ---- 系统就绪 / 遥测存活（状态条用）
+    {
+        bool allReady = true;
+        for (const auto& row : reg.entries()) {
+            if (!row.instantiated) allReady = false;
+        }
+        c["systemReady"] = allReady;
+        c["uavTelemetryAlive"] = c.value("linkUdpReceiving", false);
+    }
+
+    return c;
+}
 
 }  // namespace
 
@@ -246,6 +407,11 @@ int main(int argc, char** argv) {
     }
 #endif
 
+#if MA_WITH_GEO
+    // geo-data 瓦片服务：把 config.json 的 tiles 段交给模块装配（挂不上的包不阻止服务创建）。
+    engines.configureTiles(cfg);
+#endif
+
     engines.report(registry);
 
     std::cout << "[host] " << engines.evidence.summary() << "\n";
@@ -283,6 +449,19 @@ int main(int argc, char** argv) {
     ma::HostServer server(cfg, registry, engines);
     g_server = &server;
 
+    // ---- 流程装配层（Excel 11 步）：命令面 + 启动进度 + 自检聚合
+    //
+    // 它只做两件事：把宿主**真实状态**翻译成引擎要的入参，把引擎输出原样转成 HTTP/WS 负载。
+    // 引擎不是线程安全的，Drogon 的 handler 跑在多个 IO 线程 → 命令面在 FlowEngine 内串行化。
+    ma::FlowEngine flow(engines, registry, cfg);
+    flow.setBroadcaster([&hubEngine](const std::string& type, const nlohmann::json& data) {
+        hubEngine.hub().broadcast(type, data);
+    });
+    flow.setClientCounter([&hubEngine]() { return static_cast<int>(hubEngine.hub().clientCount()); });
+    flow.setCapabilityProbe([&cfg, &engines, &registry, &hubEngine]() {
+        return capabilitySnapshot(cfg, engines, registry, hubEngine);
+    });
+
     // ---- 广播腿：WS 路由的三条路径 + /stats 的实时读数
     //
     // 心跳节拍是**为了验收可观测**刻意调短的：默认 15 s × 4 = 60 s 判死，
@@ -313,7 +492,13 @@ int main(int argc, char** argv) {
             extra["ingest"] = engines.ingestStatsJson();
 #endif
             return extra;
-        }});
+        },
+        // ---- 命令面与状态面（流程装配层 FlowEngine；HostServer 只做 HTTP/JSON 搬运）
+        [&flow](const std::string& verb, const nlohmann::json& params) {
+            return flow.command(verb, params);
+        },
+        [&flow]() { return flow.stateJson(); },
+        [&flow]() { return flow.healthJson(); }});
 
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
@@ -371,6 +556,18 @@ int main(int argc, char** argv) {
         }
     }
 #endif
+    flushLog();
+
+    // ---- 流程装配层：装载 selfcheck 规则包（kind:"probes"）+ 注册规则侧探针包
+    //
+    // 放在接入层与仿真节拍**之后**：这样第一次能力快照就是"真实在跑"的状态。
+    // 启动加载（Excel 步 1）由前端发 `boot.run` 驱动 —— 宿主**不自动跑**：
+    // 否则页面打开时进度条早走完了，看到的那一次就不是真的。
+    if (flow.initSelfCheck()) {
+        std::cout << "[host] 流程层就绪：" << flow.summary() << "\n";
+    } else {
+        std::cerr << "[host] 流程层未就绪：" << flow.summary() << "\n";
+    }
     flushLog();
 
     std::cout << "[host] 已就绪：\n"
