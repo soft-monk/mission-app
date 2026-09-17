@@ -19,7 +19,8 @@
 // 前置：宿主已在跑（不用 vite dev —— 直接打宿主托管的 dist，减少变量）
 // 退出码：0 = 全绿；1 = 有断言失败；2 = 环境不具备（没找到 Chrome）
 import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -174,18 +175,36 @@ try {
   console.log(`  · WS 采集器：open=${events.state.open} errors=${events.state.errors} ${events.state.error}`)
 
   // 页面进入即发 boot.run（真实推进）
+  //
+  // ★ 启动页截图必须拍在**进度还没走完**的时候：boot.complete 之后页面自动进到自检屏，
+  //   那时候再拍就会拍到一张"自检屏"——p2-1 与 p2-2 曾经是同一张图（证据重复，等于没有启动页证据）。
   let bootSeen = null
+  let bootShotOverall = null
   for (let i = 0; i < 60; i++) {
     bootSeen = await evalJs('window.__flowStats ? JSON.stringify(window.__flowStats()) : null')
     if (bootSeen) {
       const j = JSON.parse(bootSeen)
+      const overall = j.boot?.overall ?? null
+      // 进度已在推、又还没满 → 这就是"启动加载中"的那一瞬
+      if (overall !== null && overall > 0 && overall < 100 && !j.boot?.complete) {
+        bootShotOverall = overall
+        break
+      }
       if (j.boot?.complete) break
     }
-    await sleep(500)
+    await sleep(120)
   }
   check('页面暴露了流程自证句柄 __flowStats', !!bootSeen)
   const firstShot = await shot('p2-1-boot.png')
-  if (firstShot) console.log(`  · 启动页截图：${firstShot}`)
+  if (firstShot) console.log(`  · 启动页截图：${firstShot}（拍到时总进度 ${bootShotOverall ?? 'n/a'}%）`)
+  check('启动加载截图拍在进度未满时（否则与自检屏重复）', bootShotOverall !== null, `overall=${bootShotOverall ?? 'n/a'}%`)
+
+  // 等启动跑完（断言要用"完成态"）
+  for (let i = 0; i < 60; i++) {
+    const s = await evalJs('window.__flowStats ? JSON.stringify(window.__flowStats()) : null')
+    if (s && JSON.parse(s).boot?.complete) break
+    await sleep(500)
+  }
 
   // ============================================================== 2) 启动进度：真实且单调
   const progresses = events.seen
@@ -242,6 +261,11 @@ try {
   await sleep(700)  // 等页面轮询到新一轮结果
   const secondShot = await shot('p2-2-selfcheck.png')
   if (secondShot) console.log(`  · 自检页截图：${secondShot}`)
+  // 证据不重复：两张截图必须是**两个不同界面**（曾经 p2-1/p2-2 字节相同 = 只有一张真证据）
+  const shotHash = (f) => (f ? createHash('sha1').update(readFileSync(f)).digest('hex').slice(0, 12) : null)
+  const h1 = shotHash(firstShot)
+  const h2 = shotHash(secondShot)
+  check('启动页与自检页是两张不同的图（证据不重复）', !!h1 && !!h2 && h1 !== h2, `boot=${h1 ?? 'n/a'} selfcheck=${h2 ?? 'n/a'}`)
   const domRows = await evalJs(`document.body.innerText`)
   const sawNames = items.filter((i) => (domRows || '').includes(i.name)).length
   check('自检界面把 5 项名称都渲染出来了', sawNames === 5, `${sawNames}/5`)
