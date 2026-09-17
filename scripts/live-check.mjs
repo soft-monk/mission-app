@@ -1,4 +1,4 @@
-// mission-app · scripts/live-check.mjs
+﻿// mission-app · scripts/live-check.mjs
 //
 // 端到端真机自证：**前端连真后端**（不是脚本自己造的 WS 服务端），验证
 //   「本地配置 → sim-source → UDP → device-ingest → hub → WS → 前端 → map-2d 上屏」
@@ -104,6 +104,7 @@ try {
   const page = targets.targetInfos.find((t) => t.type === 'page')
   const attached = await send('Target.attachToTarget', { targetId: page.targetId, flatten: true })
   sessionId = attached.sessionId
+  await send('Page.bringToFront')  // ★ 后台 tab 的 rAF 被节流 → MapLibre 样式装载会卡死（实测）
   await send('Runtime.enable')
   await send('Page.enable')
   await send('Page.navigate', { url: URL_ + (URL_.includes('?') ? '&' : '?') + 'stage=map' })

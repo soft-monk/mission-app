@@ -1,9 +1,9 @@
-// mission-app · apps/web/src/screens/ReconExpandScreen.tsx
+﻿// mission-app · apps/web/src/screens/ReconExpandScreen.tsx
 //
 // **侦察展开地图界面（需求专篇 DES-APP-001 SH-09，参考图 `场景1\T3-1.png`，1536×1024）**。
 //
 // 版式（本屏是**覆盖层**：底下的 `MapStage` 由 App 渲染，本文件只往地图上摆浮层）：
-//   · 左上：地图工具栏 4 键「选择 / 测距 / 图层 / 3D · 2D/3D」
+//   · 左上：地图工具栏 5 键「选择 / 测距 / 测面 / 图层 / 3D · 2D/3D」（工具条本体在 shell/MapTools）
 //   · 右上：显示模式胶囊「显示模式：侦察展开」
 //   · 地图：**6 个扁平半透明六边形**（两排三列，各含一枚四旋翼图标与标签）
 //   · 右栏：「集群总体状态」6 条（圆点 + 名称 + 在线 / 信号强度 / 电量 +【更多详情 >】）
@@ -23,11 +23,19 @@ import { C, panel, panelTitle } from '../theme'
 import type { FlowState } from '../api'
 import type { UseFlow } from '../flow/useFlow'
 import { isObj, n2s, replyText, useVerbOnce } from '../flow/useSituation'
+import { MapToolbar, ToolModeNote, toolsOf, useMapToolState } from '../shell/MapTools'
 
 type J = Record<string, unknown>
 
 /** 分组配色（**照图**：集群1 蓝 / 集群2 绿 / 集群3 金黄 / 集群4 紫 / 集群5 青 / 集群6 橙）。 */
 const CLUSTER_PALETTE = ['#3b82f6', '#22c55e', '#eab308', '#a855f7', '#06b6d4', '#f97316'] as const
+
+/**
+ * 本屏工具条的**键位与顺序逐字照参考图**（`场景1\T3-1.png`）：选择 / 测距 / 图层 / 3D(2D-3D)。
+ * 「测面」插在「测距」后一格：map-2d 的量算本来就是测距/测面两档，图上只有一格"测距"，
+ * 这是**有意偏差**（把已实现的量算真的接出来）；能不能点仍由规则包 view.compose 说了算。
+ */
+const SH09_TOOLS = toolsOf(['select', 'measure', 'measureArea', 'layers', 'mode3d', 'reset'])
 
 /** 快照 `groups[].role` 域 → 中文机型（词典；不认识就原样显示域，不猜）。 */
 const ROLE_CN: Record<string, string> = {
@@ -344,34 +352,12 @@ export function ReconExpandScreen({ state, flow, onGo, goto }: {
   goto?: (step: number) => void
 }) {
   const snap = useVerbOnce(flow, 'situation.snapshot', {}, true)
-  const compose = useVerbOnce(flow, 'view.compose', { phase: state.phase || 'T2' }, true)
+  const compose = useVerbOnce(flow, 'view.compose', {}, true)
   const sensor = useVerbOnce(flow, 'sensor.status', {}, true)
   const clusters = useMemo(() => readClusterStatus(snap.data), [snap.data])
   const [more, setMore] = useState(false)
-
-  // `view.compose` 的工具可用性（说了算的是它；本屏只把"为什么不可用"照抄到 title 上）
-  const tools = useMemo(() => {
-    const src = isObj(compose.data) ? compose.data : undefined
-    const views = rows(src, 'views')
-    const t = views.length ? rows(views[0], 'tools') : []
-    return t.map((x) => ({
-      key: strOf(x, 'key') ?? strOf(x, 'id') ?? '',
-      on: isObj(x) && typeof x.enabled === 'boolean' ? x.enabled : true,
-      reason: Array.isArray(x.reasons) && typeof x.reasons[0] === 'string' ? x.reasons[0] : strOf(x, 'state'),
-    })).filter((x) => x.key)
-  }, [compose.data])
-  const toolOf = (key: string) => tools.find((t) => t.key === key)
-
-  /** 图上 4 键（逐字）：选择 / 测距 / 图层 / 3D(2D-3D)。前三项消费侧未实现 → 灰置 + title 写原因。 */
-  const toolbar = [
-    {
-      key: 'select', label: '选择', on: toolOf('select')?.on ?? true,
-      hint: (toolOf('select')?.on ?? true) ? undefined : (toolOf('select')?.reason ?? '宿主未声明「选择」可用'),
-    },
-    { key: 'measure', label: '测距', hint: toolOf('measure')?.reason ?? '测距未实现：消费侧 map-2d 未提供该工具' },
-    { key: 'layer', label: '图层', hint: toolOf('layer')?.reason ?? '图层未实现：图层开关由 view.compose 下发，前端不自行切换' },
-    { key: 'mode3d', label: '3D', sub: '2D/3D', on: true },
-  ]
+  // 工具可用性一律问规则包（`view.compose`）；本屏只负责"图上有哪几格、什么字、什么顺序"
+  const mt = useMapToolState(flow)
 
   const modeName = useMemo(() => {
     const src = isObj(compose.data) ? compose.data : undefined
@@ -392,26 +378,9 @@ export function ReconExpandScreen({ state, flow, onGo, goto }: {
 
   return (
     <div data-testid="sh-09" data-screen="SH-09" style={wrap}>
-      {/* ---------------- 左上：工具栏 4 键（图上逐字） ---------------- */}
-      <div data-testid="sh09-toolbar" style={toolbarStyle}>
-        {toolbar.map((t) => (
-          <button
-            key={t.key}
-            data-testid={`sh09-tool-${t.key}`}
-            data-tool-enabled={t.hint ? '0' : '1'}
-            title={t.hint}
-            style={{
-              ...toolBtn,
-              color: t.on ? C.accent : C.unknown,
-              borderColor: t.on ? C.borderStrong : 'transparent',
-              cursor: t.hint ? 'not-allowed' : 'default',
-            }}
-          >
-            <span style={{ fontSize: 12.5, lineHeight: 1.1 }}>{t.label}</span>
-            {t.sub && <span style={{ fontSize: 9.5, color: C.accent }}>{t.sub}</span>}
-          </button>
-        ))}
-      </div>
+      {/* ---------------- 左上：工具栏 5 键（图上逐字；点击落 map-2d，坐标以本屏 wrap 为准） ---------------- */}
+      <MapToolbar testid="sh09-toolbar" items={SH09_TOOLS} state={mt} style={{ left: 0, top: 0 }} />
+      <ToolModeNote state={mt} items={SH09_TOOLS} />
 
       {/* ---------------- 右上：显示模式胶囊（可切"侦察展开 / 侦察融合"两屏，见需求专篇 §4.1 过渡①） ---------------- */}
       <div data-testid="sh09-mode" style={modePill}>
@@ -519,16 +488,6 @@ function ReconExpandProbe(props: {
 // ---- 样式（一律 left/right/top/bottom 长写：**不写 inset 简写**）----
 const wrap: CSSProperties = {
   position: 'absolute', left: 12, right: 12, top: 34, bottom: 12, zIndex: 20,
-}
-const toolbarStyle: CSSProperties = {
-  position: 'absolute', left: 0, top: 0, zIndex: 22,
-  display: 'flex', gap: 2, padding: '4px 6px', borderRadius: 8,
-  background: 'rgba(6,26,47,.82)', border: `1px solid ${C.border}`,
-}
-const toolBtn: CSSProperties = {
-  display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 1,
-  minWidth: 52, padding: '4px 8px', borderRadius: 6, cursor: 'default',
-  background: 'transparent', border: '1px solid transparent',
 }
 const modePill: CSSProperties = {
   position: 'absolute', right: 0, top: 0, zIndex: 22, display: 'flex', gap: 6, alignItems: 'center',

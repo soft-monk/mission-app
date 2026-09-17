@@ -1,10 +1,12 @@
-// mission-app · apps/web/src/screens/TargetsScreen.tsx
+﻿// mission-app · apps/web/src/screens/TargetsScreen.tsx
 //
 // **目标列表界面（需求专篇 DES-APP-001 SH-11，参考图 `场景1\T4-1.png`）** 与
 // **目标详情界面（SH-12，参考图 `场景1\T4-2.png`）** —— 同一个组件的两种形态（`mode`）。
 //
 // 版式（两屏共用：顶栏/左导航/底部状态条/麦克风球由 `AppShell` 提供，本文件只摆地图上的浮层）：
-//   · 左上：地图工具栏（选择 / 标绘 / 测距 / 图层 / 3D · 2D/3D）
+//   · 左上：地图工具栏（选择 / 标绘 / 测距 / 测面 / 图层 / 3D · 2D/3D）
+//     真能点的实现统一在 `shell/MapTools`（量算/手绘/图层/全屏落到 map-2d 的公共命令上），
+//     本屏只声明"图上有哪几格、什么字、什么顺序"；**能不能点**由规则包 `view.compose` 说了算。
 //   · 右上：显示模式胶囊「显示模式：目标识别」
 //   · SH-11：地图右侧**浮动「目标详情」卡**（编号大字 + 徽标 + 类型/置信度/位置/海拔 +
 //            「目标特征」2×2 + 「威胁评估」4 项）
@@ -35,6 +37,8 @@ import {
   readAct, readTargetDetail, readTargets,
   type ActionOption, type TargetDetailView, type TargetRow,
 } from '../flow/useOps'
+// 地图工具栏：共享的**真能点**实现（本屏不再自己写一份只读摆设）
+import { MapToolbar, ToolModeNote, toolsOf, useMapToolState } from '../shell/MapTools'
 
 /** 地图下方「目标列表」每页几张卡（图上 5 张）。 */
 const PAGE_SIZE = 5
@@ -131,34 +135,6 @@ function DomRow({ k, text, domain, color, testid }: {
         {text}
         {domain && <span style={{ fontSize: 10.5, color: C.textDim }}>（{domain}）</span>}
       </span>
-    </div>
-  )
-}
-
-/** 地图工具栏（图上那一排 5 键；可用性由 `view.compose` 说了算，未实现者灰置 + 写明原因）。 */
-function MapToolbar({ prefix, items }: {
-  prefix: string
-  items: { key: string; label: string; sub?: string; on?: boolean; hint?: string }[]
-}) {
-  return (
-    <div data-testid={`${prefix}-toolbar`} style={toolbarStyle}>
-      {items.map((t) => (
-        <button
-          key={t.key}
-          data-testid={`${prefix}-tool-${t.key}`}
-          data-tool-enabled={t.on ? '1' : '0'}
-          title={t.hint}
-          style={{
-            ...toolBtn,
-            color: t.on ? C.accent : (t.hint ? C.unknown : C.text),
-            borderColor: t.on ? C.borderStrong : 'transparent',
-            cursor: t.hint ? 'not-allowed' : 'default',
-          }}
-        >
-          <span style={{ fontSize: 12.5, lineHeight: 1.1 }}>{t.label}</span>
-          {t.sub && <span style={{ fontSize: 9.5, color: t.on ? C.accent : C.textDim }}>{t.sub}</span>}
-        </button>
-      ))}
     </div>
   )
 }
@@ -498,6 +474,19 @@ function ClusterRail({ snapshotRaw, reply, busy, onRetry, testid }: {
 // 主组件
 // ============================================================================
 
+/**
+ * 地图工具栏的**版式**（键位 / 顺序 / 文字照参考图 `场景1\T4-1.png`、`T4-2.png`）：
+ *   选择 / 标绘 / 测距 / 测面 / 图层 / 3D·2D/3D。
+ *
+ * 为什么放在组件外：这排格子在 SH-11 与 SH-12 上是同一份，提成模块级常量后两屏共用、
+ * 也避免每次渲染重建数组。**它只声明"图上有哪几格"**；每一格"能不能点、为什么不能点"
+ * 由 `shell/MapTools` 从规则包 `view.compose` 翻译（本屏不再自己判可用性）。
+ *
+ * 与参考图的一处有意偏差：量算在 map-2d 里是「测距 + 测面」两档，图上只有一格"测距"，
+ * 故在"测距"后补一格"测面"（量算是用户明确点名要接的能力，见 `TOOL_SPECS` 的注释）。
+ */
+const TARGETS_TOOLS = toolsOf(['select', 'draw', 'measure', 'measureArea', 'layers', 'mode3d', 'reset'])
+
 export function TargetsScreen({ state, flow, mode = 'list', onGo }: {
   state: FlowState
   flow: UseFlow
@@ -509,12 +498,18 @@ export function TargetsScreen({ state, flow, mode = 'list', onGo }: {
   const P = mode === 'detail' ? 'sh12' : 'sh11'          // 新增 testid 前缀
   const detailMode = mode === 'detail'
 
+  // 工具条状态：可用性一律来自规则包 `view.compose`（`shell/MapTools` 内部发同一条 verb，
+  // 幂等只读）。本屏只把 `mt` 交给 `<MapToolbar>`，不再自己算"哪个工具能用"。
+  const mt = useMapToolState(flow)
+
   // ---- 进屏发一次目标台账（幂等）；`entity.changed` 到达时限频重取 ----
   const list = useVerbOnce(flow, 'targets.list', {}, true)
   const tv = useMemo(() => readTargets(list.data), [list.data])
 
-  // ---- 显示模式与工具栏可用性（`view.compose` 说了算，前端不写死） ----
-  const compose = useVerbOnce(flow, 'view.compose', { phase: state.phase || 'T4' }, true)
+  // ---- 显示模式（`view.compose` 说了算，前端不写死）----
+  // ★ 这条调用**保留**：显示模式的取值来源不变（下面用 `cmp.modeName`）；
+  //   工具可用性改由 `mt` 负责（`useMapToolState` 内部发的是同一条幂等只读 verb）。
+  const compose = useVerbOnce(flow, 'view.compose', {}, true)
   const cmp = useMemo(() => readCompose(compose.data), [compose.data])
 
   // ---- 右栏「集群总体状态」（**只有 SH-11 图上那一栏用它**；SH-12 的右栏是目标详情） ----
@@ -628,21 +623,8 @@ export function TargetsScreen({ state, flow, mode = 'list', onGo }: {
   const canPrev = safePage > 0
   const canNext = safePage < pageCount - 1
 
-  const tools = cmp.tools
-  const toolOn = (key: string) => tools.find((t) => t.key === key)?.on ?? false
-  const toolHint = (key: string, fallback: string) => {
-    const t = tools.find((x) => x.key === key)
-    if (!t) return fallback
-    if (t.on) return undefined
-    return t.reason ?? '宿主未声明该工具可用'
-  }
-  const toolbar = [
-    { key: 'select', label: '选择', on: toolOn('select') || !tools.length, hint: toolHint('select', 'view.compose 未声明「选择」工具') },
-    { key: 'mark', label: '标绘', hint: toolHint('mark', '标绘未实现（消费侧 map-2d 未提供该工具）') },
-    { key: 'measure', label: '测距', hint: toolHint('measure', '测距未实现（消费侧 map-2d 未提供该工具）') },
-    { key: 'layer', label: '图层', hint: toolHint('layer', '图层未实现（图层开关由 view.compose 下发，前端不自行切换）') },
-    { key: 'mode3d', label: '3D', sub: '2D/3D', on: true },
-  ]
+  // 工具栏的"哪几格 / 能不能点 / 为什么不能点"都不在这里算了：
+  //   版式 → 模块级 `TARGETS_TOOLS`；可用性 + 原话原因 → `mt`（规则包 `view.compose`）。
   const modeName = cmp.modeName ?? cmp.modeKey ?? '目标识别'
 
   const total = tv.total
@@ -654,7 +636,9 @@ export function TargetsScreen({ state, flow, mode = 'list', onGo }: {
 
   return (
     <div data-testid={detailMode ? 'sh-12' : 'sh-11'} data-screen={detailMode ? 'SH-12' : 'SH-11'} style={wrap}>
-      <MapToolbar prefix={P} items={toolbar} />
+      {/* 左上：地图工具栏（共享实现；`style` 以本屏浮层容器 `wrap` 为参照系 → 容器左上角） */}
+      <MapToolbar testid={`${P}-toolbar`} items={TARGETS_TOOLS} state={mt} style={{ left: 0, top: 0 }} />
+      <ToolModeNote state={mt} items={TARGETS_TOOLS} />
       <ModePill prefix={P} name={modeName} right={RAIL_W + 12} />
 
       {/* ---------------- SH-11：地图上的浮动「目标详情」卡 ---------------- */}
@@ -943,16 +927,6 @@ function TargetsProbe(props: {
 const RAIL_W = 320
 const wrap: CSSProperties = {
   position: 'absolute', left: 12, right: 12, top: 34, bottom: 12, zIndex: 20,
-}
-const toolbarStyle: CSSProperties = {
-  position: 'absolute', left: 0, top: 0, zIndex: 22,
-  display: 'flex', gap: 2, padding: '4px 6px', borderRadius: 8,
-  background: 'rgba(6,26,47,.82)', border: `1px solid ${C.border}`,
-}
-const toolBtn: CSSProperties = {
-  display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 1,
-  minWidth: 52, padding: '4px 8px', borderRadius: 6, cursor: 'default',
-  background: 'transparent', border: '1px solid transparent', color: C.text,
 }
 const modePill: CSSProperties = {
   position: 'absolute', top: 0, zIndex: 22, display: 'flex', gap: 6, alignItems: 'center',

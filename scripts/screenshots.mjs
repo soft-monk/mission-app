@@ -1,4 +1,4 @@
-// mission-app · scripts/screenshots.mjs
+﻿// mission-app · scripts/screenshots.mjs
 //
 // **逐屏截图**（需求专篇 DES-APP-001 的 20 屏）：用 `?screen=SH-xx` 深链直达每一屏，
 // 按 1536×1024（设计基准）截一张，落到 `docs/screens/screens/SH-xx-<屏名>.png`。
@@ -63,7 +63,8 @@ const shoot = async (id, name) => {
       const created = await send('Target.createTarget', { url: `${BASE}/?screen=${id}` })
       targetId = created.targetId
       sessionId = (await send('Target.attachToTarget', { targetId, flatten: true })).sessionId
-      await send('Runtime.enable'); await send('Page.enable')
+      await send('Page.bringToFront')  // ★ 后台 tab 的 rAF 被节流 → MapLibre 样式装载会卡死（实测）
+  await send('Runtime.enable'); await send('Page.enable')
       await send('Emulation.setDeviceMetricsOverride', { width: W, height: H, deviceScaleFactor: 1, mobile: false })
       await sleep(3600)
       const badge = await js(`(document.querySelector('[data-testid="flow-badge"]')||{}).innerText || ''`)

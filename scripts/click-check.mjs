@@ -1,4 +1,4 @@
-// mission-app · scripts/click-check.mjs
+﻿// mission-app · scripts/click-check.mjs
 //
 // **手点通路自证（20 屏）**：只用界面上的按钮/卡片（除了少数图上确实没有入口的过渡）从 SH-01 走到 SH-18，
 // 每一步都按《宿主需求专篇》DES-APP-001 §4.1 的流程点，并断言"当前屏 / 落到哪一屏 / 哪个步号"。
@@ -105,6 +105,7 @@ try {
   await send('Target.createTarget', { url: 'about:blank' }); await sleep(400)
   const t = await send('Target.getTargets'); const page = t.targetInfos.find((x) => x.type === 'page')
   sessionId = (await send('Target.attachToTarget', { targetId: page.targetId, flatten: true })).sessionId
+  await send('Page.bringToFront')  // ★ 后台 tab 的 rAF 被节流 → MapLibre 样式装载会卡死（实测）
   await send('Runtime.enable'); await send('Page.enable')
   await send('Emulation.setDeviceMetricsOverride', { width: 1536, height: 1024, deviceScaleFactor: 1, mobile: false })
 

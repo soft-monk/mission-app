@@ -406,8 +406,16 @@ try {
   })()
   check('页面暴露状态句柄并跟着宿主走（step 由 flow.state 驱动）', !!stPage && stPage.step >= 3,
     stPage ? `step=${stPage.step} stepKey=${stPage.stepKey} phase=${stPage.phase} missionId=${stPage.missionId}` : '（页面没暴露 __flowStats）')
+  // ★ 这条断言要**指定屏**再查：`/` 落在"宿主当前步的默认屏"，而脚本跑到这里时宿主可能已经
+  //   推进到步 6（SH-07 链路拓扑）—— 那一屏**按设计就没有地图**（App.tsx 的 MapLayer 对
+  //   SH-07/SH-08 返回 null）。用深链钉在"步 3–5 共用地图台"的那一屏上，断言才说的是它想说的
+  //   那件事（态势 / 编组 / 方案确认三屏共用同一个 MapStage）。实测踩过：不钉屏时这条会随
+  //   宿主推进的时机偶发红，而界面其实完全正常。
+  await send('Page.navigate', { url: `${URL_}/?screen=SH-05` })
+  await sleep(2500)
   const hasMap = await evalJs(`!!document.querySelector('.maplibregl-map canvas')`)
-  check('第 3 步起地图台仍挂载（态势与编组共用 MapStage）', hasMap === true)
+  const mapScreen = await evalJs(`(document.querySelector('[data-testid="flow-badge"]')||{}).dataset?.screen || ''`)
+  check('第 3 步起地图台仍挂载（态势与编组共用 MapStage）', hasMap === true, `实测屏=${mapScreen} canvas=${hasMap}`)
   const s = await shot('p3-1-grouping.png')
   if (s) console.log(`  · 截图：${s}`)
 

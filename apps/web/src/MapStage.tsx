@@ -1,10 +1,12 @@
 // mission-app · apps/web/src/MapStage.tsx
 //
-// 页面做四件事，别的都不做（没有阶段规则、没有评分、没有告警逻辑）：
+// 页面做五件事，别的都不做（没有阶段规则、没有评分、没有告警逻辑）：
 //   ① 底图与视角：瓦片模板从宿主 `/runtime-config` 拿，视角用场景数据里的 center/zoom
 //   ② 静态态势：把 deployment / task-areas / airspace 的区域多边形与标注画出来（AreaItem / LabelItem）
 //   ③ 实时态势：订阅 `telemetry.uav.pos`，按 uavId 增量维护无人机与航迹，再按节拍上屏
 //   ④ 如实显示链路状态（连接中 / 已连接 / 已断开，断开时提示"数据可能已过期"）
+//   ⑤ **交互层**：挂 map-2d 的 `<DrawLayer/>`（量算 / 手绘 / 图元编辑，M2-DRAW-08 / M2-CTRL-10），
+//      并按规则包 `view.compose` 声明的控件把 指北针 / 比例尺 / 缩放按钮 打开（M2-CTRL-01）
 //
 // ★ 纪律：不改 packages/（后端）、不改其它模块仓；map-2d 用别名原地引用。
 //
@@ -13,8 +15,12 @@
 //   每来一帧就重灌一次，且不吃本批新增的位图图标能力。
 //   本页要的是"按 uavId 增量更新"，所以实时无人机与航迹统一经 `MapDraw` 上屏，
 //   `MapData.uavs` 保持空数组（两者同时用会互相覆盖同一个数据源）。
+//
+// 排障信息条：`debug` 为真时才渲染那条 `mission-app | 通道 | /health | engines` 自证信息条。
+//   产品屏一律 `debug={false}`（它属于开发自证，不该出现在交付界面上）；
+//   `?stage=map` 排障后门传 `debug` 保留原始信息条。
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
-import { MapDraw, MapView, mapCommands, useMapUiStore, type MapData } from 'map-2d'
+import { DrawLayer, MapDraw, MapView, mapCommands, mapInstance, useInteraction, type MapData } from 'map-2d'
 import { DEFAULT_MAP_STYLE, groupColorOf, loadMapStyle, trackStyleOf } from './map-style'
 import { DEFAULT_SCENARIO, toAreaItems, toLabelItems } from './scenario'
 import { DEFAULT_WS_URL, TelemetryStore, connectTelemetry, type LinkState } from './telemetry'
@@ -73,7 +79,8 @@ const warnStyle: CSSProperties = {
 }
 
 const noteStyle: CSSProperties = {
-  position: 'absolute', left: 12, bottom: 12, zIndex: 10, maxWidth: '60vw',
+  // 同样避开底部 30px 的全局状态条
+  position: 'absolute', left: 12, bottom: 44, zIndex: 10, maxWidth: '60vw',
   padding: '6px 10px', borderRadius: 6,
   background: 'rgba(4, 24, 47, 0.82)', border: '1px solid rgba(95, 176, 255, 0.25)',
   pointerEvents: 'none', fontSize: 12, color: '#cfe3f5',
@@ -146,7 +153,12 @@ function SituationLayer({ store, styleCfg }: { store: TelemetryStore; styleCfg: 
   return null
 }
 
-export function MapStage({ phase, bottomBar }: { phase?: string; bottomBar?: React.ReactNode }) {
+export function MapStage({ phase, bottomBar, debug = false }: {
+  phase?: string
+  bottomBar?: React.ReactNode
+  /** 是否渲染开发自证信息条（`mission-app | 通道 | /health | engines`）。产品屏一律 false。 */
+  debug?: boolean
+}) {
   const [cfg, setCfg] = useState<RuntimeConfig | null>(null)
   const [health, setHealth] = useState<string>('(未探测)')
   const [note, setNote] = useState<string>('')
@@ -241,6 +253,34 @@ export function MapStage({ phase, bottomBar }: { phase?: string; bottomBar?: Rea
     return dispose
   }, [store, wsUrl])
 
+  // ---- 地图控件：按需开启（M2-CTRL-01：模块默认全部不显示）----
+  //
+  // 参考图每个地图屏上都有 **指北针 N / 比例尺 / 缩放 ±**（需求专篇 G-06），map-2d 早就实现了
+  // 这些控件，但**宿主从来没调用过 `showControls`**，于是界面上一个都看不到 —— 这也是
+  // "模块里已经做了的小功能没接进来"的一类。
+  //
+  // ★ 只开 `scale`（比例尺，右下角）：它与任何面板都不冲突，实测每屏可见可读（"1 km"）。
+  //
+  // ★ `zoom`（缩放按钮）与 `compass`（指北针）**有意不开**，理由是同一个：
+  //   模块把缩放按钮固定在 `top-right`、把指北针固定在它正下方（`right:12, top:78`）
+  //   —— 见 `map-2d/src/core/controls.ts` 的 POSITION 表与 `ui/Compass.tsx:41`，**宿主不可配**。
+  //   而本应用**每个地图屏的右上角都是右栏面板**（AI任务分析 / 任务信息 / 资源概况 …），
+  //   开了只有两种结果：被面板盖住点不到，或者压住面板正文（实测：`layout-check` 在开 zoom 时
+  //   报 48/60 屏次"缩放按钮被面板遮挡"）。缩放用滚轮 / 双指 / 键盘 `+` `-` / 方向键平移都可用
+  //   （M2-CTRL-14）；指北针在本应用里也不承载信息（`MapView` 建图时 `dragRotate:false`，
+  //   它恒指正北）。**不做一个看不见或点不到的控件**，理由写在这里与 README §2.3。
+  useEffect(() => {
+    let timer = 0
+    let alive = true
+    const tick = () => {
+      if (!alive) return
+      if (mapCommands.isReady()) mapCommands.showControls(['scale'])
+      else timer = window.setTimeout(tick, 120)
+    }
+    tick()
+    return () => { alive = false; window.clearTimeout(timer) }
+  }, [])
+
   // ---- 指标：每秒刷新一次（UAV 数 + 数据新鲜度）----
   useEffect(() => {
     const t = window.setInterval(() => {
@@ -283,7 +323,10 @@ export function MapStage({ phase, bottomBar }: { phase?: string; bottomBar?: Rea
 
   const onFlushProbe = useCallback(() => {
     // 自证脚本用：把模块统计挂到 window 上（不改变任何渲染行为）
-    const w = window as unknown as { __maStats?: () => unknown }
+    const w = window as unknown as {
+      __maStats?: () => unknown
+      __measureProbe?: () => unknown
+    }
     w.__maStats = () => ({
       uavCount: store.uavs().length,
       trackCount: store.tracks().length,
@@ -300,23 +343,56 @@ export function MapStage({ phase, bottomBar }: { phase?: string; bottomBar?: Rea
       link,
       styleSource,
     })
+    /**
+     * 量算自证（`scripts/measure-check.mjs` 读它）：把 map-2d **交互层里那一份**测量结果
+     * 原样交出来（`mapCommands.getMeasurement()`，M2-CTRL-10）。**只读**，不参与渲染，
+     * 也不做任何加工 —— 脚本断言的数值就是 `DrawLayer` 浮层上显示的那个数。
+     */
+    w.__measureProbe = () => {
+      const st = useInteraction.getState()
+      const m = mapCommands.getMeasurement()
+      const mp = mapInstance.current
+      return {
+        mode: st.mode,
+        livePoints: st.points.length,
+        // 交互层是否真的挂上了（DrawLayer 的 setup() 会加这个预览源；没挂上 → 点击不会被接收）
+        drawLayerReady: !!(mp && mp.getSource && mp.getSource('src-2d-interaction')),
+        mapReady: !!mp,
+        styleLoaded: mp && mp.isStyleLoaded ? mp.isStyleLoaded() : null,
+        hasAreaSource: !!(mp && mp.getSource && mp.getSource('src-area')),
+        mapLoaded: !!(mp && mp.loaded && mp.loaded()),
+        sourceIds: mp && mp.getStyle ? Object.keys(mp.getStyle()?.sources ?? {}) : null,
+        measurement: m
+          ? {
+            mode: m.mode,
+            meters: m.meters ?? null,
+            areaM2: m.areaM2 ?? null,
+            bearing: m.bearing ?? null,
+            vertices: Array.isArray(m.points) ? m.points.length : null,
+            points: m.points ?? null,
+          }
+          : null,
+      }
+    }
   }, [store, link, styleSource])
   useEffect(() => { onFlushProbe() }, [onFlushProbe])
 
   return (
     <div style={{ position: 'absolute', inset: 0 }}>
-      <div style={barStyle}>
-        <strong>mission-app</strong>
-        <LinkBadge link={link} />
-        <span>无人机 {uavCount}</span>
-        <span style={{ color: '#8fb0cc' }}>
-          {lastSeenAgo === null ? '尚未收到遥测' : `最近数据 ${(lastSeenAgo / 1000).toFixed(1)}s 前`}
-        </span>
-        <span>engines 就绪 {keys.length ? `${readyCount}/${keys.length}` : '—'}</span>
-        <span title={health}>/health {health}</span>
-        <span style={{ color: '#8fb0cc' }}>style {styleSource}</span>
-        <span style={{ color: '#8fb0cc' }}>通道 {wsUrl}</span>
-      </div>
+      {debug && (
+        <div style={barStyle}>
+          <strong>mission-app</strong>
+          <LinkBadge link={link} />
+          <span>无人机 {uavCount}</span>
+          <span style={{ color: '#8fb0cc' }}>
+            {lastSeenAgo === null ? '尚未收到遥测' : `最近数据 ${(lastSeenAgo / 1000).toFixed(1)}s 前`}
+          </span>
+          <span>engines 就绪 {keys.length ? `${readyCount}/${keys.length}` : '—'}</span>
+          <span title={health}>/health {health}</span>
+          <span style={{ color: '#8fb0cc' }}>style {styleSource}</span>
+          <span style={{ color: '#8fb0cc' }}>通道 {wsUrl}</span>
+        </div>
+      )}
 
       {showStaleBanner && (
         <div style={warnStyle}>
@@ -327,21 +403,14 @@ export function MapStage({ phase, bottomBar }: { phase?: string; bottomBar?: Rea
 
       <MapView data={data} style={styleCfg}>
         <SituationLayer store={store} styleCfg={styleCfg} />
+        {/* 交互层（量算 / 手绘 / 图元编辑）：map-2d 的实现，必须挂进 `<MapView>` 才生效。
+            各屏工具栏的"测距 / 测面 / 区域 / 新建 / 标绘"就是把它切到对应绘制模式。 */}
+        <DrawLayer />
       </MapView>
 
       {note ? <div style={noteStyle}>{note}</div> : null}
 
       {bottomBar}
-
-      {/* 视角复位按钮（宿主自己的控件，放在地图之上） */}
-      <button
-        onClick={() => mapCommands.resetView(data.config)}
-        style={{
-          position: 'absolute', right: 12, bottom: 12, zIndex: 11,
-          padding: '5px 11px', fontSize: 12, cursor: 'pointer', borderRadius: 6,
-          background: 'rgba(10,20,36,.78)', border: '1px solid #1d3a5c', color: '#cfe3f5',
-        }}
-      >复位视角</button>
     </div>
   )
 }

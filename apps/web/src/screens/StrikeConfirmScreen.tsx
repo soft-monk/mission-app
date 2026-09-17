@@ -1,4 +1,4 @@
-// mission-app · apps/web/src/screens/StrikeConfirmScreen.tsx
+﻿// mission-app · apps/web/src/screens/StrikeConfirmScreen.tsx
 //
 // **打击确认界面（需求专篇 DES-APP-001 SH-14，参考图 `场景1\T5-2.png`，1519×1035）**。
 //
@@ -34,6 +34,9 @@ import {
   type GuidanceView,
 } from '../flow/useStrike'
 import { voiceLine, useLabels } from '../shell/VoiceStrip'
+// 工具条改用**共享的**实现（`shell/MapTools`）：真能点的量算/手绘/图层面板都落在这里，
+// 各屏只声明"图上有哪几格"，能不能点由规则包 `view.compose` 说了算。
+import { MapToolbar, ToolModeNote, toolsOf, useMapToolState } from '../shell/MapTools'
 
 // 图元 id 前缀：**只用来认领本屏画的东西**（清理与计数都靠它；MapStage 的图元一个都不碰）
 const IP_PREFIX = 'IP:'
@@ -81,32 +84,15 @@ function Section({ title, right, children, testid }: {
   )
 }
 
-/** 地图工具栏（图上那一排；可用性由 `view.compose` 说了算，未实现者灰置 + 写明原因）。 */
-function MapToolbar({ items }: {
-  items: { key: string; label: string; sub?: string; on?: boolean; hint?: string }[]
-}) {
-  return (
-    <div data-testid="sh14-toolbar" style={toolbarStyle}>
-      {items.map((t) => (
-        <button
-          key={t.key}
-          data-testid={`sh14-tool-${t.key}`}
-          data-tool-enabled={t.on ? '1' : '0'}
-          title={t.hint}
-          style={{
-            ...toolBtn,
-            color: t.on ? C.accent : (t.hint ? C.unknown : C.text),
-            borderColor: t.on ? C.borderStrong : 'transparent',
-            cursor: t.hint ? 'not-allowed' : 'default',
-          }}
-        >
-          <span style={{ fontSize: 12.5, lineHeight: 1.1 }}>{t.label}</span>
-          {t.sub && <span style={{ fontSize: 9.5, color: t.on ? C.accent : C.textDim }}>{t.sub}</span>}
-        </button>
-      ))}
-    </div>
-  )
-}
+/**
+ * 本屏工具条的**版式**（键位/顺序逐字照参考图 `场景1\T5-2.png`）。
+ *
+ * 图上是「选择 / 测距 / 图层 / 3D · 2D/3D」四格，这里**保持原顺序一个字不改**，
+ * 只把「测面」插在「测距」后一格：map-2d 的量算本来就分"测距 + 测面"两档（M2-CTRL-10），
+ * 规则包 key 同为 `measure`，而量算是用户本轮点名要接的能力（同类偏差已在 README 登记）。
+ * 每一格**能不能点**不看这张表，一律由规则包 `view.compose` 的声明决定（VWC-TOOL-01/02）。
+ */
+const SH14_TOOLS = toolsOf(['select', 'measure', 'measureArea', 'layers', 'mode3d', 'reset'])
 
 /** 一行「名 + 值」：值缺失显示"—"，**不补 0**；`miss` 写明为什么缺。 */
 function Row({ k, v, color, miss, testid }: {
@@ -200,8 +186,10 @@ export function StrikeConfirmScreen({ state, flow, selectedPlanId, onSelectPlan,
   const tv = useMemo(() => readTargets(targets.data), [targets.data])
 
   // ---- 显示模式：问 view-composer（不写死业务文案）----
-  const compose = useVerbOnce(flow, 'view.compose', { phase: state.phase || 'T5' }, true)
+  const compose = useVerbOnce(flow, 'view.compose', {}, true)
   const cmp = readCompose(compose.data)
+  // 工具可用性：一律以规则包 `view.compose` 的声明为准（VWC-TOOL-01/02）——前端不自己判"该不该能用"
+  const mt = useMapToolState(flow)
 
   // ---- 语音文案（AI确认建议）：`config.json` 的 `flow.labels` 的 `voice.sh14.advice` ----
   const labels = useLabels()
@@ -352,21 +340,6 @@ export function StrikeConfirmScreen({ state, flow, selectedPlanId, onSelectPlan,
   }
   const confirmedOk = confirmReply?.code === 0
 
-  const tools = cmp.tools
-  const toolOn = (key: string) => tools.find((t) => t.key === key)?.on ?? false
-  const toolHint = (key: string, fallback: string) => {
-    const t = tools.find((x) => x.key === key)
-    if (!t) return fallback
-    if (t.on) return undefined
-    return t.reason ?? '宿主未声明该工具可用'
-  }
-  const toolbar = [
-    { key: 'select', label: '选择', on: toolOn('select') || !tools.length, hint: toolHint('select', 'view.compose 未声明「选择」工具') },
-    { key: 'measure', label: '测距', hint: toolHint('measure', '测距未实现（消费侧 map-2d 未提供该工具）') },
-    { key: 'layer', label: '图层', hint: toolHint('layer', '图层未实现（图层开关由 view.compose 下发）') },
-    { key: 'mode3d', label: '3D', sub: '2D/3D', on: true },
-  ]
-
   /** 资源调度：把图上那 4 行按语义去 `guidance.groups[]` 里认领（名字含关键词 或 成员 model 命中）。 */
   const resRow = (keys: string[]) => gv.clusters.find((c) => {
     const n = c.name.toLowerCase()
@@ -376,7 +349,9 @@ export function StrikeConfirmScreen({ state, flow, selectedPlanId, onSelectPlan,
 
   return (
     <div data-testid="sh-14" data-screen="SH-14" style={wrap}>
-      <MapToolbar items={toolbar} />
+      {/* 左上：地图工具栏（共享实现，真能点；坐标相对本屏浮层容器 `wrap`，故 left/top 归 0） */}
+      <MapToolbar testid="sh14-toolbar" items={SH14_TOOLS} state={mt} style={{ left: 0, top: 0 }} />
+      <ToolModeNote state={mt} items={SH14_TOOLS} />
       <div data-testid="sh14-mode" style={{ ...modePill, right: RAIL_W + 12 }}>
         <span style={{ color: C.textDim }}>显示模式：</span>
         <span style={{ color: C.text }}>{cmp.modeName ?? cmp.modeKey ?? '打击确认'}</span>
@@ -804,16 +779,6 @@ function ConfirmProbe(props: {
 const RAIL_W = 306
 const wrap: CSSProperties = {
   position: 'absolute', left: 12, right: 12, top: 34, bottom: 12, zIndex: 20,
-}
-const toolbarStyle: CSSProperties = {
-  position: 'absolute', left: 0, top: 0, zIndex: 22,
-  display: 'flex', gap: 2, padding: '4px 6px', borderRadius: 8,
-  background: 'rgba(6,26,47,.82)', border: `1px solid ${C.border}`,
-}
-const toolBtn: CSSProperties = {
-  display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 1,
-  minWidth: 52, padding: '4px 8px', borderRadius: 6, cursor: 'default',
-  background: 'transparent', border: '1px solid transparent', color: C.text,
 }
 const modePill: CSSProperties = {
   position: 'absolute', top: 0, zIndex: 22, display: 'flex', gap: 6, alignItems: 'center',

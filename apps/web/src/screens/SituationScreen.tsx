@@ -31,8 +31,9 @@ import {
   uavTypeCN, useVerbOnce, type Metric,
 } from '../flow/useSituation'
 import { VerbVerdict } from './VerbVerdict'
-import { StageStrip } from './StageOverlay'
 import { MapStage } from '../MapStage'
+import { MapToolbar, ToolModeNote, toolsOf, useMapToolState } from '../shell/MapTools'
+import { DiagBox, DiagLine } from '../shell/Diag'
 
 /**
  * 三张场景入口卡（**文案逐字来自参考图**，不是引擎数据）。
@@ -45,6 +46,20 @@ const SCENES: { id: string; no: string; name: string; accent: string; implemente
   { id: 'scenario-2', no: '场景二', name: '集群协同突击', accent: 'rgba(34,197,94,.85)', implemented: false },
   { id: 'scenario-3', no: '场景三', name: '立体融合攻坚', accent: 'rgba(245,158,11,.85)', implemented: false },
 ]
+
+/**
+ * 本屏工具条的**版式**（键位/顺序逐字照参考图 T0-1）。
+ *
+ * 图上是「选择 / 新建 / 全屏 / 区域 / 3D」；这里保留图上的 5 格，并在其后补上
+ * `view.compose` 对 `overview` 模式声明为 available 的 测距·测面·标绘·图层·清屏
+ * —— **量算（测距/测面）是用户本轮点名要接的能力**（map-2d 已实现 M2-CTRL-10，
+ * 宿主此前从未挂 `DrawLayer`，所以一直是灰的）。补格属于"图上有工具组、模块有能力"的
+ * 如实接线，已登记进 README「本轮的已知偏差」。
+ * 每一格**能不能点**不看这张表，一律由规则包 `view.compose` 说了算。
+ */
+const SH03_TOOLS = toolsOf([
+  'select', 'create', 'fullscreen', 'area', 'measure', 'measureArea', 'draw', 'layers', 'clear', 'mode3d', 'reset',
+])
 
 /** 一行计量：名 + 值（值缺失显示"—"，**不补 0**）。 */
 function MetricRow({ m }: { m: Metric }) {
@@ -133,10 +148,12 @@ export function SituationScreen({ state, flow, onGo }: {
   onGo?: (id: string) => void
 }) {
   const snap = useVerbOnce(flow, 'situation.snapshot', {}, true)
-  const compose = useVerbOnce(flow, 'view.compose', { phase: state.phase || 'T0' }, true)
+  const compose = useVerbOnce(flow, 'view.compose', {}, true)
   // 资源概况取**资源台账**（需求专篇 SH-03 的"数据来源"第三条）。
   // `alloc.inventory` 自己会在台账不存在时初始化（宿主 ensureLedger，幂等），所以步 3 也能读。
   const inv = useVerbOnce(flow, 'alloc.inventory', {}, true)
+  // 工具可用性：一律以规则包 `view.compose` 的声明为准（VWC-TOOL-01/02）
+  const mt = useMapToolState(flow)
 
   const sit = readSituation(snap.data)
   const cmp = readCompose(compose.data)
@@ -203,70 +220,45 @@ export function SituationScreen({ state, flow, onGo }: {
         <MapStage phase={state.phase} />
       </div>
 
-      {/* ---------------- 顶部压条（盖住地图台的自证信息条）---------------- */}
-      <StageStrip
-        items={[
-          { k: '显示模式', v: cmp.modeName ?? cmp.modeKey ?? '—', color: C.accent },
-          { k: '阶段', v: state.phase || '—' },
-          { k: '任务态势', v: state.stepTitle },
-          { k: '区域', v: `${sit.areas.length}` },
-          { k: '目标', v: `${sit.targets.length}` },
-        ]}
-        right={<span style={{ color: snap.reply?.code === 0 ? C.ok : C.warn }}>
-          {snap.reply === null
-            ? '态势快照读取中…'
-            : snap.reply.code === 0
-              ? '态势快照已就绪（situation.snapshot）'
-              : `态势快照：${replyText(snap.reply)}`}
-        </span>}
+      {/* ---------------- 左上：地图浮动工具栏 ----------------
+           ★ 上一版这一排是**只读的 `<span>` 摆设**（点了没反应），而 map-2d 里量算/手绘/
+             图层面板/清屏/全屏**早就实现了**。现在统一走 `shell/MapTools`（真能点，
+             可用性由规则包 `view.compose` 说了算）。键位按参考图 T0-1：
+             选择 / 新建 / 全屏 / 区域 / 3D，另按 `view.compose` 的声明补 测距·测面·标绘·图层·清屏
+             （量算是用户明确点名要接的能力，见 README「本轮的已知偏差」）。 ---------------- */}
+      <MapToolbar
+        testid="sh03-toolbar"
+        items={SH03_TOOLS}
+        state={mt}
+        style={{ right: 328, left: 12, top: 12, width: 'auto' }}
       />
+      <ToolModeNote state={mt} items={SH03_TOOLS} style={{ left: 12, top: 66 }} />
 
-      {/* ---------------- 左上：地图浮动工具栏（画不画由 view.compose 说了算）---------------- */}
-      <div style={toolbarStyle}>
-        <div data-testid="compose-panel" style={{ ...panel, padding: '6px 10px' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <div data-testid="sh03-toolbar" style={{ display: 'flex', gap: 6, flexWrap: 'wrap', flex: 1, minWidth: 0 }}>
-              {cmp.tools.map((t) => (
-                <span
-                  key={t.key}
-                  data-testid="sh03-tool"
-                  data-tool-on={t.on ? '1' : '0'}
-                  title={t.on ? `可用（view.compose：${t.key}）` : `不可用：${t.reason ?? '宿主未给原因'}`}
-                  style={{
-                    fontSize: 11.5, padding: '3px 9px', borderRadius: 6, whiteSpace: 'nowrap',
-                    border: `1px solid ${t.on ? C.borderStrong : C.border}`,
-                    background: t.on ? 'rgba(29,78,216,.35)' : 'rgba(10,20,36,.6)',
-                    color: t.on ? C.text : C.unknown,
-                  }}
-                >{t.name}</span>
-              ))}
-              {!cmp.tools.length && <Missing text="工具栏未就绪（view.compose 未给出 tools）" />}
-            </div>
-            {/* 图上这里是「显示模式：综合态势 ⌄」下拉。可选值只有 view.compose 给的那一个，
-                所以做成**只读展示**，不编一份模式清单出来（G-06 的"其余按阶段启用"）。 */}
-            <span
-              data-testid="sh03-display-mode"
-              title="显示模式由 view.compose 给出（本期只有「综合态势」这一档可用，其余按阶段启用）"
-              style={{
-                fontSize: 11.5, color: C.accent, border: `1px solid ${C.border}`, borderRadius: 6,
-                padding: '3px 9px', whiteSpace: 'nowrap', flex: '0 0 auto',
-              }}
-            >显示模式：{cmp.modeName ?? cmp.modeKey ?? '—'} ⌄</span>
-          </div>
-          <div style={{ display: 'flex', gap: 14, marginTop: 5, fontSize: 11, color: C.textDim, flexWrap: 'wrap' }}>
-            {cmp.visibleGroups.length > 0 && <span>可见图层 {cmp.visibleGroups.join(' / ')}</span>}
-            {okTools.length > 0 && <span style={{ color: C.accentDim }}>可用 {okTools.length}</span>}
-            {offTools.length > 0 && (
-              <span style={{ color: C.unknown }} title={offTools.map((t) => `${t.name}：${t.reason ?? '未给原因'}`).join('；')}>
-                不可用 {offTools.length}（悬停看原因）
-              </span>
-            )}
-            {cmp.controls.length > 0 && <span>控件 {cmp.controls.map((c) => c.name).join('/')}</span>}
-            {!cmp.tools.length && !cmp.visibleGroups.length && compose.reply && compose.reply.code !== 0 && (
-              <span style={{ color: C.warn }}>view.compose → {replyText(compose.reply)}</span>
-            )}
-          </div>
-        </div>
+      {/* 显示模式（右上，图上的胶囊；取值只有 view.compose 给的那一档，不编模式清单） */}
+      <span
+        data-testid="sh03-display-mode"
+        title="显示模式由 view.compose 给出（本期只有「综合态势」这一档可用，其余按阶段启用）"
+        style={displayModePill}
+      >显示模式：{cmp.modeName ?? cmp.modeKey ?? '—'} ⌄</span>
+
+      {/* 视图声明（图层组 / 控件 / 工具可用性）：收进折叠块，产品界面不再被它占满 */}
+      <div style={composeDiagStyle}>
+        <DiagBox testid="compose-panel" title="视图声明（view.compose）">
+          <DiagLine k="显示模式" v={`${cmp.modeName ?? cmp.modeKey ?? '—'}（modeKey=${cmp.modeKey ?? '—'}）`} />
+          <DiagLine k="可见图层组" v={cmp.visibleGroups.length ? cmp.visibleGroups.join(' / ') : '—'} />
+          <DiagLine k="可用工具" v={okTools.length ? okTools.map((t) => `${t.name}(${t.key})`).join(' / ') : '—'} />
+          <DiagLine
+            warn={offTools.length > 0}
+            k="不可用工具"
+            v={offTools.length ? offTools.map((t) => `${t.name}(${t.key})：${t.reason ?? '规则包未给原因'}`).join('；') : '—'}
+          />
+          <DiagLine k="地图控件" v={cmp.controls.length ? cmp.controls.map((c) => c.name).join(' / ') : '—'} />
+          <DiagLine k="态势快照" v={snap.reply === null
+            ? '读取中…'
+            : snap.reply.code === 0 ? 'code=0（situation.snapshot）' : replyText(snap.reply)} />
+          {compose.reply && compose.reply.code !== 0 && <DiagLine warn k="view.compose" v={replyText(compose.reply)} />}
+          {!cmp.tools.length && <DiagLine warn k="工具" v="工具栏未就绪（view.compose 未给出 tools）" />}
+        </DiagBox>
       </div>
 
       {/* ---------------- 右栏：AI任务分析 / 任务信息 / 资源概况 ---------------- */}
@@ -491,18 +483,24 @@ function SituationProbe({ situationRaw, composeRaw, inventoryRaw, snapshotReply,
 }
 
 // ---- 样式（一律 left/right/bottom 长写：**不写 inset 简写**，见 App.tsx 的踩坑注释）----
-const toolbarStyle: CSSProperties = {
-  position: 'absolute', left: 12, right: 328, top: 34, zIndex: 20,
-}
+// 顶部压条已删（`MapStage` 的自证信息条不再出现在产品屏），所以各面板的 top 从 34 收到 12
 const rightColStyle: CSSProperties = {
-  position: 'absolute', right: 12, top: 34, bottom: 204, zIndex: 20, width: 300,
+  position: 'absolute', right: 12, top: 12, bottom: 216, zIndex: 20, width: 300,
   display: 'flex', flexDirection: 'column', gap: 8, overflowY: 'auto',
 }
 const bottomStyle: CSSProperties = {
-  position: 'absolute', left: 12, right: 12, bottom: 36, zIndex: 20, height: 158,
+  position: 'absolute', left: 12, right: 12, bottom: 56, zIndex: 20, height: 152,
+}
+const displayModePill: CSSProperties = {
+  position: 'absolute', right: 328, top: 12, zIndex: 22,
+  fontSize: 12, color: C.accent, border: `1px solid ${C.border}`, borderRadius: 8,
+  padding: '7px 12px', whiteSpace: 'nowrap', background: 'rgba(6,26,47,.86)',
+}
+const composeDiagStyle: CSSProperties = {
+  position: 'absolute', right: 328, top: 56, zIndex: 20, width: 320,
 }
 const noticeStyle: CSSProperties = {
-  position: 'absolute', left: 12, bottom: 200, zIndex: 24, maxWidth: 560,
+  position: 'absolute', left: 12, bottom: 216, zIndex: 24, maxWidth: 560,
   fontSize: 12, color: C.text, background: 'rgba(120,60,10,.94)',
   border: '1px solid rgba(245,158,11,.6)', borderRadius: 8, padding: '6px 10px', cursor: 'pointer',
 }

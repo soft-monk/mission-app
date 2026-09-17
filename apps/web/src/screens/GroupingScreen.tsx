@@ -1,4 +1,4 @@
-// mission-app · apps/web/src/screens/GroupingScreen.tsx
+﻿// mission-app · apps/web/src/screens/GroupingScreen.tsx
 //
 // **SH-05 · 集群编组界面（无人机分组与任务编组）**
 // （参考图 `需求图与描述\场景1\T1-1.png`，需求专篇 DES-APP-001 §3 SH-05）
@@ -155,7 +155,7 @@ export function GroupingScreen({ state, flow, onNext, onSelectPlan, onGo }: {
   const snap = useVerbOnce(flow, 'situation.snapshot', {}, true)
   const plans = useVerbOnce(flow, 'alloc.plans', { side: 'group', count: 3 }, true)
   const inv = useVerbOnce(flow, 'alloc.inventory', {}, true)
-  const compose = useVerbOnce(flow, 'view.compose', { phase: state.phase || 'T1' }, true)
+  const compose = useVerbOnce(flow, 'view.compose', {}, true)
 
   const sit = readSituation(snap.data)
   const pv = readPlans(plans.data, sit.groups)

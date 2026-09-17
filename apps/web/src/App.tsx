@@ -129,13 +129,13 @@ export function App() {
     go(sameStep ?? target.screens[0])
   }, [go, step])
 
-  // ---- 排障后门：直接看地图台 ----
+  // ---- 排障后门：直接看地图台（**保留开发自证信息条**，产品屏上没有它）----
   if (stageOverride === 'map') {
     return (
       <div style={{ position: 'absolute', inset: 0, background: C.bg, color: C.text }}>
         <TopBar linkOk />
         <div style={{ position: 'absolute', top: 42, left: 0, right: 0, bottom: 0 }}>
-          <MapStage phase="T4" />
+          <MapStage phase="T4" debug />
         </div>
       </div>
     )

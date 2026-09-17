@@ -166,6 +166,23 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\manual.ps1 goto 7
 | 「信号强度 / 带宽 / 时延 / 覆盖范围 / 跟踪稳定度 / 命中概率 / 偏差 / 回收进度」等 | SH-07/08/15/16/17 等 | 这些字段**全工程没有数据源** → 一律显示「—」并写明"引擎未给出该字段"，**不编数**（图上数值是示意值） |
 | 「自动优化」「快速脱离体系」等按钮 | SH-05/SH-06/SH-18 | 宿主没有对应 verb → **灰置 + title 写原因**，不假装能点 |
 | 时间轴段名：图上 `T+00…T+09` vs 引擎 `t0/到达/打击/评估` | SH-14 | 段名照图；时刻位先显示引擎真值段（§9-9 待裁决，屏上有口径说明行） |
+| 工具条上多一格「**测面**」（图上只有「测距」） | 所有带地图的屏 | 量算（M2-CTRL-10）在 map-2d 里是**测距 + 测面 + 方位角**三件；图上只画了"测距"一格。测面与测距**共用规则包的同一个 `measure` 工具**（同一份可用性），只是把模块已有的能力接出来，故多一格 |
+| 工具条上多一格「**复位**」（图上没有） | 所有带地图的屏 | 原先是浮在地图右下角的独立按钮 —— 实测**每一屏都被那一屏自己的面板压住**（`layout-check` 报 42/60 屏次点不到：右下角要么是"请选择任务场景"卡区，要么是右栏/底部浮层）。地图四个角在本应用里都被面板占了，唯一恒定空着的位置就是左上工具条，所以把它并进去 |
+| **不开**地图「缩放 ±」与「指北针 N」控件（图上都有） | 所有带地图的屏 | map-2d 把缩放按钮固定在**右上角**、指北针固定在它正下方（`map-2d/src/core/controls.ts` 的 `POSITION` 表与 `ui/Compass.tsx`，**宿主不可配**），而本应用每个地图屏的右上角都是右栏面板 —— 开了实测 48/60 屏次被面板遮挡。缩放用滚轮/双指/键盘 `+`/`-`（M2-CTRL-14）仍可用；指北针在本应用里也不承载信息（建图时 `dragRotate:false`，恒指正北）。**比例尺照常开启**（右下角，每屏实测可见："1 km"） |
+| 开发自证信息条只在 `?stage=map` 出现 | 地图台 | `mission-app｜通道｜/health｜engines` 那条是**开发者自证**，不该出现在交付界面上；产品屏一律不渲染它（`MapStage` 的 `debug` 属性） |
+| 「数据来源与诊断」「命令回执」默认**折叠** | 所有屏 | G-09 要求"每个数字都能找到出处、缺失要写明原因" —— 这些句子原先平铺在正文里，把界面撑成了"工程味"。改成折叠块后**内容仍在 DOM 里**（验收脚本照读），点开即见 |
+
+## 2.4 界面返工第二轮（2026-09-17，按用户反馈）
+
+用户报告四件事，逐条落点如下（自证脚本见 §六）：
+
+| 用户反馈 | 根因（实测） | 处置 |
+|---|---|---|
+| **卡在第三步，点不进下一阶段** | SH-04 右栏把两枚按钮放在**可滚动**容器里用 `marginTop:auto` 顶到底；视口高度 < ~950px 时（实测 **1366×768 / 1280×720**）按钮被挤出可视区 —— `getBoundingClientRect()` 仍返回坐标、`click-check` 的 `el.click()` 也仍能触发，但**真鼠标点在那个坐标上命中的是外层容器**，于是彻底卡死 | 右栏拆成「可滚动内容 + **钉在栏底的按钮区**」；按钮任何视口高度都在栏底。新增 `scripts\click-real.mjs`（**真鼠标** + 命中测试）把这一类问题钉死：修前 1280×720 只有 3/7，修后 **7/7** |
+| **排版很奇怪** | ① `MapStage` 的开发自证信息条裸露在所有地图屏顶部；② 各屏把"数值出处/缺失原因"平铺在正文；③ 底部状态条压住内容区的下边缘（`复位视角` 中心点命中的是 `bottom-status`，42/60 屏次点不到） | ① 信息条只在 `?stage=map` 渲染；② 出处与回执收进**折叠块**；③ `AppShell` 的 `CONTENT_INSET` 下边界抬到状态条之上。新增 `scripts\layout-check.mjs`（多视口 × 20 屏，按"视口外 / 被裁切 / 命中测试 / 面板交叠"四条判据审计）：**修前 51 条（2 视口）→ 修后 13 条（3 视口，其中 12 条只是"面板内滚动 37–69px"）** |
+| **左侧菜单栏连图标都没了** | 参考图（`场景1\T0-1.png`）与需求专篇 §3 都写着"左侧竖向 **7 项图标导航**"，上一版只渲染了文字 | 按参考图逐项补回图标（态势=准星环 / 任务=靶环 / 目标=取景框 / 区域=六边形 / 资源=节点图 / 告警=铃 / 设置=齿轮）；底部 6 段状态条同时改成图上那样的"图标 + 标签 + 值"小卡片 |
+| **量算等功能没接进来、也用不了** | map-2d 里量算/手绘/图层面板**早就实现了**（`DrawLayer`、M2-DRAW-08 / M2-CTRL-10），但：① 宿主从没渲染 `<DrawLayer/>`；② 各屏工具栏是**只读 `<span>` 摆设**；③ 规则包 `map2dImplemented` 只列了 4 个工具，把 `measure/area/create/draw` 收敛成 `disabled`（VWC-TOOL-02） | ① `MapStage` 挂上 `<DrawLayer/>` 并开启指北针/比例尺（`showControls` 此前从未调用过）；② 新增 `apps/web/src/shell/MapTools.tsx` **唯一接线点**，7 个屏的摆设工具栏全部换成它（真能点，可用性照规则包）；③ `view-composer/policies/mapapp/layerMapping.json` 的 `map2dImplemented` 按模块实际能力订正。自证：新增 `scripts\measure-check.mjs` —— 真鼠标点【测距】→ 地图落两点 → 双击结束，**实测 6.16 km / 方位角 113.7°**，7/7 通过 |
+
 
 # 三、像产品一样自由点：跳屏 / 重来 / 容错
 
@@ -311,6 +328,19 @@ node scripts\p6-check.mjs    http://127.0.0.1:8099/   # 步 10–11 执行 + 总
 node scripts\p7-check.mjs    http://127.0.0.1:8099/   # 一键串联 + 倍速 + 可重跑      33/33
 node scripts\click-check.mjs http://127.0.0.1:8099/   # **手点通路（20 屏）**：只用界面按钮从 SH-01 点到 SH-18
                                                       #  32 条断言（含每步落屏与阶段 T0→…→T7）—— 实测 32/32
+node scripts\click-real.mjs  http://127.0.0.1:8099/ 1280 720
+node scripts\click-real.mjs  http://127.0.0.1:8099/ 1366 768
+node scripts\click-real.mjs  http://127.0.0.1:8099/ 1920 1080
+                                                      # **真鼠标手点通路**（CDP Input + elementFromPoint 命中测试）：
+                                                      #  `click-check` 用 `el.click()`（JS 合成，绕过遮挡），
+                                                      #  所以"脚本点得通、人点不通"它看不见 —— 这一条专门抓那个。
+                                                      #  三种视口都必须 7/7
+node scripts\layout-check.mjs http://127.0.0.1:8099/  # **排版与可点性审计**：3 视口 × 20 屏，
+                                                      #  按"视口外 / 被裁切 / 命中测试 / 面板交叠"四条判据列问题
+                                                      #  （可加 `--viewports 1536x1024,1366x768`、`--screens SH-03,SH-04` 缩小范围）
+node scripts\measure-check.mjs http://127.0.0.1:8099/ 1536 1024 SH-03
+                                                      # **量算真机自证**：真鼠标点【测距】→ 地图落两点 → 双击结束，
+                                                      #  读 map-2d 的 `getMeasurement()`（长度 / 方位角），7/7
 node scripts\screenshots.mjs http://127.0.0.1:8099/ --drive   # **20 屏截图**（1536×1024）→ docs/screens/screens/
 node scripts\render-check-map.mjs                     # 前端自带受控 WS 服务端，只验渲染
 pwsh -File scripts\acceptance.ps1                     # 结构守卫 + 构建 + 端点（含 BOM 校验）
@@ -323,7 +353,10 @@ pwsh -File scripts\acceptance.ps1                     # 结构守卫 + 构建 + 
 **写新脚本请照抄这几条纪律**（都踩过）：断言里**打印实测原值**而不是"应为"；
 **拿不到的数据一律留空 + 点名原因**，MUST NOT 编数值、MUST NOT 显示成 0；
 WS 采集器**先建连接再发 HTTP**（Node 的 WebSocket 与 fetch 共用 dispatcher）且**自己发心跳保活**（hub 4.5 s 判死）；
-截图前 `Emulation.setDeviceMetricsOverride(1280x800)`。
+截图前 `Emulation.setDeviceMetricsOverride(1280x800)`；
+**CDP 的 page target 必须先 `Page.bringToFront`** —— 后台 tab 的 `requestAnimationFrame` 会被节流到几乎不触发，
+而 MapLibre v4 的样式/数据源装载走的就是 rAF 调度，表现为"地图容器在、canvas 在，但 `getStyle().sources` 为空、
+连一个地图事件都不发"（实测不加这一句约 3/4 概率复现）。本仓所有 CDP 脚本都已带上这一句。
 
 ---
 

@@ -57,42 +57,73 @@ export interface VerdictRow {
   okNote?: string
 }
 
-export function VerbVerdict({ rows, title = '命令回执' }: { rows: VerdictRow[]; title?: string }) {
+/**
+ * 「命令回执」默认**折叠**。
+ *
+ * ★ 2026-09-17 返工（用户："最基础的排版，为什么排版很奇怪"）：
+ *   这一块此前是**常展开**的三行（verb 名 + code + 原因 + 重试按钮），每个地图屏的右栏
+ *   都摊着它。它属于**诊断信息**，却占掉了右栏本来就不多的高度 —— 实测在 1280×720/1366×768
+ *   下，它把右栏内容顶出可视区（`scripts/layout-check.mjs` 报 23 处"重试按钮在视口外"）。
+ *   改成折叠后只占一行；**内容仍在 DOM 里**（验收脚本照样读得到），点开就能看每条 verb 的原话。
+ *   标题右侧始终保留一个**一眼可见的汇总**：有几条失败 —— 不把问题藏起来。
+ */
+export function VerbVerdict({ rows, title = '命令回执', defaultOpen = false }: {
+  rows: VerdictRow[]
+  title?: string
+  defaultOpen?: boolean
+}) {
+  const failed = rows.filter((r) => r.reply && r.reply.code !== 0).length
+  const pending = rows.filter((r) => !r.reply || r.busy).length
   return (
-    <div style={{
-      border: `1px solid ${C.border}`, borderRadius: 8, background: 'rgba(10,32,58,.55)',
-      padding: '8px 10px',
-    }}>
-      <div style={{ fontSize: 12, color: C.textDim, marginBottom: 4 }}>{title}</div>
-      {rows.map((r) => {
-        const code = r.reply?.code
-        const ni = notImplemented(r.reply)
-        return (
-          <div key={r.verb} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '3px 0' }}>
-            <span style={{ width: 8, height: 8, borderRadius: '50%', flex: '0 0 auto', background: replyColor(r.reply) }} />
-            <span style={{ fontSize: 11.5, color: C.text, fontFamily: 'ui-monospace, Consolas, monospace' }}>
-              {r.verb}
-            </span>
-            <span style={{ flex: 1, minWidth: 0, fontSize: 11.5, color: replyColor(r.reply), overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
-              title={reasonOf(r.reply)}>
-              {r.busy
-                ? '发送中…'
-                : !r.reply
-                  ? '未发送'
-                  : r.reply.code === 0
-                    ? (r.okNote ?? label(0))
-                    : `code=${code} ${label(code as number)}：${reasonOf(r.reply)}`}
-            </span>
-            {r.onRetry && (
-              <button onClick={r.onRetry} disabled={r.busy} style={{
-                padding: '1px 8px', fontSize: 11, cursor: r.busy ? 'default' : 'pointer', borderRadius: 5,
-                background: 'rgba(10,20,36,.7)', border: `1px solid ${C.border}`, color: C.text,
-              }}>重试</button>
-            )}
-          </div>
-        )
-      })}
-    </div>
+    <details
+      data-testid="verb-verdict"
+      data-verdict-failed={String(failed)}
+      open={defaultOpen}
+      style={{
+        border: `1px solid ${C.border}`, borderRadius: 8, background: 'rgba(10,32,58,.55)',
+        fontSize: 11.5,
+      }}
+    >
+      <summary style={{ cursor: 'pointer', padding: '5px 10px', display: 'flex', alignItems: 'center', gap: 8, listStyle: 'none', userSelect: 'none' }}>
+        <span style={{ color: C.textDim }}>ⓘ {title}</span>
+        <span style={{
+          color: failed ? C.bad : (pending ? C.warn : C.ok),
+        }}>
+          {failed ? `${failed} 条失败` : pending ? `${pending} 条未回` : '全部成功'}
+        </span>
+        <span style={{ flex: 1 }} />
+        <span style={{ color: C.unknown }}>点开看每条原话</span>
+      </summary>
+      <div style={{ padding: '2px 10px 8px', borderTop: `1px solid ${C.border}` }}>
+        {rows.map((r) => {
+          const code = r.reply?.code
+          return (
+            <div key={r.verb} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '3px 0' }}>
+              <span style={{ width: 8, height: 8, borderRadius: '50%', flex: '0 0 auto', background: replyColor(r.reply) }} />
+              <span style={{ fontSize: 11.5, color: C.text, fontFamily: 'ui-monospace, Consolas, monospace' }}>
+                {r.verb}
+              </span>
+              <span style={{ flex: 1, minWidth: 0, fontSize: 11.5, color: replyColor(r.reply), overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                title={reasonOf(r.reply)}>
+                {r.busy
+                  ? '发送中…'
+                  : !r.reply
+                    ? '未发送'
+                    : r.reply.code === 0
+                      ? (r.okNote ?? label(0))
+                      : `code=${code} ${label(code as number)}：${reasonOf(r.reply)}`}
+              </span>
+              {r.onRetry && (
+                <button onClick={r.onRetry} disabled={r.busy} style={{
+                  padding: '1px 8px', fontSize: 11, cursor: r.busy ? 'default' : 'pointer', borderRadius: 5,
+                  background: 'rgba(10,20,36,.7)', border: `1px solid ${C.border}`, color: C.text,
+                }}>重试</button>
+              )}
+            </div>
+          )
+        })}
+      </div>
+    </details>
   )
 }
 
