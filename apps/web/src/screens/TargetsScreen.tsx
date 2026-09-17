@@ -26,6 +26,7 @@ import {
 } from '../flow/useOps'
 import { MediaPanel } from '../components/MediaPanel'
 import { VerbVerdict } from './VerbVerdict'
+import { AdvanceButton } from './AdvanceButton'
 import { StageStrip } from './StageOverlay'
 
 /** 契约冻结的三个动作（`targets.act{action}`）。**仅当引擎没给清单时**用来占位显示（灰置）。 */
@@ -445,6 +446,11 @@ export function TargetsScreen({ state, flow }: {
             )}
           </div>
         </div>
+        {/* 步 7 → 步 8（打击准备）：本屏原来**没有前进入口**（只能靠宿主推步），
+            手点流程会卡在这里。现在用同一个 AdvanceButton 发 `mission.advance{to:"T5"}`（阶段 T5 → 步 8）。 */}
+        <div style={{ display: 'flex', alignItems: 'center', paddingRight: 4 }}>
+          <AdvanceButton flow={flow} to="T5" label="进入打击准备 ≫" style={primaryBtn} />
+        </div>
       </div>
 
       <TargetsProbe
@@ -587,6 +593,10 @@ const actGhost: CSSProperties = {
 const actDisabled: CSSProperties = {
   padding: '8px 12px', fontSize: 12.5, cursor: 'default', borderRadius: 7,
   border: `1px solid ${C.border}`, background: 'rgba(10,20,36,.5)', color: C.unknown,
+}
+const primaryBtn: CSSProperties = {
+  padding: '8px 14px', fontSize: 12.5, cursor: 'pointer', borderRadius: 7,
+  border: `1px solid ${C.borderStrong}`, background: 'rgba(29,78,216,.5)', color: C.text,
 }
 
 export default TargetsScreen

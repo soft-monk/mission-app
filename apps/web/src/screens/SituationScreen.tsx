@@ -22,6 +22,7 @@ import {
   useVerbOnce, type Metric,
 } from '../flow/useSituation'
 import { VerbVerdict } from './VerbVerdict'
+import { AdvanceButton } from './AdvanceButton'
 import { StageStrip } from './StageOverlay'
 
 /** 一行计量：名 + 值（值缺失显示"—"，**不补 0**）。 */
@@ -57,11 +58,9 @@ function Section({ title, children, testid }: { title: string; children: React.R
   )
 }
 
-export function SituationScreen({ state, flow, onNext }: {
+export function SituationScreen({ state, flow }: {
   state: FlowState
   flow: UseFlow
-  /** 「确认场景，进入编组」——切步由宿主说了算（`flow.goto`），前端不自己改 step */
-  onNext: () => void
 }) {
   const snap = useVerbOnce(flow, 'situation.snapshot', {}, true)
   const compose = useVerbOnce(flow, 'view.compose', { phase: state.phase || 'T0' }, true)
@@ -253,7 +252,8 @@ export function SituationScreen({ state, flow, onNext }: {
             目标 {sit.targets.length} 个 · 集群 {sit.groups.length} 个
           </div>
           <div style={{ flex: 1 }} />
-          <button data-testid="btn-confirm-scene" style={primaryBtn} onClick={onNext}>确认场景，进入编组 ≫</button>
+          {/* 切步归宿主：这里发 `mission.advance{to:"T1"}`（阶段 T1 → 步 4），不再直接 flow.goto */}
+          <AdvanceButton flow={flow} to="T1" label="确认场景，进入编组 ≫" style={primaryBtn} testId="btn-confirm-scene" />
           <button style={ghostBtn} onClick={snap.resend} disabled={snap.busy}>刷新态势快照</button>
         </div>
       </div>

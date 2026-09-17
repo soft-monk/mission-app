@@ -32,6 +32,7 @@ import {
   TIMELINE_ORDER, type GuidanceView, type TimelineSeg,
 } from '../flow/useStrike'
 import { VerbVerdict } from './VerbVerdict'
+import { AdvanceButton } from './AdvanceButton'
 import { StageStrip } from './StageOverlay'
 
 // 图元 id 前缀：**只用来认领本屏画的东西**（清理与计数都靠它；MapStage 的图元一个都不碰）
@@ -627,6 +628,11 @@ export function StrikeConfirmScreen({ state, flow, selectedPlanId, onSelectPlan,
           disabled={busy || !plan}
           onClick={() => void onConfirm()}
         >{busy ? '确认中…' : confirmedOk ? '重新确认打击' : '确认打击'}</button>
+        {/* 步 9 → 步 10：**确认打击之后**才给这个入口。它发 `mission.advance{to:"T6"}`（阶段 T6 → 步 10）；
+            步 10 的"执行处置"（exec.run）成功后宿主也会把阶段推到 T6/步 10 —— 两条路都能到，不冲突。 */}
+        {confirmedOk && (
+          <AdvanceButton flow={flow} to="T6" label="进入协同执行 ≫" style={primaryBtn} />
+        )}
       </div>
 
       {/* 方案切换：改 planId 会重发 `guidance.plan`（几何与时间轴随之重取） */}

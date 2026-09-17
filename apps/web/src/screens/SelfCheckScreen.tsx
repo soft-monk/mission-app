@@ -115,9 +115,18 @@ export function SelfCheckScreen({ state, onRun, onRecheck, onEnter, busy, reply 
             {done && (
               <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12, marginTop: 16 }}>
                 <button onClick={onRecheck} disabled={busy} style={ghostBtn(busy)}>重新检测</button>
-                <button onClick={onEnter} disabled={busy || !allNormal} style={enterBtn(busy || !allNormal)}>
-                  进入任务 ≫
+                {/* ★ 有一项红也**不拦**：自检是"如实体检"，不是"准入闸门" —— 真实环境里
+                    "通信链路"这类项本来就可能是红的（没有实装数传），拦在这里会让流程根本走不下去。
+                    异常项照旧原样显示（红点 + 原因 + 建议），按钮文字改成"仍要进入任务"以示区别。 */}
+                <button onClick={onEnter} disabled={busy} style={enterBtn(busy)}>
+                  {allNormal ? '进入任务 ≫' : '仍要进入任务 ≫'}
                 </button>
+              </div>
+            )}
+            {done && !allNormal && (
+              <div style={{ marginTop: 10, fontSize: 12, color: C.warn }}>
+                存在未通过项（{(state.selfCheck?.items ?? []).filter((i) => i.status !== 'normal' && i.status !== 'ok').length} 项）：
+                自检结论会原样留在本屏与总结报告里；需要复检时点【重新检测】。
               </div>
             )}
             {reply && reply.code !== 0 && (
@@ -131,7 +140,7 @@ export function SelfCheckScreen({ state, onRun, onRecheck, onEnter, busy, reply 
         <StatusPanel items={state.systemOverview} title="系统状态概览" loading={!state.selfCheckReady} />
       </div>
       <HintBar text={done
-        ? (allNormal ? '自检通过：可以进入任务' : '存在未通过项：请查看详情与处置建议后重新检测')
+        ? (allNormal ? '自检通过：可以进入任务' : '存在未通过项：可先看详情与处置建议，也可以直接进入任务（自检结论会带进报告）')
         : '点【一键自检】开始逐项检测'} />
     </div>
   )

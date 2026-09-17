@@ -27,6 +27,7 @@ import {
   type SimView, type SensorView, type TopologyView,
 } from '../flow/useOps'
 import { VerbVerdict } from './VerbVerdict'
+import { AdvanceButton } from './AdvanceButton'
 import { StageStrip } from './StageOverlay'
 
 /** 一行「名 + 值」：值缺失显示"—"，**不补 0**。 */
@@ -395,9 +396,9 @@ export function ExecuteScreen({ state, flow }: {
         <button data-testid="btn-link-optimize" style={ghostBtn} disabled={topo.busy} onClick={topo.resend}>
           {topo.busy ? '评估中…' : '自动优化链路'}
         </button>
-        <button data-testid="btn-enter-recon" style={primaryBtn} onClick={() => void flow.send('flow.goto', { step: 7 })}>
-          进入侦察阶段 ≫
-        </button>
+        {/* 步 6 → 步 7：阶段图里 T2 的 next 是 T3、T3 的 next 才是 T4，所以**按链依次推进**。
+            中间那段（T3 组网规划）与步 6 是同一屏，界面不另开屏 —— 这也是规则包的事实。 */}
+        <AdvanceButton flow={flow} to="T4" via={['T3', 'T4']} label="进入侦察阶段 ≫" style={primaryBtn} testId="btn-enter-recon" />
       </div>
 
       <ExecuteProbe

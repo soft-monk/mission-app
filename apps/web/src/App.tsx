@@ -143,7 +143,7 @@ export function App() {
             第 6 步起由 C/D 两组写者的屏幕接管这一层。 */}
         {step === 3 && (
           <StageOverlay>
-            <SituationScreen state={state} flow={flow} onNext={() => goto(4)} />
+            <SituationScreen state={state} flow={flow} />
           </StageOverlay>
         )}
         {step === 4 && (

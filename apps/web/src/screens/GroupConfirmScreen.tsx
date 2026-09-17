@@ -27,6 +27,7 @@ import {
   type GroupView, type PlanView,
 } from '../flow/useSituation'
 import { VerbVerdict } from './VerbVerdict'
+import { AdvanceButton } from './AdvanceButton'
 import { StageStrip } from './StageOverlay'
 
 function MixInline({ mix }: { mix: GroupView['mix'] }) {
@@ -352,7 +353,8 @@ export function GroupConfirmScreen({ state, flow, selectedPlanId, onPickPlan }: 
 
         {assignOk && entityFail === 0 && (
           <div style={{ ...panel, padding: '7px 12px', fontSize: 12, color: C.ok, lineHeight: 1.7 }}>
-            编组已下达。步 6（任务执行）由宿主推进——本屏不自己改 step。
+            编组已下达。下一步点右下角【进入任务执行 ≫】—— 它发 <code>mission.advance&#123;to:"T2"&#125;</code>，
+            由宿主把阶段推到 T2、步号落到 6，并自动起飞（前端不自己改 step）。
           </div>
         )}
       </div>
@@ -370,6 +372,11 @@ export function GroupConfirmScreen({ state, flow, selectedPlanId, onPickPlan }: 
           {busy ? '下达中…' : confirmed ? '重新确认编组' : '确认编组'}
         </button>
         <button style={ghostBtn} disabled title="自动优化：宿主尚未提供该 verb">自动优化</button>
+        {/* 步 5 → 步 6：**只有下发成功（实体真的建成）之后**才给这个入口 —— 前置没满足就推进，
+            阶段门禁会挡（回执照抄），但那是错的操作顺序，界面不该先把人引到那儿去。 */}
+        {assignOk && (
+          <AdvanceButton flow={flow} to="T2" label="进入任务执行 ≫" style={primaryBtn(true)} />
+        )}
       </div>
 
       <GroupConfirmProbe

@@ -31,6 +31,7 @@ import { dynamicStateName, isStruckState, readExecReceipt, readTargetState, targ
 import { readTargets, type TargetRow } from '../flow/useOps'
 import { MediaPanel } from '../components/MediaPanel'
 import { VerbVerdict } from './VerbVerdict'
+import { AdvanceButton } from './AdvanceButton'
 import { StageStrip } from './StageOverlay'
 
 /** 本屏画的图元 id 前缀（清理与计数只认它；MapStage 的图元一个都不碰）。 */
@@ -640,6 +641,9 @@ export function GuidanceScreen({ state, flow, onNext }: {
         {onNext && (
           <button data-testid="p6-btn-next" style={ghostBtn} onClick={onNext}>下一步：任务总结</button>
         )}
+        {/* 步 10 → 步 11：**阶段推进**走引擎门禁（`mission.advance{to:"T7"}` → 步 11）。
+            与上面的 `onNext`（纯切屏）并存：切屏负责"让你看到那一屏"，推进负责"报告里的阶段对得上"。 */}
+        <AdvanceButton flow={flow} to="T7" label="推进阶段并进入总结 ≫" style={primaryBtn} />
         {lastRun && !lastRun.busy && lastRun.reply && lastRun.reply.code !== 0 && (
           <span data-testid="p6-run-verdict" style={{ fontSize: 11.5, color: C.bad, maxWidth: 420, lineHeight: 1.5 }}>
             {V_RUN} → {replyText(lastRun.reply)}
