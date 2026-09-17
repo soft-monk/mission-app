@@ -1,42 +1,91 @@
 # mission-app · 智能任务管理系统（场景一：敏捷拒止布控）
 
-> **这份文档是给"坐在电脑前点界面的人"写的**：起一条命令，剩下的全在浏览器里点。
-> 11 屏每一步都写清了 **屏上有什么 → 你点哪里 → 点完看到什么 → 想反悔怎么办**。
+> **这份文档是给"坐在电脑前点界面的人"写的**：起一条命令（§1.0 一分钟版），剩下的全在浏览器里点。
+> **20 屏**每一步都写清了 **屏上有什么 → 你点哪里 → 点完看到什么 → 想反悔怎么办**。
 >
-> 现状：P0–P7 全部完成，七个阶段各有真机验收脚本，一轮跑完 **261 条断言全绿**（见 §六）。
+> 现状：P0–P7 全部完成，七个阶段各有真机验收脚本，一轮跑完 **261 条断言全绿**（见 §六）；
+> 界面已按参考图返工两轮（2026-09-17），**20 屏真机截图**在 `docs/screens/screens/`；
+> 除逐阶段脚本外另有四条**界面级**自证：手点通路 `click-check`、**真鼠标**手点通路 `click-real`、
+> 排版与可点性审计 `layout-check`、量算真机 `measure-check`（都在 §六）。
 > 手点全流程已在真机跑通（本文的按钮文字与可见结果都是**实测**，不是设计稿）。
 
 ---
 
 # 一、先跑起来（手点模式 = 一条命令 + 一个页面）
 
-## 1.1 起服务（二选一）
-
-**A. 后台跑（第一次用推荐）**——在 `mission-app` 目录下：
+## 1.0 一分钟版（复制这四段就能用）
 
 ```powershell
 cd D:\dsh_workpath\webMap\mission-app
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\demo.ps1 serve
+
+# ① 重建前端产物 —— 【可选】只在「第一次」或「刚改过 apps/web 源码」时跑（约 5 秒）
+#    首次还要先建 C++ 宿主，见 §1.1-C
+cd apps\web ; npm run build ; cd ..\..
+
+# ② 起宿主（后台；-NoBuild = 跳过 C++ 构建，秒起）
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\demo.ps1 serve -NoBuild
+
+# ③ 打开页面
+start http://127.0.0.1:8099/
+
+# ④ 收工：优雅停（先 flush 留存层，再按装配逆序停模块）
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\demo.ps1 stop
 ```
 
-它会打印三行，看到就成功了：
+> **下面这几条是新手最容易踩的**，每条都对应一个 `demo.ps1` 的真实行为：
+> · 所有动作（`serve` / `status` / `runAll` / `stop`）都认 **`-Port`** —— 用 `-Port 8100` 起的实例，
+>   必须用 **`-Port 8100`** 去停/看状态，否则脚本找的是默认的 8099；
+> · `serve` 在**已经有一个实例**时不会重复起，只打印一行 `已经有实例在 … 上跑着（先 stop）`；
+> · 想**同时跑第二个实例**必须错开 UDP 接入端口：`serve -Port 8100 -IngestPort 45501`
+>   （两条实例都绑 45500 的话，Windows 只把报文投给先绑定的那条，后起的那条 `packets=0`）；
+> · **改了前端就必须重建 `dist`**，否则页面还是旧界面（`dist` 不入库，宿主托管的是它）。
+
+## 1.1 起服务（后台 / 前台二选一）
+
+### A. 后台跑（推荐；`demo.ps1` 一把梭）
+
+在 `mission-app` 目录下：
+
+```powershell
+cd D:\dsh_workpath\webMap\mission-app
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\demo.ps1 serve -NoBuild
+```
+
+它会打印**四行**，看到就成功了（下面是实测原文）：
 
 ```
 [demo] 已就绪：http://127.0.0.1:8099/   （排障后门 http://127.0.0.1:8099/?stage=map）
 [demo] 引擎就绪：selfCheckReady=True  step=1  phase=''
 [demo] 日志：D:\dsh_workpath\webMap\mission-app\scripts\.demo-host.out.log
+[demo] 下一步：powershell -NoProfile -ExecutionPolicy Bypass -File scripts\demo.ps1 runAll    （或直接在浏览器里点）
 ```
 
-（`serve` 默认会先构建；已经有产物时加 `-NoBuild` 起得更快：`... demo.ps1 serve -NoBuild`）
+- **去掉 `-NoBuild`** 就会先跑一次 `cmake --build`（默认行为；只有改了 C++ 才需要，慢）。
+- 已经有实例在跑时不会再起，只打印：`[demo] 已经有实例在 http://127.0.0.1:8099 上跑着（先 stop）`。
+- 宿主自己的日志落盘在 `scripts\.demo-host.out.log`（脚本**不**用重定向起进程 ——
+  Windows PowerShell 5.1 的 `Start-Process -RedirectStandardOutput` 会等到子进程退出，用它起长跑进程会卡住）。
+- **`?stage=map`** 是排障后门：跳过启动/自检直接进地图台，**并且保留开发自证信息条**
+  （`mission-app｜通道｜/health｜engines`）。产品屏（SH-01…SH-20）上**没有**那条信息条 —— 这是 2026-09-17 返工的结果。
 
-**B. 前台跑（想看滚动的日志）**：
+### B. 前台跑（想在本终端看滚动日志）
 
 ```powershell
+cd D:\dsh_workpath\webMap\mission-app
 .\build\bin\Release\mission_host.exe --speed 8 --port 8099
-# 退出：Ctrl+C（走正常退出序列）；日志直接打在终端里
+# 退出：Ctrl+C（走正常退出序列，见 §1.4）；日志直接打在终端里
+# 常用可选参数：--log <文件> 把日志同时落盘；--config <json> 换一份配置（并行实例时改 UDP 端口用）
 ```
 
-**只有第一次需要先构建**（0 error 才算过）—— 一次性把 C++ 与前端产物都建出来：
+### C. 什么时候必须**先构建**
+
+| 你改了什么 | 要跑什么 | 忘了会怎样 |
+|---|---|---|
+| **没改**（只是手点演示） | 什么都不用跑，直接 `serve -NoBuild` | —— |
+| **前端**（`apps/web/src/**`、`apps/web/index.html`） | `cd apps\web; npm run build` | 页面打得开但**还是旧界面**（宿主托管的 `dist` 没变）。**本轮界面返工后必须重建一次** |
+| **C++ 宿主 / 模块引用 / `config.json`** | `demo.ps1 serve`（去掉 `-NoBuild`） | 跑的还是旧二进制 |
+| **模块仓的规则包 JSON**（例：`view-composer/policies/mapapp/*.json`） | **重启宿主**（规则包是运行时读的，不必重编） | 界面按旧规则包灰置工具。实测：本轮订正 `map2dImplemented` 后重启宿主，`measure` 就从 `disabled` 变成 `enabled` |
+
+一次性把两类产物都建出来（新机器 / 换机器）：
 
 ```powershell
 # ① C++ 宿主（需要 VS 2022 + vcpkg 依赖树；路径按你机器上的实际位置改）
@@ -53,6 +102,26 @@ cd ..\..
 
 > 忘了 ② 会怎样：`http://127.0.0.1:8099/` 打得开服务但页面是空的（`/` 找不到 `dist/index.html`）。
 > `scripts\acceptance.ps1` 里的 **F2/F3** 就是盯这件事的（它会自己跑 `npm run build`）。
+
+### D. `demo.ps1` 全部动作与参数
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\demo.ps1 <动作> [参数]
+```
+
+| 动作 | 干什么 | 实测输出 |
+|---|---|---|
+| `serve` | 后台起宿主并等它就绪（默认会先构建；`-NoBuild` 跳过） | 上面那四行 |
+| `status` | 看步/阶段/任务/仿真/自检/实时连接数 | `[demo] 步 1/11（boot）· 阶段 '' · 任务` + 仿真/自检/实时连接数，共四行 |
+| `runAll` | 一键把 11 步跑完（内部 `sim.reset` → `mission.reset` → `flow.runAll`，逐步打印 code 与耗时） | 每步一行，例如 `[demo]   ✓ 步  3  flow.enter             code=0         1 ms`；末尾一行 `汇总：ok=True failedStep=(无) 总耗时 … ms 倍速 8x` |
+| `stop` | **优雅停**：`POST /shutdown`，等它自己退出 | 见 §1.4 |
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `-Port <int>` | `8099` | 监听端口。**`status` / `stop` / `runAll` 也认它** —— 换了端口就要一起换 |
+| `-Speed <1\|8\|60>` | `8` | 仿真倍速（`runAll` 用它跑；`serve` 用它起） |
+| `-IngestPort <int>` | 不动（`config.json` 里 `ingest.points[0].port` = **45500**） | 覆盖 UDP 接入点端口；**并行第二个实例时必须错开**（例 `-IngestPort 45501`） |
+| `-NoBuild` | 关 | 跳过 `cmake --build`（只有 `serve` 用得上） |
 
 ## 1.2 打开页面
 
@@ -75,25 +144,49 @@ http://127.0.0.1:8099/
 2. **每一步都要你确认才往前走**。除了"启动加载完成 → 自动进自检"，其余各屏之间的推进都由你点按钮。
 3. **灰按钮 = 前置没满足**，不是坏了。本手册逐屏写了"什么时候是灰的"，以及怎么把它点亮。
 
-## 1.4 停止
+## 1.4 停止（怎么停才算"干净"）
 
 | 场景 | 命令 | 说明 |
 |---|---|---|
-| 后台跑 | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\demo.ps1 stop` | 发 `POST /shutdown`，走**正常退出序列** |
-| 前台跑 | 在那个终端按 **Ctrl+C** | 同上：先 flush 留存层，再按装配逆序停模块 |
-| 看状态（后台跑时） | `... scripts\demo.ps1 status` | 步/阶段/任务/仿真读数 |
+| **后台跑**（`demo.ps1 serve` 起的） | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\demo.ps1 stop` | 发 `POST /shutdown`，走**正常退出序列**；脚本会等它真的退出再返回 |
+| **换了端口**的实例 | 上面那条加 `-Port 8100` | 不加就是去停 8099 的那条（很可能压根没在跑） |
+| **前台跑**（自己敲 exe 起的） | 在**那个终端**按 **Ctrl+C** | 同上：先 flush 留存层，再按装配逆序停模块 |
+| 只想看一眼状态 | `... scripts\demo.ps1 status` | 步/阶段/任务/仿真读数/自检/实时连接数 |
+| 已经停了又敲一次 stop | —— | 只打印 `[demo] http://127.0.0.1:8099 上没有实例在跑`（不是错误） |
 
-**正常退出的日志长这样**（看到 `exit clean` 才算干净）：
+`stop` 的实测输出（两行）：
+
+```
+[demo] 请求优雅停（先 flush 留存层，再按装配逆序停模块）…
+[demo] 已停（正常退出序列）
+```
+
+**正常退出序列**在宿主日志（`scripts\.demo-host.out.log`）尾部长这样——看到 **`exit clean`** 才算干净：
 
 ```
 [host] 退出中…
-[host] flush telemetry-store：缓冲 0 条 → 已落盘 0 条
+[host] flush telemetry-store：缓冲 0 条 → 已落盘 0 条（appended=0, buffered=0, flushes=0）
+[host] telemetry-store flushed
 [host] engines stopped (reverse order)
 [host] hub stopped
 [host] exit clean
 ```
 
-> 卡住了要强停：`Get-Process mission_host | Stop-Process -Force`（**留存层不会 flush**，万不得已才用）。
+**停完之后怎么确认真的停干净了**（两条都返回空就是干净）：
+
+```powershell
+Get-NetTCPConnection -LocalPort 8099 -State Listen -ErrorAction SilentlyContinue   # 还有没有人在监听
+Get-Process mission_host -ErrorAction SilentlyContinue                            # 还有没有残留进程
+```
+
+**卡住了要强停**（万不得已；**留存层不会 flush**）：
+
+```powershell
+Get-Process mission_host | Stop-Process -Force
+```
+
+> 前台跑时敲了 `demo.ps1 stop` 会怎样：`POST /shutdown` 一样能让它退出，脚本正常打印"已停"。
+> 只有当它连 HTTP 都不响应时，脚本才会提示 `还没停：它可能是前台跑的，去那个终端按 Ctrl+C`。
 
 ---
 
@@ -388,10 +481,22 @@ WS 采集器**先建连接再发 HTTP**（Node 的 WebSocket 与 fetch 共用 di
 
 **8) 端口被占 / 上次没停干净**
 
+先按 §1.4 的"停完之后怎么确认"两条查一遍；确实是残留进程才硬停：
+
 ```powershell
-Get-NetTCPConnection -LocalPort 8099 -State Listen | Select OwningProcess
-Get-Process mission_host | Stop-Process -Force     # 硬停（不 flush，万不得已）
+Get-NetTCPConnection -LocalPort 8099 -State Listen -ErrorAction SilentlyContinue   # 谁在监听
+Get-Process mission_host | Stop-Process -Force     # 硬停（不 flush 留存层，万不得已）
 ```
+
+> 换个端口再起也行：`demo.ps1 serve -Port 8100 -NoBuild`（记得 `stop` / `status` 也要带 `-Port 8100`）。
+
+**9) 敲了 `serve` 却说"已经有实例在 … 上跑着"**
+→ 那是**预期行为**（不会重复起第二个）。要么先 `stop`，要么就想跑两个实例：
+`serve -Port 8100 -IngestPort 45501`（**必须错开 UDP 接入端口**，否则后起的那条 `packets=0`）。
+
+**10) 改了界面但页面没变**
+→ 前端产物没重建。`cd apps\web; npm run build`，然后**刷新页面**（`dist` 不入库，宿主托管的是它）。
+对照检查：`dist\assets\*.js` 的修改时间应该**晚于** `apps\web\src` 里最新的文件。
 
 ---
 
