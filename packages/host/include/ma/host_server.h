@@ -44,6 +44,12 @@ struct WsCallbacks {
     std::function<nlohmann::json()> state;
     /// `GET /health`：selfcheck 的聚合负载（六字段）。未接时回落最小合法负载。
     std::function<nlohmann::json()> health;
+    /// `POST /shutdown`：请求走**正常退出序列**（先 flush 留存层，再按装配逆序停模块）。
+    ///
+    /// 为什么需要它：前台跑时 Ctrl+C 就够；但演示/验收常把宿主**后台**起起来，
+    /// 后台进程收不到 Ctrl+C，而 `Stop-Process` 等于硬杀（留存层不 flush）。
+    /// 有了这条，脚本化演示才能"优雅停"。**宿主只监听 127.0.0.1（见 config.json），不对公网开放。**
+    std::function<void()> shutdown;
 };
 
 class HostServer {

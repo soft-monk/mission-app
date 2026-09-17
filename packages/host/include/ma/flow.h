@@ -47,16 +47,20 @@
 namespace ma {
 
 /// Excel 11 步（1-based）。`key` 是稳定标识（前端路由用它，不用中文标题）。
+///
+/// ★ 这里的字段都是 `std::string`（不是 `const char*` 常量表）：**11 步表来自
+///   `config.json` 的 `flow.steps`**，源码里只留"只有 key/phase 的骨架"。
+///   理由：步骤名 / 界面标题是**业务词汇** —— 客户改词不该重新编译宿主（见 config.h 同名注释）。
 struct FlowStep {
     int step = 1;
-    const char* key = "";
-    const char* title = "";
+    std::string key;
+    std::string title;
     /// 该步对应的任务阶段（"" = 尚未进入任务）。阶段取值由 `phase-engine` 定义（T0–T7）。
-    const char* phase = "";
+    std::string phase;
 };
 
-/// 11 步表。**这是流程骨架，不是业务内容**：标题只用于界面回执与日志；
-/// 真正决定"能不能做某件事"的是各引擎的规则包。
+/// 11 步表（**流程骨架 + 配置给的显示名**）。
+/// 真正决定"能不能做某件事"的是各引擎的规则包；这里只是"第几步叫什么、绑哪个阶段"。
 const std::vector<FlowStep>& flowSteps();
 const FlowStep* flowStepOf(int step);
 const FlowStep* flowStepByKey(const std::string& key);
@@ -164,6 +168,10 @@ private:
     /// 把 Report 里的某一类项转成 JSON 数组
     static nlohmann::json itemsJson(const std::vector<selfcheck::ItemResult>& items);
 #endif
+
+    /// 流程自产物的一步显示文案：**词汇表在 config.json 的 `flow.labels`**（宿主源码里
+    /// MUST NOT 留中文兜底 —— 配置缺这一条就回落成键名，界面上至少能认出是哪一段）。
+    std::string labelOf(const std::string& key) const;
 
     /// 启动加载：逐模块把**真实就绪判定**上报给引擎的进度源。可在工作线程里跑。
     nlohmann::json bootRunOnce(int pacingMs);
@@ -332,6 +340,8 @@ private:
 
     bool selfCheckReady_ = false;
     std::string selfCheckNote_;
+    /// 11 步表的来源（`config.json flow.steps` 读到几条 / 还是回落了内置骨架）—— 给启动日志与 /stats。
+    std::string flowStepsNote_;
 #if MA_WITH_SELFCHECK
     std::shared_ptr<selfcheck::ISelfCheckSink> flowSink_;
     std::shared_ptr<selfcheck::IClock> flowClock_;

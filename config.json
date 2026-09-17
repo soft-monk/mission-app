@@ -39,6 +39,33 @@
   "simAutoStartNote": "true = 启动加载阶段就拉起数据链路。本工程的'链路/集群节点'探针要的是**真实报文与在线设备**，不起仿真源时它们只会停在 50%（启动加载永远完不成、进不了第 2 步）。因此'起飞'属启动阶段，步 6 的控制语义是**暂停/恢复/倍速**。",
   "scenarioDir": "data/scenario-1",
 
+  "flow": {
+    "note": "Excel 11 步的**显示名**在这里（业务词汇），宿主源码里只有 key/phase 骨架 —— 改界面词不必重新编译宿主。key = 前端路由与命令回执用的稳定标识；phase = phase-engine 的阶段键（T0–T7，空串 = 尚未进入任务）。改 key/phase 要同步前端与规则包。",
+    "steps": [
+      { "step": 1,  "key": "boot",         "title": "启动加载界面",         "phase": "" },
+      { "step": 2,  "key": "selfcheck",    "title": "自检校验界面",         "phase": "" },
+      { "step": 3,  "key": "situation",    "title": "任务态势界面",         "phase": "T0" },
+      { "step": 4,  "key": "grouping",     "title": "无人机分组与任务编组", "phase": "T1" },
+      { "step": 5,  "key": "groupConfirm", "title": "编组确认界面",         "phase": "T1" },
+      { "step": 6,  "key": "execute",      "title": "任务执行界面",         "phase": "T2" },
+      { "step": 7,  "key": "targets",      "title": "实时侦察目标显示",     "phase": "T4" },
+      { "step": 8,  "key": "strike",       "title": "任务决策与打击准备",   "phase": "T5" },
+      { "step": 9,  "key": "strikeConfirm", "title": "打击方案确认",        "phase": "T5" },
+      { "step": 10, "key": "guidance",     "title": "协同执行与引导",       "phase": "T6" },
+      { "step": 11, "key": "summary",      "title": "任务总结界面",         "phase": "T7" }
+    ],
+    "labelsNote": "流程自产物的显示文案（时间轴分段名 / 俯冲区名 / 缺几何占位名）。键是稳定的：宿主按这几个键取，取不到就回落成键名（源码里没有中文兜底）。",
+    "labels": {
+      "timeline.t0": "任务下达（t0）",
+      "timeline.arrival": "预计到达 IP 点",
+      "timeline.strike": "打击完成（规则包预计完成时间）",
+      "timeline.assess": "评估完成（评估航线飞完）",
+      "dive.start": "俯冲起点区（IP 点）",
+      "dive.end": "俯冲终点区（台账目标位置）",
+      "geometry.none": "（无已确认方案的 IP 点几何）"
+    }
+  },
+
   "mediaRoot": "data/scenario-1/media",
 
   "tiles": {

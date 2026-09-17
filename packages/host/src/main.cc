@@ -60,7 +60,7 @@ void printUsage() {
         "mission-app · 装配宿主\n"
         "\n"
         "用法：mission_host [--config <路径>] [--port <端口>] [--stop-after <秒>]\n"
-        "                  [--scenario <目录>] [--speed <1|8|60>] [--no-sim]\n"
+        "                  [--scenario <目录>] [--speed <1|8|60>] [--no-sim] [--log <文件>]\n"
         "                  [--selftest]\n"
         "\n"
         "  --config <路径>   配置文件（JSON）。缺省依次尝试：仓库根 config.json、\n"
@@ -69,6 +69,8 @@ void printUsage() {
         "  --scenario <目录> 覆盖本地配置目录（缺省 <dataDir>/scenario-1）\n"
         "  --speed <倍率>    节拍倍速：1 | 8 | 60（缺省 config.json 的 simSpeed）\n"
         "  --no-sim          只起服务与接入层，不跑仿真节拍\n"
+        "  --log <文件>      把 stdout/stderr 重定向到文件（后台跑/脚本化演示用；\n"
+        "                     宿主自己落盘，调用方就能用不等待的方式起进程）\n"
         "  --determinism-check  离线双跑逐字节比对报文序列（假时钟），退出码 0/1\n"
         "  --stop-after <秒> 跑够秒数自动走正常退出序列（0/缺省 = 一直跑）\n"
         "  --selftest        不起网络、不读配置：只验装配与就绪行，退出码 0/1\n"
@@ -316,6 +318,7 @@ int main(int argc, char** argv) {
 #endif
     std::string configPath;
     std::string scenarioOverride;
+    std::string logPath;   // --log <文件>：宿主自己把 stdout/stderr 落盘（见下面的 freopen）
     int stopAfterSeconds = 0;
     int portOverride = 0;
     int speedOverride = 0;
@@ -360,6 +363,8 @@ int main(int argc, char** argv) {
             determinismCheck = true;
         } else if (arg == "--selftest") {
             selftest = true;
+        } else if (arg == "--log" && i + 1 < argc) {
+            logPath = argv[++i];
         } else if (arg == "-h" || arg == "--help") {
             printUsage();
             return 0;
@@ -367,6 +372,26 @@ int main(int argc, char** argv) {
             std::cerr << "未知参数：" << arg << "\n\n";
             printUsage();
             return 2;
+        }
+    }
+
+    // ---- `--log <路径>`：把 stdout/stderr 重定向到文件。
+    //
+    // 为什么宿主自己干这件事（而不是让调用方重定向）：**脚本化演示需要"后台起、日志留痕"**，
+    // 而 Windows PowerShell 5.1 的 `Start-Process -RedirectStandardOutput` 会一直等到子进程退出
+    // （PS 7 不会）—— 用它起长跑宿主，脚本就永远不返回（实测卡死）。
+    // 让宿主自己落盘，调用方就能用一个"不等待"的方式起进程。
+    if (!logPath.empty()) {
+        // ★ 这里**只做 freopen，不碰 setvbuf**：在 stdout 刚被重新绑定后调
+        //   `std::setvbuf(stdout, nullptr, _IOLBF, 0)` 会触发 MSVC 的无效参数处理，
+        //   直接 `__fastfail`（进程以 **0xC0000409** 秒退、一个字都不打印，实测踩过）。
+        //   freopen 之后每次 `flushLog()`（宿主本来就到处在调）足以保证日志可见。
+        if (std::freopen(logPath.c_str(), "w", stdout) == nullptr) {
+            std::cerr << "[host] 警告：--log 打不开 " << logPath << "（继续输出到控制台）\n";
+        } else {
+            std::freopen(logPath.c_str(), "a", stderr);
+            std::cout << "[host] 日志已重定向到：" << logPath << "\n";
+            std::cout.flush();
         }
     }
 
@@ -549,7 +574,9 @@ int main(int argc, char** argv) {
             return flow.command(verb, params);
         },
         [&flow]() { return flow.stateJson(); },
-        [&flow]() { return flow.healthJson(); }});
+        [&flow]() { return flow.healthJson(); },
+        // `POST /shutdown` → 走正常退出序列（脚本化演示/后台跑时唯一能优雅停的路）
+        [&server]() { server.requestStop(); }});
 
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);

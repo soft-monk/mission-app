@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -76,6 +77,28 @@ struct HostConfig {
 
     // ---- 前端产物目录（相对仓库根或绝对路径）
     std::string webDist = "apps/web/dist";
+
+    // ---- 流程步骤表（Excel 11 步的**显示名**）
+    //
+    // ★ 为什么它在配置里、不在源码里：步骤名 / 界面标题是**业务词汇**。
+    //   把它放在这里，客户改界面词不必重新编译宿主；宿主源码里只留"只有 key/phase 的骨架"。
+    //   `key`（前端路由用）与 `phase`（`phase-engine` 的 T0–T7）是**约定键**，两边要同步改。
+    struct FlowStepSetting {
+        int step = 0;
+        std::string key;
+        std::string title;  // 界面标题；空 = 回落成 key（并如实记进 flowStepsSource）
+        std::string phase;  // "" = 尚未进入任务
+    };
+    std::vector<FlowStepSetting> flowSteps;
+    /// `flow.steps` 的读取结果（给 /stats 与启动日志：读到几条，还是回落了内置骨架）。
+    std::string flowStepsSource;
+
+    /// 流程自产物的**显示文案**（`flow.labels`：时间轴分段名、俯冲区名、缺几何占位名 …）。
+    ///
+    /// ★ 同 flowSteps 的理由：这些是**业务词汇**，住在配置里 → 改文案不用重新编译宿主。
+    ///   键是稳定的（`timeline.t0` / `dive.start` …）；配置缺某一条时宿主**回落成键名**，
+    ///   MUST NOT 在源码里补一句中文兜底。
+    std::map<std::string, std::string> flowLabels;
 
     // ---- 元信息
     std::string configPath;  // 实际读到的配置文件绝对路径（空 = 用了内置默认值）

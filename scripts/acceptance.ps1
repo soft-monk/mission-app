@@ -81,14 +81,49 @@ $srcFiles = @(Get-ChildItem -Path (Join-Path $repoRoot 'packages/host/src') -Fil
 $srcFiles += @(Get-ChildItem -Path (Join-Path $repoRoot 'packages/host/include') -Filter *.h -File -Recurse -ErrorAction SilentlyContinue)
 Check 'S0' '宿主源码文件数 > 0' ($srcFiles.Count -gt 0) "$($srcFiles.Count) 个文件"
 
-function ScanForbidden([string]$id, [string]$title, [string[]]$patterns) {
+# 把"注释 + 字符串字面量"都抹掉的辅助（行号保持不变）：
+#   · 注释是散文 —— 解释性中文不算业务词；
+#   · 字符串字面量在 -StripStrings 时抹掉 —— S1 只判**标识符层**（变量/函数/类型/键名）。
+# 于是"业务词进宿主源码"这件事被拆成两条可判定的规则：
+#   S1（标识符层）= 0；S1b = 剩下的业务词只许出现在**诊断语句**里（见下面的 carrier）。
+function StripCodeLine([string]$line, [ref]$inBlockRef, [bool]$stripStrings) {
+  $inBlock = $inBlockRef.Value
+  $sb = New-Object System.Text.StringBuilder
+  $j = 0
+  while ($j -lt $line.Length) {
+    $c = $line[$j]
+    if ($inBlock) {
+      $end = $line.IndexOf('*/', $j)
+      if ($end -lt 0) { $j = $line.Length } else { $inBlock = $false; $j = $end + 2 }
+      continue
+    }
+    if ($j + 1 -lt $line.Length -and $c -eq '/' -and $line[$j + 1] -eq '*') { $inBlock = $true; $j += 2; continue }
+    if ($j + 1 -lt $line.Length -and $c -eq '/' -and $line[$j + 1] -eq '/') { break }
+    if ($stripStrings -and $c -eq '"') {
+      $j++
+      while ($j -lt $line.Length) {
+        if ($line[$j] -eq '\') { $j += 2; continue }
+        if ($line[$j] -eq '"') { $j++; break }
+        $j++
+      }
+      continue
+    }
+    [void]$sb.Append($c); $j++
+  }
+  $inBlockRef.Value = $inBlock
+  return $sb.ToString()
+}
+
+function ScanForbidden([string]$id, [string]$title, [string[]]$patterns, [switch]$StripComments, [switch]$StripStrings) {
   $hits = New-Object System.Collections.Generic.List[string]
   foreach ($f in $srcFiles) {
     $lines = Get-Content -LiteralPath $f.FullName -Encoding UTF8
+    $inBlock = $false
     for ($i = 0; $i -lt $lines.Count; $i++) {
+      $code = if ($StripComments -or $StripStrings) { StripCodeLine $lines[$i] ([ref]$inBlock) $StripStrings.IsPresent } else { $lines[$i] }
       foreach ($p in $patterns) {
-        if ($lines[$i] -match $p) {
-          $hits.Add("$(Split-Path $f.FullName -Leaf):$($i + 1) $($lines[$i].Trim())")
+        if ($code -match $p) {
+          $hits.Add("$(Split-Path $f.FullName -Leaf):$($i + 1) $($code.Trim())")
         }
       }
     }
@@ -97,8 +132,50 @@ function ScanForbidden([string]$id, [string]$title, [string[]]$patterns) {
   Check $id $title ($hits.Count -eq 0) $detail
 }
 
-# 业务词：宿主里 MUST NOT 出现（阶段规则 / 评分算法 / 告警规则都是模块与规则包的事）
-ScanForbidden 'S1' '无业务词（任务/方案/目标/场景/阶段/编组/评估）' @('任务', '方案', '目标', '场景', '阶段', '编组', '评估')
+# ════════════════════════════════════════════════════════════════════════════
+# 业务词（任务 / 方案 / 目标 / 场景 / 阶段 / 编组 / 评估）：宿主源码里 MUST NOT 当成**业务**写。
+#
+# 两条规则合起来才是完整的：
+#   S1  —— **标识符层**（注释与字符串都抹掉）：变量/函数/类型/键名里不许有业务词。
+#   S1b —— 字符串里的业务词只许出现在**诊断语句**里（notes / reason / message / basis / cerr…）。
+#          换句话说：步骤名、界面标题、方案名这类**词汇表**必须来自 config.json 或规则包，
+#          不许以"一个字面量"的形式长在宿主源码里（P7 前就是这样：11 步标题曾是源码里的常量表）。
+# ════════════════════════════════════════════════════════════════════════════
+$bizWords = @('任务', '方案', '目标', '场景', '阶段', '编组', '评估')
+ScanForbidden 'S1' '无业务词（标识符层；注释与字符串字面量不算）' $bizWords -StripComments -StripStrings
+
+# S1b：诊断载体白名单 —— 业务词允许出现的**唯一**位置
+#（都是"解释性字段"：诊断文案 / 算式 / 判据 / 出处 / 字段溯源；界面词汇表不在其中）。
+$diagnosticCarrier = 'notes|note|push_back|putBlock|snapshot|std::cerr|std::cout|os\s*<<|message|reason|why|detail|basis|formula|criteria|criterion|baseline|source|error|warn'
+$s1bHits = New-Object System.Collections.Generic.List[string]
+foreach ($f in $srcFiles) {
+  $lines = Get-Content -LiteralPath $f.FullName -Encoding UTF8
+  $inBlock = $false
+  $code = New-Object System.Collections.Generic.List[string]
+  for ($i = 0; $i -lt $lines.Count; $i++) { $code.Add((StripCodeLine $lines[$i] ([ref]$inBlock) $false)) }
+  for ($i = 0; $i -lt $code.Count; $i++) {
+    $hit = $false
+    foreach ($p in $bizWords) { if ($code[$i] -match $p) { $hit = $true; break } }
+    if (-not $hit) { continue }
+    # 往上找到本条语句的起点：上一行以 ; 或 } 收尾 = 上一条语句结束；
+    # 上一行以 { 收尾 = 它**就是**本条语句的开头（初始化列表/块），要算进来。
+    $start = $i
+    while ($start -gt 0) {
+      $prev = $code[$start - 1].TrimEnd()
+      if ($prev -match '[;{}]\s*$') {
+        if ($prev -match '\{\s*$') { $start-- }
+        break
+      }
+      $start--
+    }
+    $stmt = ($code[$start..$i] -join ' ')
+    if ($stmt -notmatch $diagnosticCarrier) {
+      $s1bHits.Add("$(Split-Path $f.FullName -Leaf):$($i + 1) $($code[$i].Trim())")
+    }
+  }
+}
+Check 'S1b' '业务词只出现在诊断文案里（步骤名/界面词汇表来自 config.json 或规则包）' ($s1bHits.Count -eq 0) `
+  $(if ($s1bHits.Count -eq 0) { '零命中' } else { "$($s1bHits.Count) 处：" + ($s1bHits[0..([Math]::Min(2, $s1bHits.Count - 1))] -join ' | ') })
 
 # 跨模块内部 include：只允许 <模块>/<公开头>.h 这条路（模块内部实现在 src/ 下，宿主不许碰）
 $internalInclude = New-Object System.Collections.Generic.List[string]
@@ -131,7 +208,7 @@ Check 'S3' '无 SQL' ($sqlHits.Count -eq 0) $(if ($sqlHits.Count -eq 0) { '零�
 # 除外的是本仓**自己的代码**：packages/ 下是宿主的包（host 是 P0 的；scenario-data 与
 # sim-bridge 是 P1 的"本地配置 → 上路"那一层）。它们本来就该在本仓里，不是模块副本。
 $copied = @(Get-ChildItem -Path $repoRoot -Recurse -File -Include *.h,*.cc,*.cpp -ErrorAction SilentlyContinue |
-  Where-Object { $_.FullName -notmatch '\\build\\' -and $_.FullName -notmatch '\\node_modules\\' -and $_.FullName -notmatch '\\.git\\' -and $_.FullName -notmatch '\\packages\\' })
+  Where-Object { $_.FullName -notmatch '\\build[^\\]*\\' -and $_.FullName -notmatch '\\node_modules\\' -and $_.FullName -notmatch '\\.git\\' -and $_.FullName -notmatch '\\packages\\' })
 Check 'S4' '本仓没有模块源码副本（packages/ 之外无 .cc/.h）' ($copied.Count -eq 0) $(if ($copied.Count -eq 0) { '零命中' } else { ($copied | Select-Object -First 3 | ForEach-Object { $_.FullName.Substring($repoRoot.Length + 1) }) -join ' | ' })
 
 # CMake 原地引用：必须出现 add_subdirectory，且 MUST NOT 出现拷源码的命令
@@ -253,7 +330,12 @@ if (-not $SkipFrontend) {
 
 Check 'F3' 'apps/web/dist/index.html 存在' (Test-Path $distIndex) $distIndex
 Check 'F4' 'Vite 别名原地引用 map-2d' ((Get-Content -LiteralPath (Join-Path $webDir 'vite.config.ts') -Raw -Encoding UTF8) -match "'map-2d':\s*fileURLToPath") ''
-Check 'F5' '页面用全屏 MapView' ((Get-Content -LiteralPath (Join-Path $webDir 'src/App.tsx') -Raw -Encoding UTF8) -match '<MapView') ''
+# P5 起全屏地图由 MapStage 承担（App.tsx 只做流程编排），所以按"src/ 下有人渲染 <MapView>"
+# 判定，并把命中的文件报出来——否则重构一次目录就把这条守卫变成假失败。
+$mapViewFiles = @(Get-ChildItem -Path (Join-Path $webDir 'src') -Recurse -File -Include *.tsx -ErrorAction SilentlyContinue |
+  Where-Object { (Get-Content -LiteralPath $_.FullName -Raw -Encoding UTF8) -match '<MapView' } |
+  ForEach-Object { $_.FullName.Substring($webDir.Length + 1) })
+Check 'F5' '页面用全屏 MapView' ($mapViewFiles.Count -gt 0) $(if ($mapViewFiles.Count -gt 0) { "$($mapViewFiles.Count) 处：$($mapViewFiles[0])" } else { 'src/ 下没有任何组件渲染 <MapView' })
 
 # ════════════════════════════════════════════════════════════ 5 · /health 实测
 Section '5 · 服务端 /health 实测'
@@ -531,6 +613,28 @@ $liveText = if (Test-Path $liveLog) { Get-Content -LiteralPath $liveLog -Encodin
 Check 'K18' '真实链路启动日志里有接入点与仿真启动行' `
   ($liveText -match '接入点 ingest' -and $liveText -match '仿真已启动') `
   $(if ($liveText -match '\[host\] 仿真已启动[^\r\n]*') { $Matches[0].Trim() } else { '未找到启动行' })
+
+# ════════════════════════════════════════════════════════════ 8 · 验收后恢复默认构建
+#
+# 本文件默认用 `-DMA_BUILD_SENSOR_MODEL=OFF`（缺可选模块）做**负向验收** —— 证明"少了
+# 可选模块也装得起来、跑得起来"。但它会把这个 build/ 留在"缺模块"的配置上：用户接着
+# 演示就会看到 sensorModel=0。所以最后把默认配置装回去（-SkipBuild 时不动 build/）。
+Section '8 · 验收后恢复默认构建（可选模块装回）'
+if ($SkipBuild) {
+  Check 'C5' 'C5 跳过（-SkipBuild：没有动过 build/）' $true '未重新 configure'
+} else {
+  $restoreArgs = @('-S', $repoRoot, '-B', $buildPath, '-G', 'Visual Studio 17 2022', '-A', 'x64',
+                   '-DCMAKE_CONFIGURATION_TYPES=Release', "-DMA_VCPKG_DIR=$vcpkgDir",
+                   '-DMA_BUILD_SIM_SOURCE=ON', '-DMA_BUILD_SENSOR_MODEL=ON')
+  $restoreOut = & cmake @restoreArgs 2>&1
+  $restoreCode = $LASTEXITCODE
+  $restoreLog = Join-Path $repoRoot 'scripts/.acceptance-restore.log'
+  & cmake --build $buildPath --config $Config --parallel 2>&1 | Set-Content -LiteralPath $restoreLog -Encoding UTF8
+  $restoreBuild = $LASTEXITCODE
+  Check 'C5' '验收后恢复默认构建（sim-source / sensor-model 装回）' `
+    ($restoreCode -eq 0 -and $restoreBuild -eq 0) `
+    "configure=$restoreCode build=$restoreBuild 日志=$restoreLog"
+}
 
 # ════════════════════════════════════════════════════════════ 汇总
 Section '汇总'

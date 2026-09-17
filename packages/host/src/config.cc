@@ -179,6 +179,71 @@ bool HostConfig::loadFile(const std::string& path, HostConfig& out, std::string&
     if (!getBool(j, "simAutoStart", out.simAutoStart, error)) return false;
     if (!getString(j, "scenarioDir", out.scenarioDir, error)) return false;
 
+    // ---- flow.steps[]：11 步表（**业务词汇**：步骤名 / 界面标题）
+    //
+    // 缺它不报错（宿主回落"只有 key/phase 的骨架"，标题 = key，并在 flowStepsSource 里点名）——
+    // 但**给了就必须合法**：序号从 1 起、不重复，key 非空（写错了当场可见，不静默吞）。
+    {
+        nlohmann::json flowScratch;
+        const auto& flow = sub(j, "flow", flowScratch);
+        if (flow.contains("steps")) {
+            if (!flow["steps"].is_array()) {
+                error = "flow.steps 必须是数组";
+                return false;
+            }
+            for (std::size_t i = 0; i < flow["steps"].size(); ++i) {
+                const auto& node = flow["steps"][i];
+                const std::string base = "flow.steps[" + std::to_string(i) + "]";
+                if (!node.is_object()) {
+                    error = base + " 必须是对象";
+                    return false;
+                }
+                FlowStepSetting s;
+                if (!getInt(node, "step", s.step, error)) return false;
+                if (!getString(node, "key", s.key, error)) return false;
+                if (!getString(node, "title", s.title, error)) return false;
+                if (!getString(node, "phase", s.phase, error)) return false;
+                if (s.step < 1) {
+                    error = base + ".step 必须 >= 1：" + std::to_string(s.step);
+                    return false;
+                }
+                if (s.key.empty()) {
+                    error = base + ".key 不能为空（前端路由用它）";
+                    return false;
+                }
+                for (const auto& seen : out.flowSteps) {
+                    if (seen.step == s.step) {
+                        error = base + ".step 与 " + seen.key + " 重复：" + std::to_string(s.step);
+                        return false;
+                    }
+                    if (seen.key == s.key) {
+                        error = base + ".key 与步 " + std::to_string(seen.step) + " 重复：" + s.key;
+                        return false;
+                    }
+                }
+                out.flowSteps.push_back(std::move(s));
+            }
+            out.flowStepsSource = "config.json flow.steps（" + std::to_string(out.flowSteps.size()) + " 条）";
+        } else {
+            out.flowStepsSource = "内置骨架（config.json 没给 flow.steps → 界面标题回落成步骤键）";
+        }
+        // flow.labels：流程自产物的显示文案（时间轴分段名 / 俯冲区名 / 缺几何占位名 …）。
+        // 键自由（宿主只按自己认识的那几个键取）；值必须是字符串 —— 写错了当场可见。
+        if (flow.contains("labels")) {
+            if (!flow["labels"].is_object()) {
+                error = "flow.labels 必须是对象（键 → 文案）";
+                return false;
+            }
+            for (auto it = flow["labels"].begin(); it != flow["labels"].end(); ++it) {
+                if (!it.value().is_string()) {
+                    error = "flow.labels." + it.key() + " 必须是字符串";
+                    return false;
+                }
+                out.flowLabels[it.key()] = it.value().get<std::string>();
+            }
+        }
+    }
+
     if (out.port <= 0 || out.port > 65535) {
         error = "server.port 超出范围（1..65535）：" + std::to_string(out.port);
         return false;

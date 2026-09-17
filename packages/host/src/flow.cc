@@ -37,22 +37,55 @@ int64_t wallClockMs() {
 
 using nlohmann::json;
 
-/// 11 步表（与《业务层宿主层实施方案》§2 一一对应）
-const std::vector<FlowStep>& kSteps() {
-    static const std::vector<FlowStep> k = {
-        {1, "boot", "启动加载界面", ""},
-        {2, "selfcheck", "自检校验界面", ""},
-        {3, "situation", "任务态势界面", "T0"},
-        {4, "grouping", "无人机分组与任务编组", "T1"},
-        {5, "groupConfirm", "编组确认界面", "T1"},
-        {6, "execute", "任务执行界面", "T2"},
-        {7, "targets", "实时侦察目标显示", "T4"},
-        {8, "strike", "任务决策与打击准备", "T5"},
-        {9, "strikeConfirm", "打击方案确认", "T5"},
-        {10, "guidance", "协同执行与引导", "T6"},
-        {11, "summary", "任务总结界面", "T7"},
-    };
-    return k;
+/// 11 步表（与《业务层宿主层实施方案》§2 一一对应）。
+///
+/// ★ 显示名来自 `config.json` 的 `flow.steps`（**业务词汇不住在源码里**）。
+///   这里只留**骨架**：每一步的 `key`（前端路由/命令回执用）与它绑的 `phase`
+///   （`phase-engine` 的 T0–T7）。配置缺失 → 标题回落成 `key`，并在 `flowStepsNote` 里点名。
+///   `FlowEngine` 构造时调一次 `initFlowSteps(cfg)`；此后全进程只读。
+std::vector<FlowStep> g_flowSteps = {
+    {1, "boot", "", ""},          {2, "selfcheck", "", ""},
+    {3, "situation", "", "T0"},   {4, "grouping", "", "T1"},
+    {5, "groupConfirm", "", "T1"}, {6, "execute", "", "T2"},
+    {7, "targets", "", "T4"},     {8, "strike", "", "T5"},
+    {9, "strikeConfirm", "", "T5"}, {10, "guidance", "", "T6"},
+    {11, "summary", "", "T7"},
+};
+std::string g_flowStepsNote = "内置骨架（未初始化）";
+
+/// 用配置里的 11 步表覆盖骨架（**只在 FlowEngine 构造时调一次**）。
+/// 表里给出的步与骨架按键对齐：配置少给几步 → 那几步保持"标题 = key"。
+void initFlowSteps(const HostConfig& cfg) {
+    for (auto& s : g_flowSteps) {
+        if (s.title.empty()) s.title = s.key;  // 兜底：至少能在界面上认出是第几步
+    }
+    if (cfg.flowSteps.empty()) {
+        g_flowStepsNote = cfg.flowStepsSource.empty() ? "内置骨架" : cfg.flowStepsSource;
+        return;
+    }
+    int applied = 0;
+    for (const auto& s : cfg.flowSteps) {
+        for (auto& row : g_flowSteps) {
+            if (row.step != s.step) continue;
+            row.key = s.key;
+            row.title = s.title.empty() ? s.key : s.title;
+            row.phase = s.phase;
+            ++applied;
+            break;
+        }
+    }
+    g_flowStepsNote = cfg.flowStepsSource + "，已套用 " + std::to_string(applied) + " 步";
+}
+
+const std::vector<FlowStep>& kSteps() { return g_flowSteps; }
+
+/// 显示文案（词汇表 = `config.json` 的 `flow.labels`；缺 → 回落成键名，**不编文案**）。
+/// 之所以有"自由函数版"：`runDiveLocked` 这类自由函数拿不到 `FlowEngine`，
+/// 由调用方把词汇表递进来（`cfg_.flowLabels`）—— 口径只有这一份。
+std::string labelOfMap(const std::map<std::string, std::string>& labels, const std::string& key) {
+    const auto it = labels.find(key);
+    if (it != labels.end() && !it->second.empty()) return it->second;
+    return key;
 }
 
 /// 把 JSON 里的整数字段读出来（缺/类型不对 → 默认值）。宿主只做类型收敛，不做语义判断。
@@ -215,6 +248,9 @@ public:
 
 FlowEngine::FlowEngine(Engines& engines, Registry& reg, const HostConfig& cfg)
     : engines_(engines), reg_(reg), cfg_(cfg) {
+    // 11 步表：显示名来自配置（业务词汇不写在源码里）。构造期套一次，之后全进程只读。
+    initFlowSteps(cfg_);
+    flowStepsNote_ = g_flowStepsNote;
 #if MA_WITH_SIM_SOURCE && MA_WITH_INGEST && MA_WITH_SENSOR_MODEL
     // 探测结果的落账出口：**在这里接线**（装配顺序上 sensorBridge 早于本对象）。
     // 回调来自仿真驱动线程 —— 见 onDetection 的线程说明（只碰 detectMtx_）。
@@ -240,11 +276,16 @@ void FlowEngine::setBroadcaster(Broadcaster b) { broadcast_ = std::move(b); }
 void FlowEngine::setClientCounter(ClientCounter c) { clients_ = std::move(c); }
 void FlowEngine::setCapabilityProbe(CapabilityProbe p) { capabilityProbe_ = std::move(p); }
 
+std::string FlowEngine::labelOf(const std::string& key) const {
+    return labelOfMap(cfg_.flowLabels, key);
+}
+
 std::string FlowEngine::summary() const {
     std::ostringstream os;
     os << "step=" << step_ << (phase_.empty() ? "（未进入任务）" : " phase=" + phase_);
     os << " selfcheck=" << (selfCheckReady_ ? "已装载" : "未装载");
     if (!selfCheckNote_.empty()) os << "（" << selfCheckNote_ << "）";
+    if (!flowStepsNote_.empty()) os << " steps=" << g_flowSteps.size() << "（" << flowStepsNote_ << "）";
     return os.str();
 }
 
@@ -1339,12 +1380,18 @@ nlohmann::json FlowEngine::rebuildSimLocked(int& code) {
     }
 
     // ---- ② 探测出口重新接线（新 SensorBridge → 本对象）----
+    //
+    // ★ 挂接数与 `sensorBridge` 都只在**编译期装了 sensor-model** 时才存在（可选模块口径）：
+    //   未装配时如实报 0 —— `acceptance.ps1` 会用 `-DMA_BUILD_SENSOR_MODEL=OFF` 跑一遍"模块缺席"
+    //   的负证，宿主 MUST 照样编译、照样跑起来（这就是"模块不在是编译期事实"的落地）。
+    int attachmentsAfter = 0;
 #if MA_WITH_SIM_SOURCE && MA_WITH_INGEST && MA_WITH_SENSOR_MODEL
     if (engines_.sensorBridge) {
+        attachmentsAfter = static_cast<int>(engines_.sensorAttachments.size());
         engines_.sensorBridge->setDetectionSink(
             [this](const ma::sensor_bridge::Detection& det) { onDetection(det); });
         notes.push_back("探测出口已重挂：新 SensorBridge（" +
-                        std::to_string(engines_.sensorAttachments.size()) + " 条挂接）→ FlowEngine::onDetection");
+                        std::to_string(attachmentsAfter) + " 条挂接）→ FlowEngine::onDetection");
     } else {
         notes.push_back("探测适配器未装配（" + engines_.sensorNote + "）→ 第 7 步的目标只能靠既有台账");
     }
@@ -1399,7 +1446,7 @@ nlohmann::json FlowEngine::rebuildSimLocked(int& code) {
     d["simElapsedMs"] = elapsedAfter;      // 重建那一刻的读数（= 0）
     d["platforms"] = platforms;
     d["speed"] = engines_.bridge.engine->capabilities().speedMultiplier;  // 重建后的**真实**倍速
-    d["attachments"] = static_cast<int>(engines_.sensorAttachments.size());
+    d["attachments"] = attachmentsAfter;
     d["emitted"] = emittedAfter;
     d["resumed"] = resumed;
     d["paused"] = drv.paused();
@@ -1421,7 +1468,7 @@ nlohmann::json FlowEngine::rebuildSimLocked(int& code) {
     }
     d["notes"] = notes;
     LOG_INFO << "[flow] sim.reset：重建完成 platforms=" << platforms << " speed=" << speed
-             << " attachments=" << engines_.sensorAttachments.size()
+             << " attachments=" << attachmentsAfter
              << "（重建前 elapsed=" << elapsedBefore << "ms speed=" << speedBefore
              << " running=" << (wasRunning ? 1 : 0) << "）";
     return d;
@@ -1470,11 +1517,13 @@ void FlowEngine::onWireEvent(const std::string& type, const nlohmann::json& data
     a.simTs = simTs;
 }
 
-#if MA_WITH_SIM_SOURCE && MA_WITH_INGEST && MA_WITH_SENSOR_MODEL
-
 // ---------------------------------------------------------------- 探测 → 台账
 
 std::map<std::string, std::string> FlowEngine::targetTypeKeysLocked() const {
+    // ★ 本函数**故意放在所有 `#if` 之外**：它被 `buildReportLocked()`（报告里的目标类型汇总）
+    //   无条件调用，所以**任何编译配置下都必须有定义** —— 否则 `-DMA_BUILD_SENSOR_MODEL=OFF`
+    //   这类"模块缺席"配置会在**链接期**报 LNK2019（实测踩过：编译过了、链接挂了）。
+    //   拿不到场景数据时返回空表，调用方按"没有目标类型"如实呈现。
     std::map<std::string, std::string> out;
 #if MA_WITH_SIM_SOURCE && MA_WITH_INGEST
     // 场景数据是**唯一**的 id → typeKey 来源（typeKey 必须是规则包 entityTypes.json 的词汇）
@@ -1482,6 +1531,8 @@ std::map<std::string, std::string> FlowEngine::targetTypeKeysLocked() const {
 #endif
     return out;
 }
+
+#if MA_WITH_SIM_SOURCE && MA_WITH_INGEST && MA_WITH_SENSOR_MODEL
 
 void FlowEngine::onDetection(const ma::sensor_bridge::Detection& d) {
     // ★ 本函数在**仿真驱动线程**里跑（Driver 持有自己的锁时回调进来）：
@@ -2830,7 +2881,7 @@ nlohmann::json FlowEngine::buildGuidancePlanLocked(const std::string& planId,
              {"fromEngine", pv.fromEngine}},
             "phase::PhaseEngine::phaseContext(missionId).enteredAt（公开头 phase_engine.h:594）");
         nlohmann::json item = {{"key", "t0"},
-                               {"name", "任务下达（t0）"},
+                               {"name", labelOf("timeline.t0")},
                                {"atMs", t0 > 0 ? nlohmann::json(t0) : nlohmann::json(nullptr)},
                                {"atText", timeText(t0)},
                                {"basis", b}};
@@ -2842,7 +2893,7 @@ nlohmann::json FlowEngine::buildGuidancePlanLocked(const std::string& planId,
     }
     // 到达
     {
-        nlohmann::json item = {{"key", "arrival"}, {"name", "预计到达 IP 点"}};
+        nlohmann::json item = {{"key", "arrival"}, {"name", labelOf("timeline.arrival")}};
         if (hasArrival) {
             nlohmann::json b = basisJson(
                 "到达 = t0 + (d / v) × 1000 ms；d = 平台→IP 点大圆距离（m），v = 平台实测速度（m/s）",
@@ -2877,10 +2928,10 @@ nlohmann::json FlowEngine::buildGuidancePlanLocked(const std::string& planId,
     }
     // 打击
     {
-        nlohmann::json item = {{"key", "strike"}, {"name", "打击完成（规则包预计完成时间）"}};
+        nlohmann::json item = {{"key", "strike"}, {"name", labelOf("timeline.strike")}};
         if (strikeMs > 0) {
             nlohmann::json item2 = {{"key", "strike"},
-                                    {"name", "打击完成（规则包预计完成时间）"},
+                                    {"name", labelOf("timeline.strike")},
                                     {"atMs", strikeMs},
                                     {"atText", timeText(strikeMs)},
                                     {"basis", basisJson(
@@ -2923,7 +2974,7 @@ nlohmann::json FlowEngine::buildGuidancePlanLocked(const std::string& planId,
     }
     // 评估
     {
-        nlohmann::json item = {{"key", "assess"}, {"name", "评估完成（评估航线飞完）"}};
+        nlohmann::json item = {{"key", "assess"}, {"name", labelOf("timeline.assess")}};
         if (assessMs > 0) {
             item["atMs"] = assessMs;
             item["atText"] = timeText(assessMs);
@@ -3134,7 +3185,8 @@ DiveOutcome runDiveLocked(Engines& engines, const std::string& entityId, double 
                           double tgtAltM, const std::string& targetSource,
                           const nlohmann::json& ipPoint, const std::string& ipSourceIn,
                           const std::vector<std::string>& preferredDevices, const nlohmann::json& params,
-                          double areaHalfM, const std::string& areaHalfMSource) {
+                          double areaHalfM, const std::string& areaHalfMSource,
+                          const std::map<std::string, std::string>& labels) {
     DiveOutcome out;
     nlohmann::json d = nlohmann::json::object();
     nlohmann::json notes = nlohmann::json::array();
@@ -3243,7 +3295,7 @@ DiveOutcome runDiveLocked(Engines& engines, const std::string& entityId, double 
         ipAltM = ipPoint.value("altM", cruiseAltM);
     } else {
         ipOut = nlohmann::json{{"key", nullptr},
-                               {"name", "（无已确认方案的 IP 点几何）"},
+                               {"name", labelOfMap(labels, "geometry.none")},
                                {"lng", leadSt.lng},
                                {"lat", leadSt.lat},
                                {"altM", cruiseAltM}};
@@ -3272,13 +3324,13 @@ DiveOutcome runDiveLocked(Engines& engines, const std::string& entityId, double 
     const std::string tgAreaKey = "dive-target-" + entityId;
     sim_source::Area ipArea;
     ipArea.key = ipAreaKey;
-    ipArea.name = "俯冲起点区（IP 点）";
+    ipArea.name = labelOfMap(labels, "dive.start");
     ipArea.role = sim_source::AreaRole::Deploy;
     ipArea.polygon = squareAround(ipLng, ipLat, areaHalfM);
     upsertArea(ipArea);
     sim_source::Area tgArea;
     tgArea.key = tgAreaKey;
-    tgArea.name = "俯冲终点区（台账目标位置）";
+    tgArea.name = labelOfMap(labels, "dive.end");
     tgArea.role = sim_source::AreaRole::Task;
     tgArea.polygon = squareAround(tgtLng, tgtLat, areaHalfM);
     upsertArea(tgArea);
@@ -3842,7 +3894,7 @@ nlohmann::json FlowEngine::execRunLocked(const std::string& entityId, const nloh
     DiveOutcome dv =
         runDiveLocked(engines_, entityId, rec0->lng, rec0->lat, rec0->alt,
                       "entity-ledger 台账 getEntity(entityId) 的 lng/lat/alt（目标位置的权威）",
-                      ipPoint, ipSource, preferred, params, areaHalfM, areaHalfMSource);
+                      ipPoint, ipSource, preferred, params, areaHalfM, areaHalfMSource, cfg_.flowLabels);
     d["dive"] = dv.payload;
     rec.hitPlatformId = dv.hitPlatform;
     if (dv.applied) ++execDiveCount_;

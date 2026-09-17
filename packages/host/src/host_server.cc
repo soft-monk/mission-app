@@ -303,6 +303,27 @@ void HostServer::registerRoutes() {
         },
         {drogon::Post});
 
+    // ---- /shutdown（POST）：请求走**正常退出序列**（先 flush 留存层，再逆序停模块）。
+    //      前台跑用 Ctrl+C 就够；后台跑（脚本化演示/验收）只有这条路能"优雅停"。
+    //      宿主只监听 127.0.0.1（config.json），不对公网开放。
+    app.registerHandler(
+        "/shutdown",
+        [this](const drogon::HttpRequestPtr&,
+               std::function<void(const drogon::HttpResponsePtr&)>&& cb) {
+            nlohmann::json out;
+            out["code"] = 0;
+            out["message"] = "已请求退出：先 flush 留存层，再按装配逆序停模块";
+            cb(jsonResponse(out.dump(), drogon::k202Accepted));
+            if (ws_.shutdown) {
+                // 回执先发出去再触发退出（否则调用方收到的是"连接被关"而不是这个 202）
+                std::thread([this] {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                    if (ws_.shutdown) ws_.shutdown();
+                }).detach();
+            }
+        },
+        {drogon::Post});
+
     // ---- /stats：各引擎是否就绪（就绪账本的原样导出）+ 真实链路读数
     app.registerHandler(
         "/stats",
@@ -704,7 +725,7 @@ void HostServer::registerRoutes() {
         }
     }
 
-    LOG_INFO << "[host] HTTP 路由: / /health /stats /runtime-config /api/state /api/command"
+    LOG_INFO << "[host] HTTP 路由: / /health /healthz /stats /runtime-config /api/state /api/command /shutdown"
 #if MA_WITH_GEO
              << (cfg_.enableTiles && engines_.tileService ? " " + cfg_.tilesBasePath : "")
 #endif
