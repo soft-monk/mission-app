@@ -33,12 +33,40 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\demo.ps1 stop
 ```
 
 > **下面这几条是新手最容易踩的**，每条都对应一个 `demo.ps1` 的真实行为：
+> · **真正的实现只有一份，在 `mission-app\scripts\demo.ps1`** —— 你在别的目录
+>   （例如它的上一层 `D:\dsh_workpath\webMap`）直接敲 `-File scripts\demo.ps1`，
+>   会报 `-File 形式参数的实际参数"scripts\demo.ps1"不存在`。两个解法见下面的「不在 mission-app 目录时」；
 > · 所有动作（`serve` / `status` / `runAll` / `stop`）都认 **`-Port`** —— 用 `-Port 8100` 起的实例，
 >   必须用 **`-Port 8100`** 去停/看状态，否则脚本找的是默认的 8099；
 > · `serve` 在**已经有一个实例**时不会重复起，只打印一行 `已经有实例在 … 上跑着（先 stop）`；
 > · 想**同时跑第二个实例**必须错开 UDP 接入端口：`serve -Port 8100 -IngestPort 45501`
 >   （两条实例都绑 45500 的话，Windows 只把报文投给先绑定的那条，后起的那条 `packets=0`）；
 > · **改了前端就必须重建 `dist`**，否则页面还是旧界面（`dist` 不入库，宿主托管的是它）。
+
+### 不在 mission-app 目录时（两行之一，都在 `D:\dsh_workpath\webMap` 下敲）
+
+仓库根目录放了两份**转发器**（十几行、不含任何逻辑，只把参数原样交给 `mission-app\scripts\demo.ps1`），
+所以在 `webMap` 根目录下这两条都能用：
+
+```powershell
+# ① 最短
+powershell -NoProfile -ExecutionPolicy Bypass -File demo.ps1 stop
+
+# ② 与"在 mission-app 里"写法一致的那种（脚本名一样，只是路径少一层）
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\demo.ps1 stop
+```
+
+两条都会先打印一行**转发提示**，再输出真正的结果（下面这条是 ① 的实测原文）：
+
+```
+[demo] （webMap\demo.ps1 转发 → D:\dsh_workpath\webMap\mission-app\scripts\demo.ps1）
+[demo] 已停（正常退出序列）
+```
+
+（② 那一行的提示写的是 `webMap\scripts\demo.ps1 转发`，其余完全一样。）
+
+> 不带参数时默认执行 `status`（比什么都不做有用）。`serve` / `status` / `runAll` / `stop`
+> 与 `-Port` / `-Speed` / `-IngestPort` / `-NoBuild` **全部原样转发**。
 
 ## 1.1 起服务（后台 / 前台二选一）
 
@@ -146,15 +174,19 @@ http://127.0.0.1:8099/
 
 ## 1.4 停止（怎么停才算"干净"）
 
+> 下表里的 `scripts\demo.ps1` 是**相对 mission-app 目录**的路径。
+> 如果你人在 `D:\dsh_workpath\webMap`（上一层），用 `demo.ps1` 或 `scripts\demo.ps1` 都行（转发器，见 §1.0）。
+
 | 场景 | 命令 | 说明 |
 |---|---|---|
 | **后台跑**（`demo.ps1 serve` 起的） | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\demo.ps1 stop` | 发 `POST /shutdown`，走**正常退出序列**；脚本会等它真的退出再返回 |
 | **换了端口**的实例 | 上面那条加 `-Port 8100` | 不加就是去停 8099 的那条（很可能压根没在跑） |
 | **前台跑**（自己敲 exe 起的） | 在**那个终端**按 **Ctrl+C** | 同上：先 flush 留存层，再按装配逆序停模块 |
+| **人在 `webMap` 根目录** | `powershell -NoProfile -ExecutionPolicy Bypass -File demo.ps1 stop` | 同一件事的短写法（转发器） |
 | 只想看一眼状态 | `... scripts\demo.ps1 status` | 步/阶段/任务/仿真读数/自检/实时连接数 |
 | 已经停了又敲一次 stop | —— | 只打印 `[demo] http://127.0.0.1:8099 上没有实例在跑`（不是错误） |
 
-`stop` 的实测输出（两行）：
+`stop` 的实测输出（两行；走转发器时会多一行转发提示）：
 
 ```
 [demo] 请求优雅停（先 flush 留存层，再按装配逆序停模块）…
@@ -497,6 +529,36 @@ Get-Process mission_host | Stop-Process -Force     # 硬停（不 flush 留存�
 **10) 改了界面但页面没变**
 → 前端产物没重建。`cd apps\web; npm run build`，然后**刷新页面**（`dist` 不入库，宿主托管的是它）。
 对照检查：`dist\assets\*.js` 的修改时间应该**晚于** `apps\web\src` 里最新的文件。
+
+**11) 敲 `demo.ps1` 报 `-File 形式参数的实际参数"scripts\demo.ps1"不存在`**
+→ 你不在 `mission-app` 目录里。`demo.ps1` 在 **`mission-app\scripts\`** 下，
+   而 `scripts\demo.ps1` 是**相对当前目录**解析的 —— 在 `D:\dsh_workpath\webMap` 下当然找不到。
+   两个解法（都在 `webMap` 根目录下敲，实测可用）：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File demo.ps1 stop          # ① 最短（转发器）
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\demo.ps1 stop  # ② 同写法，少一层路径
+```
+
+   或者老老实实切目录（`cd D:\dsh_workpath\webMap\mission-app` 之后再 `-File scripts\demo.ps1 stop`），
+   或者用**绝对路径**一把梭：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File D:\dsh_workpath\webMap\mission-app\scripts\demo.ps1 stop
+```
+
+> 同一类问题的**其他脚本**也一样：`manual.ps1` / `acceptance.ps1` 都在 `mission-app\scripts\` 下；
+> §六 里那些 `node scripts\xxx.mjs` 同理，**都要先 cd 到 `mission-app`**（`node` 不会自己找）。
+
+**12) 新写/改过带中文的 `.ps1`，一跑就语法错、输出乱码**
+→ 存成了**没有 BOM 的 UTF-8**，Windows PowerShell 5.1 会按 ANSI 读它。
+   实测踩过：用编辑器"另存为 UTF-8（无 BOM）"或某些工具改写文件后，原本好好的脚本立刻
+   `The string is missing the terminator` + 中文乱码。**带中文的 `.ps1` 必须存成 UTF-8 with BOM**：
+
+```powershell
+# PS 5.1 的 Set-Content -Encoding UTF8 会写 BOM；写完用这三字节确认（应为 239 187 191）
+$b = [System.IO.File]::ReadAllBytes('scripts\demo.ps1')[0..2]; "$($b -join ' ')"
+```
 
 ---
 
