@@ -6,6 +6,17 @@
 //   3) 起 HTTP 服务（观测端点 + WS + 静态托管 + 瓦片转发）
 //   4) 等退出信号，按固定顺序优雅退出：**先 flush 再停模块**
 //   5) 打印退出自证行，进程退出码 0
+//
+// ★ Windows 控制台编码：源码里的中文是 **UTF-8 字节**，而 Windows 控制台默认代码页是 936(GBK)，
+//   不切码页就会整屏乱码（实测踩过）。所以 **windows.h 必须最先包含**（带 WIN32_LEAN_AND_MEAN，
+//   免得它把 winsock.h 也拽进来与 trantor 的 winsock2.h 打架），并在 main 一进来就切码页。
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -295,6 +306,14 @@ json capabilitySnapshot(const ma::HostConfig& cfg, ma::Engines& e, ma::Registry&
 }  // namespace
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    // 控制台切 UTF-8（见文件头注释）：不切就是"中文全乱码"，用户实测过。
+    // 输出码页决定"我们写出去的 UTF-8 字节怎么显示"，输入码页决定"我们读进来的参数怎么解码"。
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+    // 顺带让 std::cout 别再按老 code page 做任何转换（MSVC 下它本来就是直写字节）
+    std::ios::sync_with_stdio(true);
+#endif
     std::string configPath;
     std::string scenarioOverride;
     int stopAfterSeconds = 0;

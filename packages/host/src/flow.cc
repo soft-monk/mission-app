@@ -274,8 +274,13 @@ bool FlowEngine::initSelfCheck() {
     }
 
     // ---- 规则包（kind:"probes"）：文案、分组、等级映射、进度源全在里面
+    //
+    // ★ 路径必须走 `resolvePath`：config.json 里的路径是**相对配置文件**写的
+    //   （`../selfcheck/policies/mapapp/probes.json`）。直接用原串会按**进程当前目录**去解析 ——
+    //   从 build\bin\Release\ 或任何别处启动就必然读不到（实测症状：
+    //   "规则包装载失败（../selfcheck/…）：code=1000 规则包文件读不到"）。
     if (!cfg_.selfcheckPolicies.empty()) {
-        const std::string path = cfg_.selfcheckPolicies;
+        const std::string path = cfg_.resolvePath(cfg_.selfcheckPolicies);
         const selfcheck::LoadResult lr = engine->loadPoliciesFile(path);
         if (lr.code != 0) {
             selfCheckNote_ = "规则包装载失败（" + path + "）：code=" + std::to_string(lr.code);
@@ -313,11 +318,12 @@ void FlowEngine::refreshCapabilities() {
     mapapp_probes::Capabilities c;
     if (!cfg_.selfcheckCapabilities.empty()) {
         std::string err;
-        if (mapapp_probes::Capabilities::load(cfg_.selfcheckCapabilities, c, &err)) {
+        const std::string capsPath = cfg_.resolvePath(cfg_.selfcheckCapabilities);  // 同上：相对配置文件
+        if (mapapp_probes::Capabilities::load(capsPath, c, &err)) {
             // 文件是缺省值，宿主的真实读数覆盖它（真实状态优先于兜底文件）
             for (auto it = caps.begin(); it != caps.end(); ++it) c.set(it.key(), it.value());
         } else {
-            LOG_WARN << "[flow] 能力快照文件读不到（" << cfg_.selfcheckCapabilities
+            LOG_WARN << "[flow] 能力快照文件读不到（" << capsPath
                      << "）：" << err << " —— 只用宿主实测值";
             for (auto it = caps.begin(); it != caps.end(); ++it) c.set(it.key(), it.value());
         }
@@ -5647,7 +5653,7 @@ nlohmann::json FlowEngine::command(const std::string& verb, const nlohmann::json
             // 而不是残留上一轮的结论。
             if (!cfg_.selfcheckPolicies.empty()) {
                 const selfcheck::LoadResult lr =
-                    engines_.selfCheckEngine->loadPoliciesFile(cfg_.selfcheckPolicies);
+                    engines_.selfCheckEngine->loadPoliciesFile(cfg_.resolvePath(cfg_.selfcheckPolicies));
                 reloadCode = lr.code;
             }
             engines_.selfCheckEngine->resetProgress();
