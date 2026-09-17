@@ -341,7 +341,7 @@ void HostServer::registerRoutes() {
         },
         {drogon::Get});
 
-    // ---- /runtime-config：给前端的最小装配信息（瓦片模板 + 就绪表）
+    // ---- /runtime-config：给前端的最小装配信息（瓦片模板 + 就绪表 + 流程词汇表）
     app.registerHandler(
         "/runtime-config",
         [this](const drogon::HttpRequestPtr&,
@@ -349,6 +349,19 @@ void HostServer::registerRoutes() {
             nlohmann::ordered_json out;
             out["version"] = kVersion;
             out["tiles"] = nlohmann::ordered_json{{"template", cfg_.tilesTemplate}};
+            // 11 步的显示名 + 流程词汇表（含界面文案与语音台词）——**词汇表是配置，前端不写死**。
+            // 前端拿它渲染"步 N/11 · 屏名"与语音条；配置里缺的键，前端如实显示"未配置"。
+            {
+                nlohmann::ordered_json steps = nlohmann::ordered_json::array();
+                for (const auto& s : cfg_.flowSteps) {
+                    steps.push_back(nlohmann::ordered_json{
+                        {"step", s.step}, {"key", s.key}, {"title", s.title}, {"phase", s.phase}});
+                }
+                out["steps"] = std::move(steps);
+                nlohmann::ordered_json labels = nlohmann::ordered_json::object();
+                for (const auto& kv : cfg_.flowLabels) labels[kv.first] = kv.second;
+                out["labels"] = std::move(labels);
+            }
             out["stats"] = nlohmann::ordered_json::parse(reg_.statsJson(kVersion));
             cb(jsonResponse(out.dump()));
         },

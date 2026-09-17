@@ -1,60 +1,133 @@
 // mission-app · apps/web/src/App.tsx
 //
-// 前端总入口 = **流程路由**。它只做三件事：
-//   ① 维护与宿主的状态同步（`useFlow`：轮询 + WS 事件）
-//   ② 按 `state.step` 决定显示哪一屏（Excel 11 步；第 3 步起才有地图）
-//   ③ 把用户动作翻译成命令（启动加载 / 一键自检 / 重新检测 / 进入任务）
+// 前端总入口 = **屏路由**（需求专篇 DES-APP-001 §1/§4）。
+//   ① 与宿主同步状态（`useFlow`：轮询 + WS）
+//   ② 按 `state.step` 选"这一步的默认屏"，并允许用户在同一组内切子屏（`setScreen`）
+//   ③ 给所有屏套**全局框架**（顶栏 + 左导航 7 项 + 底部 6 段状态条 + 麦克风球）
 //
-// ★ 纪律：本文件不写任何业务文案、不编任何百分比、不判断"通过与否"——
-//   所有取值都来自 `/api/state`（其源头是各引擎 + 规则包）。
+// ★ 纪律：
+//   · 本文件不写业务文案、不编百分比、不判断"通过与否"——取值全部来自 `/api/state`（源头是引擎+规则包）；
+//   · **前端不许自己改步号**：切屏只改本地 `screenId`，要动流程一律发命令（`flow.goto` / `mission.advance`）；
+//   · 图上没有的屏不做，图上没有的按钮不加（例外见 README「本轮的已知偏差」）。
 //
-// 排障后门：`?stage=map` 直接进地图台（P1 的 live-check 用它，跳过启动/自检两屏）。
-import { useCallback, useMemo, useState, type CSSProperties } from 'react'
+// 排障后门：`?stage=map` 直接进地图台；`?screen=SH-09` 直达某一屏（截图脚本用）。
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useFlow } from './flow/useFlow'
 import { useGoto } from './flow/useSituation'
 import { DEFAULT_WS_URL } from './telemetry'
-import { C, statusColor } from './theme'
+import { C } from './theme'
 import { TopBar } from './screens/Chrome'
+import { AppShell, MicBall, type NavKey } from './shell/AppShell'
+import { VoiceStrip, voiceLine, useLabels } from './shell/VoiceStrip'
+import { SCREEN_BY_ID, defaultScreenForStep, NAV_TARGET } from './screens/registry'
 import { BootScreen } from './screens/BootScreen'
 import { SelfCheckScreen } from './screens/SelfCheckScreen'
 import { SituationScreen } from './screens/SituationScreen'
+import { SceneConfirmScreen } from './screens/SceneConfirmScreen'
 import { GroupingScreen } from './screens/GroupingScreen'
 import { GroupConfirmScreen } from './screens/GroupConfirmScreen'
-import { StageOverlay } from './screens/StageOverlay'
-import { ExecuteScreen } from './screens/ExecuteScreen'
+import { LinkTopologyScreen } from './screens/LinkTopologyScreen'
+import { LinkStableScreen } from './screens/LinkStableScreen'
+import { ReconExpandScreen } from './screens/ReconExpandScreen'
+import { ReconFusionScreen } from './screens/ReconFusionScreen'
 import { TargetsScreen } from './screens/TargetsScreen'
 import { StrikeScreen } from './screens/StrikeScreen'
 import { StrikeConfirmScreen } from './screens/StrikeConfirmScreen'
 import { GuidanceScreen } from './screens/GuidanceScreen'
+import { DamageAssessScreen } from './screens/DamageAssessScreen'
 import { SummaryScreen } from './screens/SummaryScreen'
+import { BigScreenExec } from './screens/BigScreenExec'
+import { BigScreenRecon } from './screens/BigScreenRecon'
 import { MapStage } from './MapStage'
 
 function param(name: string): string | null {
   try { return new URLSearchParams(window.location.search).get(name) } catch { return null }
 }
 
+/**
+ * 步号 → 要依次推进的**阶段链**（按 `phase-engine/policies/mapapp/phases.json` 的阶段图：
+ * 只能沿相邻边前进，所以"步 6 → 步 7"是 `T3` 再 `T4`）。
+ * 与 `config.json` 的 `flow.steps[].phase` 是同一份事实，这里只是"从当前步走到目标步要过哪几个阶段"。
+ */
+const ADVANCE_CHAIN: Record<number, string[]> = {
+  3: ['T0'],
+  4: ['T1'],
+  6: ['T2'],
+  7: ['T3', 'T4'],
+  8: ['T5'],
+  10: ['T6'],
+  11: ['T7'],
+}
+
 export function App() {
   const wsUrl = param('ws') ?? DEFAULT_WS_URL
   const stageOverride = param('stage')
+  const screenParam = param('screen')
   const flow = useFlow(wsUrl)
-  // 步 3–5 三屏要发自己的 verb（`situation.snapshot` / `view.compose` / `alloc.*`），
-  // 所以整个句柄往下传；命令面仍然只有 `flow.send` → `POST /api/command` 这一条路。
   const { state, error, send, lastReply } = flow
+  const labels = useLabels()
+
   const [busy, setBusy] = useState(false)
-  // 步 4 → 步 5 只带一个"用户选了哪个方案"。切步本身一律发 `flow.goto`（step 归宿主）。
+  // 本地"这一步里的哪一屏"。null = 跟随宿主步号（`?screen=` 深链时锁定不跟随）
+  const [screenId, setScreenId] = useState<string | null>(screenParam)
+  const locked = useRef(!!screenParam)
   const [planId, setPlanId] = useState<string | null>(null)
-  // 步 8 → 步 9 同理带一个"选了哪个**打击**方案"（步 9 的 `guidance.plan{planId}` 要用它）
   const [strikePlanId, setStrikePlanId] = useState<string | null>(null)
-  const goto = useGoto(send)
+  const [nav, setNav] = useState<NavKey>('态势')
+  const [voiceOpen, setVoiceOpen] = useState(false)
+  const [notice, setNotice] = useState<string | null>(null)
+  /**
+   * **走流程**：把"进入第 N 步"翻译成**先推进阶段、再落屏**。
+   *
+   * 为什么不是一句 `flow.goto{step:N}`：`flow.goto` 只换屏、**不动阶段**（阶段图是引擎的规则），
+   * 于是屏上写的"步 6"和引擎里的阶段 T0 会对不上，后续所有靠阶段门禁的 verb 都会被拒
+   * （实测：一路 `flow.goto` 走到步 6，阶段仍停在 T0，`mission.advance{T3}` 直接被门禁挡下）。
+   *
+   * 所以：① 按阶段图的**边**依次 `mission.advance`（跨中间阶段的走链，例：步 7 = T3 → T4）；
+   *      ② 再发一次 `flow.goto{step}` 把屏定死（阶段推进成功时它本来就落到同一步，是幂等收尾）。
+   * 阶段推进被 Gate 挡下时**照实回执**（界面会显示），随后仍把屏切过去 —— 不假装阶段成功。
+   */
+  const goto = useCallback(async (target: number) => {
+    const chain = ADVANCE_CHAIN[target] ?? []
+    for (const phase of chain) {
+      const r = await send('mission.advance', { to: phase })
+      if (r.code !== 0) break
+    }
+    await send('flow.goto', { step: target })
+  }, [send])
 
   const run = useCallback(async (verb: string, params: Record<string, unknown> = {}) => {
     setBusy(true)
-    try {
-      await send(verb, params)
-    } finally {
-      setBusy(false)
-    }
+    try { await send(verb, params) } finally { setBusy(false) }
   }, [send])
+
+  const step = state?.step ?? 0
+  // 宿主步号变了 → 回到这一步的默认屏（深链锁定时不跟随，截图脚本要它停在指定屏）
+  const prevStep = useRef<number | null>(null)
+  useEffect(() => {
+    if (prevStep.current !== null && prevStep.current !== step && !locked.current) setScreenId(null)
+    prevStep.current = step
+  }, [step])
+
+  // 当前屏：`?screen=` 深链优先，否则跟随宿主步号（步 1/2 是启动与自检两屏）
+  const activeId = screenId ?? defaultScreenForStep(step || 1)
+  const def = SCREEN_BY_ID[activeId] ?? SCREEN_BY_ID['SH-03']
+
+  const go = useCallback((id: string) => {
+    const d = SCREEN_BY_ID[id]
+    setScreenId(id)
+    if (d) setNav(d.nav)
+  }, [])
+
+  const onNav = useCallback((k: NavKey) => {
+    setNav(k)
+    const target = NAV_TARGET[k]
+    if (!target) { setNotice(`左导航「${k}」本期未实现（图上保留该入口）`); return }
+    if (step < target.needStep) { setNotice(`「${k}」要第 ${target.needStep} 步之后才可用（当前第 ${step} 步）`); return }
+    setNotice(null)
+    const sameStep = target.screens.find((id) => SCREEN_BY_ID[id]?.steps.includes(step))
+    go(sameStep ?? target.screens[0])
+  }, [go, step])
 
   // ---- 排障后门：直接看地图台 ----
   if (stageOverride === 'map') {
@@ -68,28 +141,8 @@ export function App() {
     )
   }
 
-  // ---- 底部全局状态条（Excel 步 3 起显示；项与文案来自宿主的 statusBar）----
-  const bottomBar = useMemo(() => {
-    const items = state?.statusBar ?? []
-    if (!items.length) return null
-    return (
-      <div style={statusBarStyle}>
-        {items.map((it) => (
-          <span key={it.key} style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
-            <span style={{ color: C.textDim }}>{it.name}</span>
-            <span style={{ color: statusColor(it.status) }}>{it.text || it.status}</span>
-          </span>
-        ))}
-      </div>
-    )
-  }, [state?.statusBar])
-
   // ---- 首帧：还没拿到状态 ----
-  //
-  // ★ 千万别在这里用 `inset` 简写（曾经写过 `top:42, inset:42`）：这一块与下面的步容器
-  //   处在**同一棵树位置**，React 复用同一个 DOM 节点、按属性逐个 diff —— 切到步容器时
-  //   它会移除 `inset`（简写移除会连带清掉 top），而 `top:42` 因为"值没变"不会被重设，
-  //   结果整屏容器塌成 0 高、内容全跑到视口外。一律用 left/right/bottom 长写。
+  // ★ 别用 `inset` 简写（曾踩过：简写移除会连带清掉 top，整屏容器塌成 0 高）——一律长写。
   if (!state) {
     return (
       <div style={{ position: 'absolute', inset: 0, background: C.bg, color: C.text }}>
@@ -103,22 +156,27 @@ export function App() {
     )
   }
 
-  const step = state.step
-
-  return (
-    <div style={{ position: 'absolute', inset: 0, background: C.bg, color: C.text }}>
-      <TopBar linkOk={state.wsClients > 0} />
-
-      <div style={{ position: 'absolute', top: 42, left: 0, right: 0, bottom: 0 }}>
-        {step <= 1 && (
-          <BootScreen
-            state={state}
-            running={busy}
-            onStart={() => void run('boot.run', { pacingMs: 400 })}
-          />
-        )}
-
-        {step === 2 && (
+  // ---- SH-01 / SH-02：图上另有版式（无左导航/状态条/麦克风）----
+  // 注意：判据是**当前屏**而不是宿主步号 —— 这样 `?screen=SH-03` 在宿主还停在步 2 时也能直达
+  // （截图脚本要靠它；屏上的数据可能未就绪，那是当期真实状态）。
+  if (def.id === 'SH-01') {
+    return (
+      <div style={{ position: 'absolute', inset: 0, background: C.bg, color: C.text }}>
+        <TopBar linkOk={state.wsClients > 0} />
+        <div style={{ position: 'absolute', top: 42, left: 0, right: 0, bottom: 0 }}>
+          <BootScreen state={state} running={busy} onStart={() => void run('boot.run', { pacingMs: 400 })} />
+        </div>
+        <FlowBadge state={state} lastReply={lastReply} screenId="SH-01" />
+        {screenParam && <ForcedNotice step={state.step} screen={def.id} />}
+        <Probe state={state} />
+      </div>
+    )
+  }
+  if (def.id === 'SH-02') {
+    return (
+      <div style={{ position: 'absolute', inset: 0, background: C.bg, color: C.text }}>
+        <TopBar linkOk={state.wsClients > 0} />
+        <div style={{ position: 'absolute', top: 42, left: 0, right: 0, bottom: 0 }}>
           <SelfCheckScreen
             state={state}
             busy={busy}
@@ -127,132 +185,183 @@ export function App() {
             onRecheck={() => void run('selfcheck.recheck', {})}
             onEnter={() => void run('flow.enter', {})}
           />
-        )}
+        </div>
+        <FlowBadge state={state} lastReply={lastReply} screenId="SH-02" />
+        {screenParam && <ForcedNotice step={state.step} screen={def.id} />}
+        <Probe state={state} />
+      </div>
+    )
+  }
 
-        {step >= 3 && (
-          /* `data-ma-stagestrip` 是给 index.html 里那条 CSS 用的选择器锚点（截断 /health 原文，
-             免得它换行把地图挤下去）；不改 MapStage 的 JSX。 */
-          <div data-ma-stagestrip="1" style={{ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0 }}>
-            <MapStage phase={state.phase} bottomBar={bottomBar} />
-          </div>
-        )}
+  // ---- SH-19 / SH-20：两张**大屏**（图上自成一壳：居中大标题、无左导航/状态条/麦克风）----
+  if (def.id === 'SH-19' || def.id === 'SH-20') {
+    return (
+      <div style={{ position: 'absolute', inset: 0, background: C.bg, color: C.text }}>
+        <TopBar linkOk={state.wsClients > 0} />
+        <div style={{ position: 'absolute', top: 42, left: 0, right: 0, bottom: 0 }}>
+          {def.id === 'SH-19'
+            ? <BigScreenExec state={state} flow={flow} />
+            : <BigScreenRecon state={state} flow={flow} />}
+        </div>
+        <FlowBadge state={state} lastReply={lastReply} screenId={def.id} />
+        <Probe state={state} />
+        <BackToFlow onBack={() => { locked.current = false; setScreenId(null) }} />
+      </div>
+    )
+  }
 
-        {/* 步 3–5 是**覆盖层**（不是整页替换）：地图台照常跑，各屏只往上摆面板。
-            摆成 MapStage 的**兄弟节点**（不是 children）——MapStage 是主 agent 的文件，
-            步 6–9 的屏幕也要走同一个插槽，所以这里不动它，只用 z-index 叠上去。
-            第 6 步起由 C/D 两组写者的屏幕接管这一层。 */}
-        {step === 3 && (
-          <StageOverlay>
-            <SituationScreen state={state} flow={flow} />
-          </StageOverlay>
-        )}
-        {step === 4 && (
-          <StageOverlay>
-            <GroupingScreen
-              state={state}
-              flow={flow}
-              onNext={(id) => { setPlanId(id); goto(5) }}
-              onSelectPlan={setPlanId}
-            />
-          </StageOverlay>
-        )}
-        {step === 5 && (
-          <StageOverlay>
-            <GroupConfirmScreen
-              state={state}
-              flow={flow}
-              selectedPlanId={planId}
-              onPickPlan={setPlanId}
-            />
-          </StageOverlay>
-        )}
-
-        {/* 步 6 任务执行（T2-1/T3-1）：同样是覆盖层——地图台照常画无人机与航迹，
-            本屏只叠控制条（起飞/暂停/恢复/倍速）与两块引擎读数面板（链路/覆盖）。 */}
-        {step === 6 && (
-          <StageOverlay>
-            <ExecuteScreen state={state} flow={flow} />
-          </StageOverlay>
-        )}
-
-        {/* 步 7 实时侦察目标显示（T4-1/T4-2）：目标列表 + 详情/处置 + 视频/SAR 回传面板。 */}
-        {step === 7 && (
-          <StageOverlay>
-            <TargetsScreen state={state} flow={flow} />
-          </StageOverlay>
-        )}
-
-        {/* 步 8 任务决策与打击准备（T5-1）：三张打击方案卡（成功率/协同方式/预计完成时间/
-            方案要点/理由）+ 打击窗口 + 采纳回执。推荐标记只认引擎的 `recommendedId`。 */}
-        {step === 8 && (
-          <StageOverlay>
-            <StrikeScreen
-              state={state}
-              flow={flow}
-              selectedPlanId={strikePlanId}
-              onSelectPlan={setStrikePlanId}
-              onNext={() => goto(9)}
-            />
-          </StageOverlay>
-        )}
-
-        {/* 步 9 打击方案确认（T5-2）：地图上 IP 点高亮 + 引导连线（`MapDraw`，坐标全部取
-            `guidance.plan`）+ 打击窗口时间轴（每段带 basis）+ 确认打击回执逐条显示。 */}
-        {step === 9 && (
-          <StageOverlay>
-            <StrikeConfirmScreen
-              state={state}
-              flow={flow}
-              selectedPlanId={strikePlanId}
-              onSelectPlan={setStrikePlanId}
-              onBack={() => goto(8)}
-            />
-          </StageOverlay>
-        )}
-
-        {/* 步 10 协同执行与引导（T6-1 实时态势 / T6-2 引导控制）：目标处置
-            （`exec.run` / `exec.abort`）逐条回执 + `target.state` 事件驱动的状态与**地图变灰**
-            （颜色只由引擎状态决定）+ 回传画面（`media.channels`）。 */}
-        {step === 10 && (
-          <StageOverlay>
-            <GuidanceScreen state={state} flow={flow} onNext={() => goto(11)} />
-          </StageOverlay>
-        )}
-
-        {/* 步 11 任务总结（T7-1 毁伤评估 / T7-2 结果汇总）：`report.generate` 的报告卡
-            （分组/字段/缺失原因全部以返回结构为准）+ phase-engine 的时间轴 + 预警计数 + JSON 复看。 */}
-        {step === 11 && (
-          <StageOverlay>
-            <SummaryScreen state={state} flow={flow} onBack={() => goto(10)} />
-          </StageOverlay>
-        )}
+  // ---- 其余（SH-03…SH-18）：全局框架 + 分屏 ----
+  const vScreen = activeId.toLowerCase().replace('-', '') // 'SH-04' → 'sh04'
+  const hasVoice = !!(voiceLine(labels, vScreen, 'system') || voiceLine(labels, vScreen, 'question'))
+  return (
+    <div style={{ position: 'absolute', inset: 0, background: C.bg, color: C.text }}>
+      <TopBar linkOk={state.wsClients > 0} />
+      <div style={{ position: 'absolute', top: 42, left: 0, right: 0, bottom: 0 }} data-ma-stagestrip="1">
+        <AppShell
+          state={state}
+          nav={nav}
+          onNav={onNav}
+          voice={voiceOpen ? (
+            <div style={{ position: 'absolute', right: 16, bottom: 88, zIndex: 44, width: 340 }}>
+              {hasVoice
+                ? <VoiceStrip labels={labels} screen={vScreen} title={`AI语音（${def.title}）`} />
+                : <div style={{ border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px 12px', background: 'rgba(10,32,58,.85)', fontSize: 11.5, color: C.textDim }}>
+                    本屏图上没有语音台词（`flow.labels` 里没有 `voice.{vScreen}.*`）
+                  </div>}
+            </div>
+          ) : null}
+        >
+          {activeId !== 'SH-03' && <MapLayer state={state} screenId={activeId} />}
+          <ScreenBody
+            id={activeId}
+            state={state}
+            flow={flow}
+            busy={busy}
+            lastReply={lastReply}
+            goto={goto}
+            go={go}
+            planId={planId}
+            setPlanId={setPlanId}
+            strikePlanId={strikePlanId}
+            setStrikePlanId={setStrikePlanId}
+          />
+        </AppShell>
+        <MicBall open={voiceOpen} onToggle={() => setVoiceOpen((v) => !v)} />
       </div>
 
-      {/* 流程回执（左下角一行）：步骤 + 阶段 + 最近一条命令的结果 */}
-      <div style={flowBadgeStyle}>
-        步 {state.step}/{11} · {state.stepTitle || state.stepKey}
-        {state.phase ? ` · 阶段 ${state.phase}` : ''}
-        {lastReply && lastReply.code !== 0
-          ? ` · 命令失败 code=${lastReply.code}（${lastReply.error?.message ?? ''}）`
-          : ''}
-      </div>
-
-      {/* 自证句柄：验收脚本读它（不改渲染行为） */}
+      {notice && (
+        <div data-testid="nav-notice" style={noticeStyle} onClick={() => setNotice(null)}>
+          {notice}（点这条提示关掉）
+        </div>
+      )}
+      <FlowBadge state={state} lastReply={lastReply} screenId={activeId} />
       <Probe state={state} />
     </div>
   )
 }
 
-const statusBarStyle: CSSProperties = {
-  position: 'absolute', left: 0, right: 0, bottom: 0, height: 28, zIndex: 12,
-  display: 'flex', gap: 18, alignItems: 'center', padding: '0 14px',
-  background: 'rgba(6, 26, 47, 0.9)', borderTop: `1px solid ${C.border}`, fontSize: 12,
+/** 地图台：除 SH-03（态势主界面自己带地图）外的屏都在同一张地图上叠面板。 */
+function MapLayer({ state, screenId }: { state: NonNullable<ReturnType<typeof useFlow>['state']>; screenId: string }) {
+  // SH-04/SH-05/SH-06/SH-09/SH-10/SH-11/SH-12 需要地图；SH-07/SH-08 是拓扑屏（图上无地图）
+  const noMap = ['SH-07', 'SH-08'].includes(screenId)
+  if (noMap) return null
+  return (
+    <div style={{ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0 }}>
+      <MapStage phase={state.phase} />
+    </div>
+  )
 }
 
-const flowBadgeStyle: CSSProperties = {
-  position: 'absolute', left: 12, bottom: 34, zIndex: 40, fontSize: 11.5,
+function ScreenBody(p: {
+  id: string
+  state: NonNullable<ReturnType<typeof useFlow>['state']>
+  flow: ReturnType<typeof useFlow>
+  busy: boolean
+  lastReply: ReturnType<typeof useFlow>['lastReply']
+  goto: (n: number) => void
+  go: (id: string) => void
+  planId: string | null
+  setPlanId: (v: string | null) => void
+  strikePlanId: string | null
+  setStrikePlanId: (v: string | null) => void
+}) {
+  const { id, state, flow, goto, go } = p
+  switch (id) {
+    case 'SH-03': return <SituationScreen state={state} flow={flow} onGo={go} />
+    case 'SH-04': return <SceneConfirmScreen state={state} flow={flow} onGo={go} goto={goto} />
+    case 'SH-05': return <GroupingScreen state={state} flow={flow} onSelectPlan={p.setPlanId} onGo={go} />
+    case 'SH-06': return <GroupConfirmScreen state={state} flow={flow} selectedPlanId={p.planId} onPickPlan={p.setPlanId} onGo={go} goto={goto} />
+    case 'SH-07': return <LinkTopologyScreen state={state} flow={flow} onGo={go} />
+    case 'SH-08': return <LinkStableScreen state={state} flow={flow} onGo={go} goto={goto} />
+    case 'SH-09': return <ReconExpandScreen state={state} flow={flow} onGo={go} goto={goto} />
+    case 'SH-10': return <ReconFusionScreen state={state} flow={flow} onGo={go} goto={goto} />
+    case 'SH-11': return <TargetsScreen state={state} flow={flow} mode="list" onGo={go} />
+    case 'SH-12': return <TargetsScreen state={state} flow={flow} mode="detail" onGo={go} />
+    case 'SH-13': return <StrikeScreen state={state} flow={flow} selectedPlanId={p.strikePlanId} onSelectPlan={p.setStrikePlanId} onGo={go} />
+    case 'SH-14': return <StrikeConfirmScreen state={state} flow={flow} selectedPlanId={p.strikePlanId} onSelectPlan={p.setStrikePlanId} onBack={() => go('SH-13')} onGo={go} goto={goto} />
+    case 'SH-15': return <GuidanceScreen state={state} flow={flow} mode="exec" onGo={go} />
+    case 'SH-16': return <GuidanceScreen state={state} flow={flow} mode="control" onGo={go} />
+    case 'SH-17': return <DamageAssessScreen state={state} flow={flow} onGo={go} goto={goto} />
+    case 'SH-18': return <SummaryScreen state={state} flow={flow} onBack={() => go('SH-15')} onGo={go} goto={goto} />
+    default: return null
+  }
+}
+
+/** 左下角流程徽标：`步 N/11 · 屏名 · 阶段`（屏名取注册表，与左上角口径一致）。 */
+function FlowBadge({ state, lastReply, screenId }: {
+  state: NonNullable<ReturnType<typeof useFlow>['state']>
+  lastReply: ReturnType<typeof useFlow>['lastReply']
+  screenId: string
+}) {
+  const def = SCREEN_BY_ID[screenId]
+  return (
+    <div style={flowBadgeStyle} data-testid="flow-badge" data-screen={screenId}>
+      步 {state.step}/11 · {def?.title ?? (state.stepTitle || state.stepKey)}
+      {state.phase ? ` · 阶段 ${state.phase}` : ''}
+      {lastReply && lastReply.code !== 0
+        ? ` · 命令失败 code=${lastReply.code}（${lastReply.error?.message ?? ''}）`
+        : ''}
+    </div>
+  )
+}
+
+/** `?screen=` 深链与宿主当前步不一致时的如实提示（截图脚本会用到这个能力）。 */
+function ForcedNotice({ step, screen }: { step: number; screen: string }) {
+  return (
+    <div data-testid="forced-notice" style={{
+      position: 'absolute', right: 16, top: 52, zIndex: 60, fontSize: 11.5, lineHeight: 1.7,
+      color: C.warn, background: 'rgba(6,26,47,.92)', border: '1px solid rgba(245,158,11,.5)',
+      borderRadius: 8, padding: '6px 10px', maxWidth: 380,
+    }}>
+      本屏由 `?screen={screen}` 强制显示；宿主当前在**第 {step} 步** —— 屏上数据可能尚未就绪（如实显示，不代填）。
+    </div>
+  )
+}
+
+/** 大屏返回按钮（图上没有；大屏是独立壳，没有它就没法回到流程）。 */
+function BackToFlow({ onBack }: { onBack: () => void }) {
+  return (
+    <button
+      data-testid="bigscreen-back"
+      onClick={onBack}
+      style={{
+        position: 'absolute', left: 16, top: 56, zIndex: 50, padding: '6px 12px', fontSize: 12,
+        borderRadius: 8, border: '1px solid rgba(95,176,255,.45)', background: 'rgba(10,32,58,.85)',
+        color: '#cfe3f5', cursor: 'pointer',
+      }}
+    >← 回到流程界面</button>
+  )
+}
+
+const flowBadgeStyle = {
+  position: 'absolute' as const, left: 12, bottom: 36, zIndex: 40, fontSize: 11.5,
   color: C.textDim, background: 'rgba(6,26,47,.72)', border: `1px solid ${C.border}`,
-  borderRadius: 6, padding: '2px 8px', pointerEvents: 'none',
+  borderRadius: 6, padding: '2px 8px', pointerEvents: 'none' as const,
+}
+const noticeStyle = {
+  position: 'absolute' as const, left: 90, bottom: 44, zIndex: 60, fontSize: 12,
+  color: C.text, background: 'rgba(120,60,10,.92)', border: '1px solid rgba(245,158,11,.6)',
+  borderRadius: 8, padding: '6px 10px', cursor: 'pointer', maxWidth: 520,
 }
 
 /** 把当前流程状态挂到 window 上供脚本断言（只读，不影响渲染）。 */

@@ -1,39 +1,42 @@
 // mission-app · apps/web/src/screens/SummaryScreen.tsx
 //
-// Excel 步 11 · 任务总结（参考图 `T7-1.png` 毁伤评估地图 / `T7-2.png` 任务总结）。
+// **SH-18 任务总结界面（参考图 `场景1\T7-2.png`）**
 //
-// 数据面只有一条命令：`report.generate{}`（宿主 = report-engine `generate` + alert-engine `counts`
-// + store `query`）。本屏把它拆成四块如实渲染：
-//   · **报告卡**：字段与分组**以返回结构为准**（`document.groups[].fields[]`）——
-//     每个字段显示 `text`（引擎已格式化）+ `source{engine,path}`（RPT-SCHEMA-02 的溯源），
-//     `missing=true` 的**把宿主给的原因显示出来**（缺失标记 / 来源模块 / 引擎 missing[] 清单），
-//     绝不用 0 顶替（RPT-SCHEMA-03）。
-//   · **时间轴**：`durations`（phase-engine 的逐阶段耗时）——段数与顺序**原样**，前端不自己算。
-//   · **预警次数**：alert-engine 的计数**原样**（并标出 `basis` 声明取的是哪个口径）。
-//   · **导出/复看**：只做"把报告 JSON 显示出来"（复制到剪贴板 + 展开原文），**不做文件下载**、
-//     不伪造"已导出报告 xx.pdf"。
+// 版式（照图）：顶部压条 ｜ 中区上 3/5 地图（App 的 MapStage，本屏只摆浮层）
+//   ｜ 地图下部通栏：**3 张指标卡（目标清除 / 覆盖区域 / 协同效率）** + 「报告生成」进度行
+//   + **3 个状态标签（信息包已推送 / 残余风险低 / 链路待释放）** + **3 个按钮**
+//   （返回场景选择 / 导出任务报告 / 快速脱离体系）｜ 右栏 3 面板（AI摘要 / 关键结果 / 后续处置）
+//   ｜ 左栏：报告时间轴 / 预警次数 / 报告 JSON（需求专篇 §7「报告面板较全」→ 保留，按图补新块）
 //
-// ★ 纪律：拿不到的字段写"—/未就绪 + code"；这条 verb 未实现时把宿主原话摆在最显眼处，
-//   并明确写出"报告未生成"，不画假数字、不画假时间轴。
+// 数据面（只读为主，两条动作）：
+//   · `report.generate{}` —— 报告文档（`document.groups[].fields[]`：**字段名与数值一律以回执为准**）
+//     + phase-engine 的 `durations`（逐阶段耗时）+ alert-engine 的 `counts`（预警次数）
+//   · `targets.list` / `sensor.status` / `topology.evaluate` —— 指标卡在报告缺字段时的**台账回落**
+//     （回落一律在卡面写明来源，不换算、不折算）
+//   · 【导出任务报告】= 把**报告 JSON** 复制 + 展开（**不做文件下载、不谎报 PDF**）
+//   · 【返回场景选择】= `mission.reset`（结束本轮）→ `flow.goto{step:3}` → 本地切到 SH-03
+//   · 【快速脱离体系】= **disabled**，`title` 写明「宿主尚未提供该 verb」（图上按钮保留）
 //
-// 地图（T7-1 的"毁伤评估"部分）：本屏只把**台账目标**按引擎状态重画一遍
-//   （已被判失效的用 `theme` 的 muted 灰、其余按状态色），**不编残余威胁点、不编回收轨迹/
-//   复核航线**——那三类几何宿主没给（契约里步 11 只有 `report.generate` 一条 verb），
-//   谁画谁就是编数据。
-import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
-import { DEFAULT_INSTANCE_ID, getMapInstance, MapDraw, type PrimitiveKind } from 'map-2d'
+// ★ 图上给了示意数值（目标清除 3 / 覆盖区域 24.6 km² / 协同效率 91% / 成功率 92% /
+//   组网时长 38分钟）——**一律不写死**：报告字段对得上就显示回执里的数，对不上显示"—"并写明原因
+//   （`missingReason`：宿主 warnings 原话 → 溯源模块 → 缺失标记 → missingFields）。
+//
+// 样式：`theme.ts` 令牌；不用 `backdrop-filter`；**不用 `inset` 简写**（与 `top` 混用会清掉 top）。
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react'
+import { MapDraw, type PrimitiveKind } from 'map-2d'
 import { C, panel, panelTitle, statusColor } from '../theme'
 import type { CommandReply, FlowState } from '../api'
 import type { UseFlow } from '../flow/useFlow'
-import { n2s, replyText, useVerbOnce } from '../flow/useSituation'
-import { readTargets } from '../flow/useOps'
+import { isObj, obj, objList, pick, replyText, str, useVerbOnce } from '../flow/useSituation'
+import { readTargets, readTopology, readSensor } from '../flow/useOps'
 import {
   alertCountOf, dynamicStateName, isStruckState, missingReason, msText,
   readAlertCounts, readDurations, readReport,
   type DurationsView, type ReportFieldView, type ReportView,
 } from '../flow/useExec'
+import { useLabels, voiceLine } from '../shell/VoiceStrip'
 import { VerbVerdict } from './VerbVerdict'
-import { StageOverlay, StageStrip } from './StageOverlay'
+import { StageStrip } from './StageOverlay'
 
 /** 一行「名 + 值」：值缺失显示"—"，**不补 0**。 */
 function Row({ k, v, color, testid }: { k: string; v: string; color?: string; testid?: string }) {
@@ -46,10 +49,10 @@ function Row({ k, v, color, testid }: { k: string; v: string; color?: string; te
 }
 
 function Section({ title, children, testid, right }: {
-  title: React.ReactNode
-  children: React.ReactNode
+  title: ReactNode
+  children: ReactNode
   testid?: string
-  right?: React.ReactNode
+  right?: ReactNode
 }) {
   return (
     <div data-testid={testid} style={{ ...panel, width: '100%', boxSizing: 'border-box' }}>
@@ -62,14 +65,65 @@ function Section({ title, children, testid, right }: {
   )
 }
 
-/** 一个报告字段的显示值：缺失 → 缺失标记（`—`），**不显示 0**。 */
+/** 报告一个字段的显示值：缺失 → 缺失标记（`—`），**不显示 0**。 */
 function fieldValue(f: ReportFieldView): string {
   if (f.missing) return f.missingMarker ?? f.text ?? '—'
   const t = f.text
   return f.unit && !t.includes(f.unit) ? `${t} ${f.unit}` : t
 }
 
-/** 时间轴一段（phase-engine 的 `perPhase[]`，逐段显示）。 */
+/** 字段溯源一行（`source.engine · source.path`，RPT-SCHEMA-02）。 */
+function fieldSource(f: ReportFieldView): string {
+  return [f.source.engine, f.source.path].filter(Boolean).join(' · ') || '（引擎未给 source）'
+}
+
+/** 按 key 优先级找字段（报告结构以回执为准；找不到就是 undefined → 界面显示"—"）。 */
+function fieldByKeys(rv: ReportView, keys: string[]): ReportFieldView | undefined {
+  for (const k of keys) {
+    for (const g of rv.groups) {
+      const hit = g.fields.find((f) => f.key.toLowerCase() === k.toLowerCase())
+      if (hit) return hit
+    }
+  }
+  return undefined
+}
+
+/** 按 key/name 关键字找字段（宿主改字段名时的兜底；仍然只取回执里的字段）。 */
+function fieldByKeyword(rv: ReportView, needles: string[]): ReportFieldView | undefined {
+  for (const g of rv.groups) {
+    for (const f of g.fields) {
+      const hay = `${f.key} ${f.name}`.toLowerCase()
+      if (needles.some((n) => hay.includes(n.toLowerCase()))) return f
+    }
+  }
+  return undefined
+}
+
+/** 报告原文里的标量（递归找 key；找不到 undefined）——用于查"报告里到底有没有这个字段"。 */
+function deepScalar(v: unknown, key: string, depth = 0): unknown {
+  if (depth > 6 || v === null || v === undefined) return undefined
+  if (Array.isArray(v)) {
+    for (const it of v) { const hit = deepScalar(it, key, depth + 1); if (hit !== undefined) return hit }
+    return undefined
+  }
+  if (isObj(v)) {
+    for (const [k, val] of Object.entries(v)) {
+      if (k.toLowerCase() === key.toLowerCase() && (typeof val === 'string' || typeof val === 'number' || typeof val === 'boolean')) return val
+      const hit = deepScalar(val, key, depth + 1)
+      if (hit !== undefined) return hit
+    }
+  }
+  return undefined
+}
+
+/** 秒 → 「X 分钟」（**只做单位换算**，并把原始秒数一并写在卡片小字里）。 */
+function secText(sec?: number): string {
+  if (sec === undefined) return '—'
+  if (sec < 60) return `${Number(sec.toFixed(1))} 秒`
+  return `${Number((sec / 60).toFixed(1))} 分钟`
+}
+
+/** 报告时间轴一段（phase-engine 的 `perPhase[]`）。 */
 function SegCard({ seg, index }: { seg: DurationsView['segs'][number]; index: number }) {
   return (
     <div
@@ -77,56 +131,21 @@ function SegCard({ seg, index }: { seg: DurationsView['segs'][number]; index: nu
       data-seg-key={seg.key}
       data-seg-phase={seg.phase}
       data-seg-dwell={seg.dwellMs !== undefined ? String(seg.dwellMs) : ''}
-      title={[seg.phase, msText(seg.dwellMs)].join(' · ')}
       style={{
-        // `minWidth` + `flexShrink:0`：段数多（实测最多 12 段）时**横向滚动**，
-        // 而不是把每张卡压到 20 px、把「0 ms」拆成两行（review 截图里踩到过）。
-        flex: '1 0 auto', minWidth: 68, maxWidth: 132, display: 'flex', flexDirection: 'column', gap: 2,
+        flex: '1 0 auto', minWidth: 64, maxWidth: 126, display: 'flex', flexDirection: 'column', gap: 2,
         border: `1px solid ${seg.current ? C.borderStrong : C.border}`, borderRadius: 8,
         background: seg.current ? 'rgba(29,78,216,.28)' : 'rgba(10,32,58,.6)', padding: '6px 8px', overflow: 'hidden',
       }}
     >
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 5 }}>
-        <span style={{ width: 11, height: 11, borderRadius: '50%', flex: '0 0 auto', marginTop: 2, background: seg.current ? C.accent : 'rgba(95,176,255,.35)', border: `1px solid ${C.border}` }} />
-        <span data-testid="p6-timeline-seg-phase" style={{ fontSize: 13.5, color: C.accent, whiteSpace: 'nowrap' }}>{seg.phase}</span>
-        <span style={{ fontSize: 10.5, color: C.textDim }}>#{seg.seq ?? index + 1}</span>
+        <span style={{ width: 10, height: 10, borderRadius: '50%', flex: '0 0 auto', marginTop: 2, background: seg.current ? C.accent : 'rgba(95,176,255,.35)', border: `1px solid ${C.border}` }} />
+        <span data-testid="p6-timeline-seg-phase" style={{ fontSize: 13, color: C.accent, whiteSpace: 'nowrap' }}>{seg.phase}</span>
+        <span style={{ fontSize: 10, color: C.textDim }}>#{seg.seq ?? index + 1}</span>
       </div>
-      <div data-testid="p6-timeline-seg-dwell" style={{ fontSize: 12.5, color: C.text, fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>
-        {msText(seg.dwellMs)}
-      </div>
-      <div style={{ fontSize: 9.5, color: C.textDim, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-        dwellMs={seg.dwellMs ?? '—'}
-      </div>
-      <div style={{ fontSize: 9.5, color: C.textDim, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-        进 {seg.enteredAt !== undefined ? new Date(seg.enteredAt).toLocaleTimeString() : '—'}
-      </div>
-      <div style={{ fontSize: 9.5, color: C.textDim, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-        出 {seg.leftAt !== undefined ? new Date(seg.leftAt).toLocaleTimeString() : '（进行中）'}
-      </div>
-      {seg.current && <div style={{ fontSize: 9.5, color: C.accent, whiteSpace: 'nowrap' }}>当前阶段</div>}
-    </div>
-  )
-}
-
-/** 中心结果卡里的一张"关键数值"卡（只显示引擎给了数的字段）。 */
-function BigValue({ f }: { f: ReportFieldView }) {
-  return (
-    <div
-      data-testid="p6-big-value"
-      data-field-key={f.key}
-      data-missing={f.missing ? '1' : '0'}
-      style={{
-        flex: '1 1 0', minWidth: 0, border: `1px solid ${f.missing ? C.border : C.borderStrong}`, borderRadius: 9,
-        background: 'rgba(10,32,58,.62)', padding: '8px 10px', display: 'flex', flexDirection: 'column', gap: 2,
-      }}
-    >
-      <div style={{ fontSize: 11, color: C.textDim, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name}</div>
-      <div style={{ fontSize: 20, color: f.missing ? C.muted : C.accent, fontVariantNumeric: 'tabular-nums', lineHeight: 1.15 }}>
-        {fieldValue(f)}
-      </div>
-      <div style={{ fontSize: 9.5, color: C.textDim }}>
-        {f.source.engine ?? '—'}{f.source.path ? ` · ${f.source.path}` : ''}
-      </div>
+      <div data-testid="p6-timeline-seg-dwell" style={{ fontSize: 12, color: C.text, fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>{msText(seg.dwellMs)}</div>
+      <div style={{ fontSize: 9.5, color: C.textDim, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>dwellMs={seg.dwellMs ?? '—'}</div>
+      <div style={{ fontSize: 9.5, color: C.textDim, whiteSpace: 'nowrap' }}>进 {seg.enteredAt !== undefined ? new Date(seg.enteredAt).toLocaleTimeString() : '—'}</div>
+      <div style={{ fontSize: 9.5, color: C.textDim, whiteSpace: 'nowrap' }}>出 {seg.leftAt !== undefined ? new Date(seg.leftAt).toLocaleTimeString() : '（进行中）'}</div>
     </div>
   )
 }
@@ -143,56 +162,152 @@ function FieldRow({ f, rv }: { f: ReportFieldView; rv: ReportView }) {
     >
       <div style={{ display: 'flex', gap: 8, alignItems: 'baseline' }}>
         <span style={{ flex: 1, minWidth: 0, fontSize: 11.5, color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name}</span>
-        <span
-          data-testid="p6-field-value"
-          style={{ fontSize: 12, color: f.missing ? C.muted : C.text, fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}
-        >{fieldValue(f)}</span>
+        <span data-testid="p6-field-value" style={{ fontSize: 12, color: f.missing ? C.muted : C.text, fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>{fieldValue(f)}</span>
         {f.missing && <span style={{ fontSize: 9.5, color: C.warn, whiteSpace: 'nowrap' }}>缺失</span>}
       </div>
       <div style={{ fontSize: 9.5, color: C.textDim, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-        来源 {f.source.engine ?? '—'}{f.source.path ? ` / ${f.source.path}` : ''}{f.source.compute ? ` · ${f.source.compute}` : ''}
+        来源 {f.source.engine ?? '—'}{f.source.path ? ` / ${f.source.path}` : ''}
       </div>
-      {/* ↓ 无数据时必须写出**宿主给的原因**（MUST NOT 显示成空白的 0） */}
       {f.missing && (
-        <div data-testid="p6-field-missing-reason" style={{ fontSize: 9.5, color: C.warn, lineHeight: 1.45 }}>
-          {missingReason(f, rv)}
-        </div>
-      )}
-      {/* 列表型字段（逐目标结果这类）：行数按引擎给的来，超限截断要如实说 */}
-      {f.list && f.list.cells.length > 0 && (
-        <div data-testid="p6-field-list" style={{ fontSize: 9.5, color: C.textDim, marginTop: 1 }}>
-          {f.list.columns.length > 0 && <span>{f.list.columns.join(' / ')} · </span>}
-          行 {f.list.rowsShown ?? f.list.cells.length}/{f.list.rowsTotal ?? '—'}
-          {f.list.truncated ? '（引擎截断）' : ''}
-          <div style={{ color: C.text }}>
-            {f.list.cells.slice(0, 8).map((c) => `${c.key}=${c.missing ? '—' : c.text}`).join(' · ')}
-          </div>
-        </div>
+        <div data-testid="p6-field-missing-reason" style={{ fontSize: 9.5, color: C.warn, lineHeight: 1.45 }}>{missingReason(f, rv)}</div>
       )}
     </div>
   )
 }
 
-export function SummaryScreen({ state, flow, onBack }: {
+// ============================================================================
+// 指标卡（图上 3 张：目标清除 / 覆盖区域 / 协同效率）
+// ============================================================================
+
+interface MetricSpec {
+  /** 图上逐字的卡名 */
+  label: string
+  /** 主值（有真实数值时） */
+  value?: number
+  /** 主值单位（图上写的：km² / %；无单位就空） */
+  unit?: string
+  /** 无单位时的文本值（宿主 text） */
+  text?: string
+  /** 值的来源说明（回执字段 → 台账回落都在这里如实写） */
+  source: string
+  /** 缺数原因（显示在卡面下方，MUST NOT 用 0 顶替） */
+  missing?: string
+  testid: string
+  icon: 'target' | 'area' | 'coop'
+}
+
+function MetricCard({ m }: { m: MetricSpec }) {
+  const missing = m.value === undefined && !m.text
+  const main = missing ? '—' : (m.value !== undefined ? `${Number.isInteger(m.value) ? m.value : Number(m.value.toFixed(1))}${m.unit ?? ''}` : (m.text as string))
+  return (
+    <div
+      /* `p6-big-value` 是**旧脚本的契约名**（结果卡计数），`data-sh-card` 是本轮的新命名（sh18-card-*） */
+      data-testid="p6-big-value"
+      data-sh-card={m.testid}
+      data-field-key={m.testid.replace('sh18-card-', '')}
+      data-missing={missing ? '1' : '0'}
+      style={{
+        flex: '1 1 0', minWidth: 0, border: `1px solid ${missing ? C.border : C.borderStrong}`, borderRadius: 10,
+        background: 'rgba(10,32,58,.72)', padding: '8px 11px', display: 'flex', flexDirection: 'column', gap: 3, position: 'relative',
+      }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+        <MetricIcon kind={m.icon} />
+        <span style={{ fontSize: 12.5, color: C.text }}>{m.label}</span>
+        <span style={{ flex: 1 }} />
+        {/* 图上有绿对勾：**只在该卡确实取到真实值时才画**（缺失时画灰圈，不假装有值） */}
+        {missing
+          ? <span data-testid={`${m.testid}-tick`} title="未取到真实值 → 不画对勾" style={{ width: 14, height: 14, borderRadius: '50%', border: `1px solid ${C.unknown}`, display: 'inline-block' }} />
+          : <span data-testid={`${m.testid}-tick`} title="已取到真实值（来源见卡面小字）" style={{ color: C.ok, fontSize: 15, lineHeight: 1 }}>✓</span>}      </div>
+      <div style={{ fontSize: 26, lineHeight: 1.1, color: missing ? C.muted : C.text, fontVariantNumeric: 'tabular-nums' }}>{main}</div>
+      <div style={{ fontSize: 9.5, color: C.textDim, lineHeight: 1.45, wordBreak: 'break-word' }}>{m.source}</div>
+      {missing && m.missing && (
+        <div data-testid={`${m.testid}-missing`} style={{ fontSize: 9.5, color: C.warn, lineHeight: 1.45, wordBreak: 'break-word' }}>{m.missing}</div>
+      )}
+    </div>
+  )
+}
+
+/** 卡面小图标（照图的准星 / 叠层 / 六边形组网；纯装饰，不含数据）。 */
+function MetricIcon({ kind }: { kind: MetricSpec['icon'] }) {
+  const s = { stroke: C.accent, strokeWidth: 1.4, fill: 'none' } as const
+  return (
+    <svg width={18} height={18} viewBox="0 0 18 18" style={{ flex: '0 0 auto' }}>
+      {kind === 'target' && (<>
+        <circle cx={9} cy={9} r={5.4} {...s} />
+        <path d="M9 1v4M9 13v4M1 9h4M13 9h4" {...s} />
+      </>)}
+      {kind === 'area' && (<>
+        <path d="M2 6 L9 2 L16 6 L16 12 L9 16 L2 12 Z" {...s} />
+        <path d="M2 9 L16 9" {...s} />
+      </>)}
+      {kind === 'coop' && (<>
+        <path d="M9 2 L15 5.5 L15 12.5 L9 16 L3 12.5 L3 5.5 Z" {...s} />
+        <circle cx={9} cy={9} r={2.2} {...s} />
+      </>)}
+    </svg>
+  )
+}
+
+/** 状态标签（图上 3 个：信息包已推送 / 残余风险低 / 链路待释放）。 */
+function StatusChip({ label, found, positive, value, note, testid }: {
+  label: string
+  found: boolean
+  positive: boolean
+  value?: string
+  note: string
+  testid: string
+}) {
+  const mark = !found ? '—' : (positive ? '✓' : '●')
+  const color = !found ? C.unknown : (positive ? C.ok : C.accent)
+  return (
+    <span
+      data-testid={testid}
+      data-found={found ? '1' : '0'}
+      title={note}
+      style={{
+        display: 'inline-flex', alignItems: 'center', gap: 7, padding: '4px 10px', borderRadius: 7,
+        border: `1px solid ${found ? C.borderStrong : C.border}`, background: 'rgba(6,26,47,.72)',
+        fontSize: 12, color: found ? C.text : C.textDim, whiteSpace: 'nowrap',
+      }}
+    >
+      {label}
+      <span style={{ color, fontWeight: 700 }}>{mark}</span>
+      {value && <span style={{ color: C.textDim, fontSize: 10.5 }}>{value}</span>}
+    </span>
+  )
+}
+
+// ============================================================================
+// 屏
+// ============================================================================
+
+export function SummaryScreen({ state, flow, onBack, onGo, goto }: {
   state: FlowState
   flow: UseFlow
   /** 回步 10（切步一律发 `flow.goto`；本屏不自己改 step） */
   onBack?: () => void
+  /** 切到另一屏（只改本地屏路由） */
+  onGo?: (id: string) => void
+  /** 走流程（步号归宿主）：【返回场景选择】= 结束本轮（mission.reset）+ step 3 */
+  goto?: (step: number) => void
 }) {
-  // ---- 唯一一条命令：`report.generate{}`（幂等由宿主保证）----
+  const labels = useLabels()
+
+  // ---- ① 报告：`report.generate{}`（幂等由宿主保证）----
   const rep = useVerbOnce(flow, 'report.generate', {}, true)
-  const rv: ReportView = useMemo(() => readReport(rep.data), [rep.data])
-  const dv: DurationsView = useMemo(() => readDurations(rep.data), [rep.data])
-  const av = useMemo(() => readAlertCounts(rep.data), [rep.data])
+  /** `/api/state` 里也带"最近一次报告"（`state.report.last`）——回执未就绪时用它顶着，并写明来源。 */
+  const stateReport = obj(obj(state as unknown as Record<string, unknown>, 'report'), 'last')
+  const reportData = (rep.reply?.code === 0 ? rep.reply.data : undefined)
+    ?? (stateReport && isObj(stateReport) ? stateReport : undefined)
+  const reportFrom: 'verb' | 'state' | 'none' = rep.reply?.code === 0
+    ? 'verb' : (stateReport && isObj(stateReport) ? 'state' : 'none')
+  const rv: ReportView = useMemo(() => readReport(reportData), [reportData])
+  const dv: DurationsView = useMemo(() => readDurations(reportData), [reportData])
+  const av = useMemo(() => readAlertCounts(reportData), [reportData])
   const alertPick = alertCountOf(av)
 
-  // **实测形状先落一条日志**（排障用：控制台里能看到宿主到底给了什么结构）
-  useEffect(() => {
-    if (rep.reply === null) return
-    console.log('[report.generate] 实测回执', JSON.parse(JSON.stringify(rep.reply)))
-  }, [rep.reply])
-
-  // ---- `report.ready` 事件到达 → 重取一次（报告可能刚落盘）----
+  /** `report.ready` 事件到达 → 重取一次（报告可能刚落盘）。 */
   const readyTs = flow.events['report.ready']?.ts ?? 0
   const lastReadyRef = useRef(0)
   const resendRef = useRef(rep.resend)
@@ -203,37 +318,161 @@ export function SummaryScreen({ state, flow, onBack }: {
     resendRef.current()
   }, [readyTs])
 
-  // ---- 中心结果卡：取"有数值的字段"前 4 个（读不到就空着，卡片区如实写未就绪）----
-  const bigValues = useMemo(() => {
-    const out: ReportFieldView[] = []
-    for (const g of rv.groups) {
-      for (const f of g.fields) {
-        if (!f.missing && f.value !== undefined && out.length < 4) out.push(f)
-      }
+  const code = rep.reply?.code
+  const ok = code === 0 || (reportFrom === 'state' && rv.fieldCount > 0)
+  const notImpl = code === 1000 || code === 1005
+
+  // ---- ② 台账回落（报告缺字段时的**真实值**，来源一律写在卡面）----
+  const tlist = useVerbOnce(flow, 'targets.list', {}, true)
+  const tl = useMemo(() => readTargets(tlist.data), [tlist.data])
+  const struckTargets = useMemo(() => tl.items.filter((t) => isStruckState(t.status, t.motion)), [tl])
+  const sensor = useVerbOnce(flow, 'sensor.status', {}, true)
+  const sv = useMemo(() => readSensor(sensor.data), [sensor.data])
+  const topo = useVerbOnce(flow, 'topology.evaluate', {}, true)
+  const tv = useMemo(() => readTopology(topo.data), [topo.data])
+  const coopEval = tv.metrics.find((m) => m.key === 'cooperation')
+
+  // ---- ③ 指标卡（图上 3 张）----
+  const cardDestroyed = fieldByKeys(rv, ['destroyed', 'handledCount', 'damageWeighted'])
+  const cardArea = fieldByKeys(rv, ['coveredAreaKm2', 'coverageAreaKm2', 'coverageArea']) ?? fieldByKeyword(rv, ['面积', 'area', 'km²'])
+  const cardCoop = fieldByKeys(rv, ['coopEfficiency'])
+
+  const metrics: MetricSpec[] = useMemo(() => {
+    const out: MetricSpec[] = []
+    // ① 目标清除
+    if (cardDestroyed && !cardDestroyed.missing) {
+      out.push({
+        label: '目标清除', value: cardDestroyed.value, text: cardDestroyed.value === undefined ? cardDestroyed.text : undefined,
+        source: `report.generate · ${cardDestroyed.key}（${cardDestroyed.name}）`, testid: 'sh18-card-cleared', icon: 'target',
+      })
+    } else if (tl.items.length > 0) {
+      out.push({
+        label: '目标清除', value: struckTargets.length,
+        source: `台账回落 · targets.list（dynamicState=struck/destroyed 计数，共 ${tl.items.length} 个目标）`,
+        missing: cardDestroyed ? `报告字段缺失：${cardDestroyed.key}` : '报告里没有 destroyed / handledCount 字段',
+        testid: 'sh18-card-cleared', icon: 'target',
+      })
+    } else {
+      out.push({
+        label: '目标清除',
+        source: 'report.generate 与 targets.list 都没给数',
+        missing: rep.reply ? `report.generate → ${replyText(rep.reply)}` : '报告未生成（正在请求…）',
+        testid: 'sh18-card-cleared', icon: 'target',
+      })
+    }
+    // ② 覆盖区域（km²）
+    if (cardArea && !cardArea.missing) {
+      out.push({
+        label: '覆盖区域', value: cardArea.value, unit: cardArea.unit ?? '', text: cardArea.value === undefined ? cardArea.text : undefined,
+        source: `report.generate · ${cardArea.key}（${cardArea.name}）`, testid: 'sh18-card-area', icon: 'area',
+      })
+    } else if (sv.metrics.some((m) => m.key === 'coveredAreaKm2')) {
+      const m = sv.metrics.find((x) => x.key === 'coveredAreaKm2')!
+      out.push({
+        label: '覆盖区域', value: m.value, unit: ' km²',
+        source: '台账回落 · sensor.status.coveredAreaKm2（引擎覆盖读数）',
+        testid: 'sh18-card-area', icon: 'area',
+      })
+    } else {
+      out.push({
+        label: '覆盖区域', source: '报告与 sensor.status 都没有面积字段',
+        missing: sensor.reply ? `sensor.status → ${replyText(sensor.reply)}` : '（报告里没有 km² 量纲的字段；传感器读数未就绪）',
+        testid: 'sh18-card-area', icon: 'area',
+      })
+    }
+    // ③ 协同效率（%）
+    if (cardCoop && !cardCoop.missing) {
+      out.push({
+        label: '协同效率', value: cardCoop.value, unit: '%', text: cardCoop.value === undefined ? cardCoop.text : undefined,
+        source: `report.generate · ${cardCoop.key}（${cardCoop.name}）`, testid: 'sh18-card-coop', icon: 'coop',
+      })
+    } else if (coopEval?.value !== undefined) {
+      const v = coopEval.value <= 1 ? Number((coopEval.value * 100).toFixed(1)) : coopEval.value
+      out.push({
+        label: '协同效率', value: v, unit: '%',
+        source: `台账回落 · topology.evaluate · evaluation.cooperation（网络·协同效率；0–1 → ×100）`,
+        testid: 'sh18-card-coop', icon: 'coop',
+      })
+    } else {
+      out.push({
+        label: '协同效率', source: '报告与拓扑评估都没给协同效率',
+        missing: cardCoop ? `报告字段缺失：${cardCoop.key}` : '报告里没有 coopEfficiency 字段',
+        testid: 'sh18-card-coop', icon: 'coop',
+      })
     }
     return out
-  }, [rv])
+  }, [cardDestroyed, cardArea, cardCoop, tl.items.length, struckTargets.length, sv, sensor.reply, coopEval, rep.reply])
 
-  // ---- 关键结果 / 后续处置：按**字段 key 关键字**从报告里找（找不到就说"报告里没有这一段"）----
-  const pickByKeys = (needles: string[], limit = 5): ReportFieldView[] => {
-    const out: ReportFieldView[] = []
-    for (const g of rv.groups) {
-      for (const f of g.fields) {
-        const hay = `${f.key} ${f.name} ${g.key} ${g.name}`.toLowerCase()
-        if (needles.some((n) => hay.includes(n)) && out.length < limit) out.push(f)
-      }
+  // ---- ④ 「报告生成」进度行：**有真实进度才画**，否则空条 + 原因 ----
+  // 只认"报告生成进度"这一类字段（别把 recoveryProgress 之类当成它）
+  const progField = fieldByKeys(rv, ['reportProgress', 'generateProgress'])
+    ?? fieldByKeyword(rv, ['生成进度', '报告进度', 'reportprogress'])
+  const progress: { value?: number; note: string; color: string } = (() => {
+    if (progField && !progField.missing && progField.value !== undefined) {
+      const v = progField.value <= 1 ? Number((progField.value * 100).toFixed(1)) : progField.value
+      return { value: v, note: `进度来自报告字段 ${progField.key}`, color: C.ok }
     }
-    return out
-  }
-  const keyResults = useMemo(() => pickByKeys(['success', 'rate', 'efficiency', 'link', 'coverage', 'duration', '组网', '成功', '效率', '链路', '覆盖'], 5), [rv])
-  const nextSteps = useMemo(() => pickByKeys(['resource', 'release', 'recover', 'follow', '撤收', '释放', '转移', '处置'], 4), [rv])
+    if (reportData && (rv.doc !== null || rv.fieldCount > 0)) {
+      // 报告已生成（code=0 且能读到 document）→ 画满条，但**不编百分比**：写"已完成"而不是数字
+      return { value: 100, note: '报告已生成（report.generate code=0）→ 画满条；回执里没有百分比字段，故不显示百分数', color: C.ok }
+    }
+    return {
+      value: undefined,
+      note: rep.reply
+        ? `报告未生成：${replyText(rep.reply)}${notImpl ? '（宿主侧尚未实现/装配 → 空条 + 原因，不画假进度）' : ''}`
+        : '正在请求 report.generate…（空条：无真实进度可画）',
+      color: C.unknown,
+    }
+  })()
 
-  // ---- AI 摘要：报告里"文本类"字段（引擎已本地化）----
+  // ---- ⑤ 3 个状态标签：字段有就给 ✓/●，没有就"—"并写明原因 ----
+  const chipSpecs: { label: string; keys: string[]; positive: string[]; testid: string }[] = [
+    { label: '信息包已推送', keys: ['infoPackPushed', 'infoPackPushState', 'pushResult', 'infoPack'], positive: ['已', 'done', 'ok', '送达', 'complete'], testid: 'sh18-chip-infopack' },
+    { label: '残余风险低', keys: ['residualRisk', 'residualRiskLevel', 'riskLevel'], positive: ['低', 'low', 'ok', 'none', 'minimal'], testid: 'sh18-chip-risk' },
+    { label: '链路待释放', keys: ['linkRelease', 'linkReleaseState', 'pendingRelease'], positive: [], testid: 'sh18-chip-link' },
+  ]
+  const chips = chipSpecs.map((c) => {
+    const f = fieldByKeys(rv, c.keys)
+    if (f && !f.missing) {
+      const text = f.text ?? ''
+      return { ...c, found: true, positive: c.positive.some((p) => text.toLowerCase().includes(p.toLowerCase())), value: `${f.key}=${text}`, note: `报告字段 ${f.key}（${f.name}）：${text}` }
+    }
+    const raw = c.keys.map((k) => deepScalar(reportData, k)).find((x) => x !== undefined)
+    if (raw !== undefined) {
+      const text = String(raw)
+      return { ...c, found: true, positive: c.positive.some((p) => text.toLowerCase().includes(p.toLowerCase())), value: `${c.keys[0]}=${text}`, note: `报告原文里的 ${c.keys[0]}：${text}` }
+    }
+    return {
+      ...c, found: false, positive: false, value: undefined,
+      note: `回执里没有「${c.label}」对应的状态字段（reportFields.json 的 6 个分组里没有它）→ 显示"—"，不画假对勾`,
+    }
+  })
+
+  // ---- ⑥ 右栏「关键结果 / 后续处置」（图上逐字的三行 + 三行）----
+  const keyRows: { label: string; field?: ReportFieldView; fallback?: string; fallbackSrc?: string; testid: string }[] = [
+    { label: '成功率', field: fieldByKeys(rv, ['successRate', 'missionSuccess', 'hitRate', 'survivalRate', 'damageRate']), testid: 'sh18-key-success' },
+    { label: '组网时长', field: fieldByKeys(rv, ['meshDurationSec', 'meshDuration']), testid: 'sh18-key-mesh' },
+    { label: '推送结果', field: fieldByKeys(rv, ['pushResult', 'pushState', 'delivered']), testid: 'sh18-key-push' },
+  ]
+  // 组网时长：报告给的是"秒"→ 主显分钟，原始秒数写在来源里（只做单位换算）
+  const meshField = keyRows[1].field
+  const meshSec = meshField && !meshField.missing ? meshField.value : undefined
+
+  const nextRows: { label: string; field?: ReportFieldView; keys: string[]; testid: string }[] = [
+    { label: '资源撤收', field: fieldByKeys(rv, ['resourceRecovery', 'recoveryProgress', 'consumedOptical']), keys: ['resourceRecovery', 'recoveryProgress', 'consumedOptical', 'consumedRadar', 'consumedElectronic', 'consumedComm'], testid: 'sh18-next-resource' },
+    { label: '链路释放', field: fieldByKeys(rv, ['linkRelease', 'linkReleaseState']), keys: ['linkRelease', 'linkReleaseState'], testid: 'sh18-next-link' },
+    { label: '部署转移', field: fieldByKeys(rv, ['deployTransfer', 'transferState', 'redeploy']), keys: ['deployTransfer', 'transferState', 'redeploy'], testid: 'sh18-next-move' },
+  ]
+  /** 资源组字段（报告 resource 分组里真实存在的字段数）——用于「资源撤收」行的口径说明。 */
+  const resourceGroup = rv.groups.find((g) => g.key === 'resource' || g.name.includes('资源'))
+
+  // ---- ⑦ AI摘要：图上是一句中文（voice.sh18.system）+ 大对勾 ----
+  const aiVoice = voiceLine(labels, 'sh18', 'system')
   const aiSummary = useMemo(() => {
     const out: string[] = []
     for (const g of rv.groups) {
       for (const f of g.fields) {
-        if (f.value === undefined && !f.missing && f.text && out.length < 4
+        if (f.value === undefined && !f.missing && f.text && out.length < 3
           && ['summary', 'advice', 'conclusion', 'note', 'comment', '摘要', '建议', '结论'].some((n) => `${f.key}${f.name}`.toLowerCase().includes(n))) {
           out.push(f.text)
         }
@@ -242,12 +481,7 @@ export function SummaryScreen({ state, flow, onBack }: {
     return out
   }, [rv])
 
-  // ---- 台账目标（步 11 的地图）：状态只用于**上色**，不作为报告字段的来源 ----
-  const tlist = useVerbOnce(flow, 'targets.list', {}, true)
-  const tl = useMemo(() => readTargets(tlist.data), [tlist.data])
-  const struckTargets = useMemo(() => tl.items.filter((t) => isStruckState(t.status, t.motion)), [tl])
-
-  /** 本屏在地图上画的图元（前缀 `RPT6:`）：只画台账里给了坐标的目标 */
+  // ---- ⑧ 地图：台账目标按引擎状态重画（已被判失效的取灰；不编残余威胁/航线几何）----
   const drawnRef = useRef<{ kind: PrimitiveKind; id: string }[]>([])
   useEffect(() => {
     const prev = drawnRef.current
@@ -255,14 +489,12 @@ export function SummaryScreen({ state, flow, onBack }: {
     MapDraw.batch(() => {
       for (const d of prev) MapDraw.remove(d.kind, d.id)
       for (const t of tl.items) {
-        if (t.lng === undefined || t.lat === undefined) continue      // 没坐标 → 不画（不编坐标）
+        if (t.lng === undefined || t.lat === undefined) continue
         const struck = isStruckState(t.status, t.motion)
         const id = `RPT6:${t.entityId}`
         MapDraw.add('target', {
           id, lng: t.lng, lat: t.lat,
-          // 与步 10 同一口径：**已处置（dynamicState=struck/destroyed）→ 灰**；
-          // 否则按 `status` 域映射（`status=gray` 只表示低威胁档，不等于已失效）
-          color: isStruckState(t.status, t.motion) ? C.muted : (t.status ? statusColor(t.status) : C.unknown),
+          color: struck ? C.muted : (t.status ? statusColor(t.status) : C.unknown),
           status: struck ? 'gray' : t.status,
           label: t.no !== undefined ? `目标${String(t.no).padStart(3, '0')}` : (t.name || t.entityId),
         })
@@ -277,11 +509,13 @@ export function SummaryScreen({ state, flow, onBack }: {
     }
   }, [tl])
 
+  // ---- ⑨ 导出（复制 JSON + 展开）与【返回场景选择】（结束本轮）----
   const [showJson, setShowJson] = useState(false)
   const [copied, setCopied] = useState<string | null>(null)
+  const [resetNote, setResetNote] = useState<string | null>(null)
   const jsonText = useMemo(() => {
-    try { return JSON.stringify(rep.reply ?? null, null, 2) } catch { return '(回执无法序列化)' }
-  }, [rep.reply])
+    try { return JSON.stringify(rep.reply ?? reportData ?? null, null, 2) } catch { return '(回执无法序列化)' }
+  }, [rep.reply, reportData])
 
   /** 导出/复看：**只做"把报告 JSON 显示出来"**（复制 + 展开），不下载文件、不谎报导出成功。 */
   const exportJson = async (label: string) => {
@@ -295,21 +529,31 @@ export function SummaryScreen({ state, flow, onBack }: {
     }
   }
 
-  const code = rep.reply?.code
-  const ok = code === 0
-  const notImpl = code === 1000 || code === 1005
+  /** 【返回场景选择】= 先结束本轮（`mission.reset`）→ 宿主步 3 → 本地切到 SH-03。 */
+  const backToScenes = async () => {
+    try {
+      const r = await flow.send('mission.reset', {})
+      setResetNote(r.code === 0 ? 'mission.reset → code=0（本轮已结束，下一轮从 step 3 开始）' : `mission.reset → ${replyText(r)}（仍切回场景选择）`)
+    } catch (e) {
+      setResetNote(`mission.reset 发送失败：${String((e as Error)?.message ?? e)}（仍切回场景选择）`)
+    }
+    goto?.(3)
+    if (onGo) onGo('SH-03'); else onBack?.()
+  }
+
+  const struckCount = struckTargets.length
 
   return (
     <>
       {/* ---------------- 顶部压条 ---------------- */}
       <StageStrip
         items={[
-          { k: '显示模式', v: '复核态势 / 结果汇总' },
+          { k: '显示模式', v: '结果汇总' },
           { k: '阶段', v: state.phase || '—' },
           { k: '报告编号', v: rv.reportNo ?? '—', color: rv.reportNo ? C.text : C.textDim },
           { k: '生成时间', v: rv.generatedAt ?? '—' },
-          { k: '结构版本', v: rv.schemaVersion ?? '—' },
           { k: '字段', v: `${rv.fieldCount}${rv.missingCount > 0 ? `（缺失 ${rv.missingCount}）` : ''}`, color: rv.missingCount > 0 ? C.warn : C.text },
+          { k: '来源', v: reportFrom === 'verb' ? 'report.generate 回执' : reportFrom === 'state' ? 'state.report.last' : '未就绪' },
         ]}
         right={<span style={{ color: ok ? C.textDim : (notImpl ? C.warn : C.bad) }}>
           {rep.reply === null ? '报告生成中…' : ok ? 'report.generate 已就绪' : `report.generate → ${replyText(rep.reply)}`}
@@ -318,7 +562,6 @@ export function SummaryScreen({ state, flow, onBack }: {
 
       {/* ---------------- 左栏：时间轴 + 预警次数 + 报告 JSON ---------------- */}
       <div style={leftColStyle}>
-        {/* 时间轴：`durations`（phase-engine），逐段显示 */}
         <div data-testid="p6-timeline-panel" style={{ ...panel, width: '100%', boxSizing: 'border-box' }}>
           <div style={panelTitle}>
             任务时间轴（逐阶段耗时）
@@ -332,38 +575,22 @@ export function SummaryScreen({ state, flow, onBack }: {
               <div data-testid="p6-timeline-empty" style={{ flex: 1, minWidth: 200, fontSize: 11.5, color: C.textDim, lineHeight: 1.8, textAlign: 'center', padding: '6px 4px' }}>
                 <div>时间轴未就绪：需要 phase-engine 的 `durations`（逐阶段耗时，**前端不自己算**）。</div>
                 <div style={{ color: notImpl ? C.warn : C.textDim }}>
-                  {rep.reply
-                    ? (ok
-                      ? 'report.generate 回了 code=0，但回执里没有 durations（段键/层级见右侧「报告 JSON」原文）'
-                      : `report.generate → ${replyText(rep.reply)}`)
-                    : '正在请求报告…'}
+                  {rep.reply ? (ok ? '回执里没有 durations（段键/层级见「报告 JSON」原文）' : `report.generate → ${replyText(rep.reply)}`) : '正在请求报告…'}
                 </div>
               </div>
             )}
           </div>
-          {(dv.missionId || dv.totalMs !== undefined || dv.startedAt !== undefined) && (
+          {(dv.missionId || dv.totalMs !== undefined) && (
             <div style={{ fontSize: 10.5, color: C.textDim, padding: '0 12px 7px', lineHeight: 1.55 }}>
               {dv.missionId ? `任务 ${dv.missionId}` : ''}
               {dv.totalMs !== undefined ? ` · 总用时 ${msText(dv.totalMs)}（totalMs=${dv.totalMs}）` : ' · 总用时 —（引擎未给 totalMs）'}
-              {dv.startedAt !== undefined ? ` · 起 ${new Date(dv.startedAt).toLocaleTimeString()}` : ''}
-              {dv.endedAt !== undefined ? ` · 止 ${new Date(dv.endedAt).toLocaleTimeString()}` : '（endedAt 未给 = 进行中）'}
-            </div>
-          )}
-          {dv.byPhase.length > 0 && (
-            <div style={{ fontSize: 10.5, color: C.textDim, padding: '0 12px 7px', lineHeight: 1.55 }}>
-              按阶段聚合：{dv.byPhase.slice(0, 8).map((b) => `${b.phase} ${msText(b.totalDwellMs)}×${b.visits ?? '—'}`).join(' · ')}
             </div>
           )}
         </div>
 
-        {/* 预警次数：alert-engine 的计数**原样** */}
-        <Section
-          title="预警次数（alert-engine 计数）"
-          testid="p6-alert-panel"
-          right={av.basis ? `basis=${av.basis}` : '未声明 basis'}
-        >
+        <Section title="预警次数（alert-engine 计数）" testid="p6-alert-panel" right={av.basis ? `basis=${av.basis}` : '未声明 basis'}>
           <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
-            <span data-testid="p6-alert-count" data-alert-by={alertPick.by} style={{ fontSize: 26, color: alertPick.value === undefined ? C.muted : C.warn, fontVariantNumeric: 'tabular-nums' }}>
+            <span data-testid="p6-alert-count" data-alert-by={alertPick.by} style={{ fontSize: 24, color: alertPick.value === undefined ? C.muted : C.warn, fontVariantNumeric: 'tabular-nums' }}>
               {alertPick.value !== undefined ? alertPick.value : '—'}
             </span>
             <span style={{ fontSize: 11, color: C.textDim }}>{alertPick.by}</span>
@@ -371,66 +598,29 @@ export function SummaryScreen({ state, flow, onBack }: {
           {av.raw === null && (
             <div data-testid="p6-alert-empty" style={{ fontSize: 11, color: C.warn, lineHeight: 1.6 }}>
               宿主回执里没有 alert-engine 的 counts 段 → 显示"—"（**不填 0**：0 与"没有这段数据"是两回事）。
-              实测形状见右侧「报告 JSON」原文。
-            </div>
-          )}
-          {av.raw !== null && (
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '2px 12px', marginTop: 4 }}>
-              {([['alertCount', av.alertCount], ['rawRaises', av.rawRaises], ['alertsRaised', av.alertsRaised],
-                ['merged', av.merged], ['recoveries', av.recoveries], ['aggregates', av.aggregates],
-                ['suppressed', av.suppressed], ['folded', av.folded], ['openActive', av.openActive]] as const).map(([k, v]) => (
-                <span key={k} data-testid="p6-alert-metric" data-metric={k} style={{ fontSize: 10.5, color: C.textDim }}>
-                  {k}=<span style={{ color: C.text }}>{v !== undefined ? v : '—'}</span>
-                </span>
-              ))}
             </div>
           )}
           <div style={{ fontSize: 10, color: C.textDim, marginTop: 3, lineHeight: 1.5 }}>
             口径由引擎的 `basis` 声明（deduplicated / raw 两套同时在案，前端不挑、不换算）。
-            {flow.events['alert.raised'] ? ` 最近一条 alert.raised：${String(flow.events['alert.raised'].data.level ?? '—')} · ${String(flow.events['alert.raised'].data.ruleId ?? '—')}` : ''}
           </div>
         </Section>
 
-        {/* 报告生成进度 / 推送与风险：报告里"有就显示"的状态字段 */}
-        <Section title="报告生成状态" testid="p6-report-status-panel">
-          <Row k="生成结果" v={rep.reply ? (ok ? `code=0（${rv.engineMessage ?? 'ok'}）` : `code=${code} ${replyText(rep.reply)}`) : '未发送'} color={ok ? C.ok : C.warn} />
-          <Row k="渲染" v={rv.render ? `ok=${rv.render.ok ? 'true' : 'false'} · ${rv.render.format ?? '—'} · ${rv.render.bytes ?? '—'} B${rv.render.reason ? `（${rv.render.reason}）` : ''}` : '—'} />
-          <Row k="归档" v={rv.archive?.fileName ?? '—'} />
-          <Row k="编号" v={rv.numbering ? `${rv.numbering.dayKey ?? '—'} #${rv.numbering.seq ?? '—'}${rv.numbering.present ? '（已落库）' : '（引擎 numbering.present=false）'}` : '—'} />
-          <Row k="时间口径" v={rv.timeBasisName ?? rv.timeBasis ?? '—'} />
-          <Row k="缺失字段" v={rv.missingKeys.length ? rv.missingKeys.join('、') : (rv.fieldCount > 0 ? '（引擎未列 missing[]）' : '—')} color={rv.missingKeys.length ? C.warn : C.text} />
-          {rv.warnings.slice(0, 3).map((t, i) => (
-            <div key={i} style={{ fontSize: 10.5, color: C.warn, lineHeight: 1.55 }}>· {t}</div>
-          ))}
-          {!ok && (
-            <div data-testid="p6-report-notready" style={{ fontSize: 11, color: C.warn, lineHeight: 1.65, marginTop: 3 }}>
-              报告未生成：{rep.reply ? replyText(rep.reply) : '正在请求…'}
-              {notImpl ? '（宿主侧 report.generate 尚未实现/装配 —— 界面按"未就绪 + code"如实呈现，未画出任何报告字段与时间轴）' : ''}
-            </div>
-          )}
-        </Section>
-
-        {/* 导出/复看：只做"把报告 JSON 显示出来" */}
-        <Section
-          title="报告 JSON（复看 / 导出）"
-          testid="p6-json-panel"
-          right={rv.doc ? 'document 已读到' : 'document 未读到'}
-        >
+        <Section title="报告 JSON（复看 / 导出）" testid="p6-json-panel" right={rv.doc ? 'document 已读到' : 'document 未读到'}>
           <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-            <button data-testid="p6-btn-json" style={miniBtn} onClick={() => void exportJson('复看报告')}>
+            <button data-testid="p6-btn-json" style={miniBtn} onClick={() => setShowJson((v) => !v)}>
               {showJson ? '收起 JSON' : '复看报告 JSON'}
             </button>
-            <button data-testid="p6-btn-copy" style={miniBtn} onClick={() => void exportJson('导出报告')}>导出任务报告（复制 JSON）</button>
+            <button data-testid="p6-btn-refresh" style={miniBtn} onClick={rep.resend} disabled={rep.busy}>
+              {rep.busy ? '生成中…' : '重新生成报告'}
+            </button>
           </div>
           {copied && <div data-testid="p6-copy-note" style={{ fontSize: 10.5, color: C.accent, marginTop: 4, lineHeight: 1.55 }}>{copied}</div>}
-          <div style={{ fontSize: 10, color: C.textDim, marginTop: 3, lineHeight: 1.5 }}>
-            本轮不做文件下载（不生成 PDF/DOCX，也不谎报"已导出"）；这里显示的就是 `/api/command` 的**原始回执**。
-          </div>
+          {resetNote && <div data-testid="sh18-reset-note" style={{ fontSize: 10.5, color: C.textDim, marginTop: 4, lineHeight: 1.55 }}>{resetNote}</div>}
           {showJson && (
             <pre
               data-testid="p6-report-json"
               style={{
-                marginTop: 6, maxHeight: 240, overflow: 'auto', fontSize: 10, lineHeight: 1.45,
+                marginTop: 6, maxHeight: 220, overflow: 'auto', fontSize: 10, lineHeight: 1.45,
                 background: 'rgba(4,24,47,.9)', border: `1px solid ${C.border}`, borderRadius: 6, padding: '6px 8px',
                 color: C.text, whiteSpace: 'pre-wrap', wordBreak: 'break-all',
               }}
@@ -439,17 +629,90 @@ export function SummaryScreen({ state, flow, onBack }: {
         </Section>
       </div>
 
-      {/* ---------------- 右栏：AI 摘要 / 关键结果 / 后续处置 / 报告字段 ---------------- */}
+      {/* ---------------- 右栏：3 面板（AI摘要 / 关键结果 / 后续处置）+ 报告字段 ---------------- */}
       <div style={rightColStyle}>
-        <Section
-          title="目标状态（毁伤评估）"
-          testid="p6-struck-panel"
-          right={tlist.reply?.code === 0 ? `${struckTargets.length}/${tl.items.length} 已失效` : '台账未就绪'}
-        >
-          {struckTargets.length === 0 && (
+        <Section title="AI摘要" testid="p6-ai-panel" right="voice.sh18.system">
+          <div style={{ display: 'flex', gap: 10, alignItems: 'flex-start' }}>
+            <div data-testid="sh18-ai-text" style={{ flex: 1, minWidth: 0, fontSize: 12, color: aiVoice ? C.text : C.textDim, lineHeight: 1.7 }}>
+              {aiVoice || '（未配置语音文案：`config.json` 的 flow.labels 里缺 voice.sh18.system）'}
+              {aiSummary.map((t, i) => <div key={i} data-testid="p6-ai-line" style={{ marginTop: 4, fontSize: 11.5, color: C.text }}>· {t}</div>)}
+            </div>
+            {/* 图右侧的大号绿色对勾（装饰；不代表任何未取到的结论） */}
+            <svg width={44} height={44} viewBox="0 0 44 44" style={{ flex: '0 0 auto' }}>
+              <title>装饰图形（图上原样；不作为数据）</title>
+              <circle cx={22} cy={22} r={19} fill="none" stroke="rgba(34,197,94,.55)" strokeWidth={2} />
+              <circle cx={22} cy={22} r={14} fill="none" stroke="rgba(34,197,94,.35)" strokeWidth={1} />
+              <path d="M14 23 L20 29 L31 16" fill="none" stroke={C.ok} strokeWidth={3} strokeLinecap="round" />
+            </svg>
+          </div>
+        </Section>
+
+        <Section title="关键结果" testid="p6-key-panel" right={`${rv.groups.length} 个分组`}>
+          {keyRows.map((r) => {
+            const f = r.field
+            const has = !!f && !f.missing && (f.value !== undefined || !!f.text)
+            let value = '—'
+            let src = ''
+            if (has && f) {
+              if (r.label === '组网时长' && meshSec !== undefined) {
+                value = secText(meshSec)
+                src = `${f.key}（${f.name}）= ${meshSec} 秒`
+              } else {
+                value = fieldValue(f)
+                src = `${f.key}（${f.name}）· ${fieldSource(f)}`
+              }
+            } else if (r.label === '推送结果') {
+              // 报告里没有"推送结果"字段 → 用它**真有**的两样旁证（归档 / 渲染），并如实写出来
+              if (rv.archive?.fileName) { value = `已归档（${rv.archive.fileName}）`; src = 'report.generate · archive.fileName' }
+              else if (rv.render) { value = `渲染 ${rv.render.ok ? 'ok' : 'fail'}（${rv.render.format ?? '—'} · ${rv.render.bytes ?? '—'} B）`; src = 'report.generate · render' }
+              else { value = '—'; src = '报告里没有「推送结果」字段（archive/render 也没给）' }
+            } else {
+              src = f ? `字段 ${f.key} 缺失：${missingReason(f, rv)}` : `报告里没有「${r.label}」对应字段（reportFields.json 的 taskMetrics/damage 组都没有它）`
+            }
+            return (
+              <div key={r.label} data-testid={r.testid} data-has={has ? '1' : '0'} style={{ padding: '2px 0' }}>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'baseline', fontSize: 12 }}>
+                  <span style={{ color: C.textDim, flex: 1, minWidth: 0 }}>{r.label}</span>
+                  <span style={{ color: has ? C.ok : C.muted, fontVariantNumeric: 'tabular-nums' }}>{value}</span>
+                </div>
+                <div style={{ fontSize: 9.5, color: C.textDim, lineHeight: 1.45, wordBreak: 'break-word' }}>{src}</div>
+              </div>
+            )
+          })}
+        </Section>
+
+        <Section title="后续处置" testid="p6-next-panel">
+          {nextRows.map((r) => {
+            const f = r.field
+            const has = !!f && !f.missing
+            let value = '—'
+            let src = ''
+            if (has && f) {
+              value = fieldValue(f)
+              src = `报告字段 ${f.key}（${f.name}）`
+            } else if (r.label === '资源撤收' && resourceGroup && resourceGroup.fields.length > 0) {
+              value = `已统计（${resourceGroup.fields.length} 个资源字段）`
+              src = `报告 resource 组：${resourceGroup.fields.map((x) => x.key).join('、')}`
+            } else {
+              src = `报告字段里没有「${r.label}」状态（reportFields.json 的 6 个分组均无此字段）→ 显示"—"（不编状态）`
+            }
+            return (
+              <div key={r.label} data-testid={r.testid} data-has={has ? '1' : '0'} style={{ padding: '2px 0' }}>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'baseline', fontSize: 12 }}>
+                  <span style={{ color: C.textDim, flex: 1, minWidth: 0 }}>{r.label}</span>
+                  <span style={{ color: has ? statusColor('ok') : C.muted }}>{value}</span>
+                </div>
+                <div style={{ fontSize: 9.5, color: C.textDim, lineHeight: 1.45, wordBreak: 'break-word' }}>{src}</div>
+              </div>
+            )
+          })}
+        </Section>
+
+        <Section title="目标状态（毁伤评估）" testid="p6-struck-panel" right={tlist.reply?.code === 0 ? `${struckCount}/${tl.items.length} 已失效` : '台账未就绪'}>
+          {struckCount === 0 && (
             <div data-testid="p6-struck-empty" style={{ fontSize: 11.5, color: C.textDim, lineHeight: 1.7 }}>
               {tlist.reply?.code === 0
-                ? `台账里没有"已失效"的目标（status/dynamicState 一栏都没判灰）→ 图上不变灰（前端不自己判命中）。`
+                ? '台账里没有"已失效"的目标（status/dynamicState 都没判灰）→ 图上不变灰（前端不自己判命中）。'
                 : `目标台账未就绪：${tlist.reply ? replyText(tlist.reply) : '正在读取…'}`}
             </div>
           )}
@@ -464,48 +727,15 @@ export function SummaryScreen({ state, flow, onBack }: {
             </div>
           ))}
           <div style={{ fontSize: 10, color: C.textDim, marginTop: 3, lineHeight: 1.5 }}>
-            状态取自 `targets.list`（源头 entity-ledger 台账）；残余威胁点 / 回收轨迹 / 复核航线
-            三类几何宿主未给 → **不画**（不编几何）。
+            状态取自 `targets.list`（源头 entity-ledger 台账）；残余威胁点 / 回收轨迹 / 复核航线三类几何宿主未给 → **不画**。
           </div>
         </Section>
 
-        <Section title="AI 摘要" testid="p6-ai-panel">
-          {aiSummary.length > 0
-            ? aiSummary.map((t, i) => <div key={i} data-testid="p6-ai-line" style={{ fontSize: 11.5, color: C.text, lineHeight: 1.7 }}>· {t}</div>)
-            : (
-              <div data-testid="p6-ai-empty" style={{ fontSize: 11.5, color: C.textDim, lineHeight: 1.7 }}>
-                报告里没有文本类摘要字段
-                {ok ? '（引擎的规则包未声明摘要字段 —— 不编一段"主要威胁节点已清除"之类的话）' : `（${rep.reply ? replyText(rep.reply) : '报告未生成'}）`}
-              </div>
-            )}
-          {rv.title && <div style={{ fontSize: 11, color: C.accent, marginTop: 4 }}>{rv.title}</div>}
-          {rv.footer && <div style={{ fontSize: 10, color: C.textDim, marginTop: 2 }}>{rv.footer}</div>}
-        </Section>
-
-        <Section title="关键结果" testid="p6-key-panel" right={`${rv.groups.length} 个分组`}>
-          {keyResults.length > 0
-            ? keyResults.map((f) => <FieldRow key={f.key} f={f} rv={rv} />)
-            : <div data-testid="p6-key-empty" style={{ fontSize: 11.5, color: C.textDim, lineHeight: 1.7 }}>报告里没有"成功率 / 组网时长 / 推送结果"这类字段（按字段名找的，找不到就如实空着）。</div>}
-        </Section>
-
-        <Section title="后续处置" testid="p6-next-panel">
-          {nextSteps.length > 0
-            ? nextSteps.map((f) => <FieldRow key={f.key} f={f} rv={rv} />)
-            : <div data-testid="p6-next-empty" style={{ fontSize: 11.5, color: C.textDim, lineHeight: 1.7 }}>报告里没有"资源撤收 / 链路释放 / 部署转移"这类字段。</div>}
-        </Section>
-
-        {/* 报告全字段（按引擎给的分组与顺序；缺失带原因） */}
-        <Section
-          title="报告字段（按引擎分组）"
-          testid="p6-report-panel"
-          right={ok ? `${rv.groups.length} 组 / ${rv.fieldCount} 字段` : '未就绪'}
-        >
+        <Section title="报告字段（按引擎分组）" testid="p6-report-panel" right={ok ? `${rv.groups.length} 组 / ${rv.fieldCount} 字段` : '未就绪'}>
           {!ok && (
             <div data-testid="p6-report-empty" style={{ fontSize: 11.5, color: C.warn, lineHeight: 1.7 }}>
               报告未就绪：{rep.reply ? replyText(rep.reply) : '正在请求 report.generate…'}
-              <div style={{ color: C.textDim, marginTop: 3 }}>
-                本屏不预置任何字段名与数值 —— 分组与字段**以 `report.generate` 的返回结构为准**。
-              </div>
+              <div style={{ color: C.textDim, marginTop: 3 }}>本屏不预置任何字段名与数值 —— 分组与字段**以 `report.generate` 的返回结构为准**。</div>
             </div>
           )}
           {rv.groups.map((g) => (
@@ -520,8 +750,7 @@ export function SummaryScreen({ state, flow, onBack }: {
           ))}
           {ok && rv.fieldCount === 0 && (
             <div data-testid="p6-report-nofields" style={{ fontSize: 11.5, color: C.warn, lineHeight: 1.7 }}>
-              report.generate 回了 code=0，但回执里没有任何分组/字段（document 未读到）。
-              界面不补字段、不补数值；请对照右侧「报告 JSON」原文的层级。
+              report.generate 回了 code=0，但回执里没有任何分组/字段（document 未读到）。界面不补字段、不补数值。
             </div>
           )}
         </Section>
@@ -532,196 +761,212 @@ export function SummaryScreen({ state, flow, onBack }: {
         />
       </div>
 
-      {/* ---------------- 中心结果卡 ---------------- */}
-      <div style={cardStyle}>
-        <div style={{ ...panel, width: '100%', height: '100%', boxSizing: 'border-box', display: 'flex', flexDirection: 'column' }}>
-          <div style={panelTitle}>
-            任务结果
-            <span style={{ float: 'right', fontSize: 11.5, color: C.textDim }}>
-              {rv.reportNo ? `报告 ${rv.reportNo}` : (ok ? '报告已生成（未给编号）' : '报告未生成')}
+      {/* ---------------- 地图下部通栏：3 指标卡 + 报告生成进度行 + 3 状态标签 + 3 按钮 ---------------- */}
+      <div style={bottomBlockStyle}>
+        <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', gap: 7 }}>
+          {/* ① 3 张指标卡（图：目标清除 / 覆盖区域 / 协同效率，各带绿对勾） */}
+          <div data-testid="sh18-metrics" style={{ display: 'flex', gap: 10 }}>
+            {metrics.map((m) => <MetricCard key={m.label} m={m} />)}
+          </div>
+
+          {/* ② 「报告生成」进度行（文档图标 + 绿色进度条；**没有真实进度就空条 + 原因**） */}
+          <div data-testid="sh18-report-progress" data-value={progress.value ?? ''} style={{ display: 'flex', alignItems: 'center', gap: 9, height: 24 }}>
+            <svg width={15} height={15} viewBox="0 0 16 16" style={{ flex: '0 0 auto' }}>
+              <path d="M4 1.5 H10 L13 4.5 V14.5 H4 Z" fill="none" stroke={C.accent} strokeWidth={1.2} />
+              <path d="M10 1.5 V4.5 H13" fill="none" stroke={C.accent} strokeWidth={1.2} />
+            </svg>
+            <span style={{ fontSize: 12, color: C.text, whiteSpace: 'nowrap' }}>报告生成</span>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ height: 9, borderRadius: 4, background: 'rgba(6,26,47,.9)', border: `1px solid ${C.border}`, overflow: 'hidden' }}>
+                <div style={{ width: `${progress.value ?? 0}%`, height: '100%', background: progress.value === undefined ? 'transparent' : C.ok }} />
+              </div>
+              <div data-testid="sh18-progress-note" style={{ fontSize: 9.5, color: progress.value === undefined ? C.warn : C.textDim, lineHeight: 1.4 }}>{progress.note}</div>
+            </div>
+            <span style={{ fontSize: 11.5, color: progress.value === undefined ? C.textDim : C.ok, whiteSpace: 'nowrap' }}>
+              {progress.value === undefined ? '—' : (progress.value >= 100 ? '已完成' : `${progress.value}%`)}
             </span>
           </div>
-          <div style={{ display: 'flex', gap: 8, padding: '9px 10px', flex: 1, minHeight: 0, overflowX: 'auto' }}>
-            {bigValues.map((f) => <BigValue key={f.key} f={f} />)}
-            {bigValues.length === 0 && (
-              <div data-testid="p6-big-empty" style={{ margin: 'auto', fontSize: 12, color: C.textDim, lineHeight: 1.8, textAlign: 'center' }}>
-                <div>结果卡未就绪：需要 `report.generate` 返回带数值的报告字段。</div>
-                <div style={{ color: notImpl ? C.warn : C.textDim }}>
-                  {rep.reply ? (ok ? '回执 code=0 但没有「非缺失且有 value」的字段' : replyText(rep.reply)) : '正在请求…'}
-                </div>
-              </div>
+
+          {/* ③ 3 个状态标签（图：信息包已推送 ✓ / 残余风险低 ✓ / 链路待释放 ●） */}
+          <div data-testid="sh18-chips" style={{ display: 'flex', gap: 9, alignItems: 'center', flexWrap: 'wrap' }}>
+            {chips.map((c) => (
+              <StatusChip key={c.label} label={c.label} found={c.found} positive={c.positive} value={c.value} note={c.note} testid={c.testid} />
+            ))}
+            {chips.every((c) => !c.found) && (
+              <span data-testid="sh18-chips-note" style={{ fontSize: 10, color: C.warn, lineHeight: 1.4 }}>
+                三项状态在回执里都没有对应字段 → 一律"—"（不画假对勾）
+              </span>
             )}
           </div>
-        </div>
-      </div>
 
-      {/* ---------------- 底部按钮条 ---------------- */}
-      <div style={bottomStyle}>
-        {onBack && <button data-testid="p6-btn-back" style={ghostBtn} onClick={onBack}>返回协同执行</button>}
-        <button data-testid="p6-btn-export" style={primaryBtn} onClick={() => void exportJson('导出任务报告')}>导出任务报告</button>
-        <button data-testid="p6-btn-refresh" style={ghostBtn} onClick={rep.resend} disabled={rep.busy}>{rep.busy ? '生成中…' : '重新生成报告'}</button>
-        <span style={{ fontSize: 10.5, color: C.textDim, whiteSpace: 'nowrap' }}>
-          步 {state.step}/11{state.phase ? ` · ${state.phase}` : ''}
-        </span>
+          {/* ④ 3 个按钮（图：返回场景选择 / 导出任务报告 / 快速脱离体系） */}
+          <div data-testid="sh18-actions" style={{ display: 'flex', gap: 10, alignItems: 'center', height: 32 }}>
+            <button data-testid="p6-btn-back" style={ghostBtn} onClick={() => void backToScenes()} title="结束本轮：mission.reset → flow.goto{step:3} → SH-03">
+              返回场景选择
+            </button>
+            <button data-testid="p6-btn-export" style={primaryBtn} onClick={() => void exportJson('导出任务报告')} title="把 /api/command 的报告 JSON 复制到剪贴板并展开（本轮不做文件下载）">
+              导出任务报告
+            </button>
+            <button
+              data-testid="sh18-btn-detach"
+              style={ghostDisabled}
+              disabled
+              title="宿主尚未提供该 verb（流程接口冻结 §2 的 11 步命令表里没有「快速脱离体系」；本轮不假装能点）"
+            >
+              快速脱离体系
+            </button>
+            <span style={{ fontSize: 10.5, color: C.textDim, whiteSpace: 'nowrap' }}>
+              步 {state.step}/11{state.phase ? ` · ${state.phase}` : ''}
+            </span>
+          </div>
+        </div>
       </div>
 
       <P6SummaryProbe
         step={state.step}
         phase={state.phase}
+        reportFrom={reportFrom}
         reply={rep.reply}
         rv={rv}
         dv={dv}
         alertsRaw={av.raw}
         alertValue={alertPick.value ?? null}
         alertBy={alertPick.by}
-        showJson={showJson}
+        metrics={metrics}
+        chips={chips.map((c) => ({ label: c.label, found: c.found, positive: c.positive, value: c.value ?? null, note: c.note }))}
+        progress={progress}
+        keyRows={keyRows.map((r) => ({ label: r.label, key: r.field?.key ?? null, missing: r.field?.missing ?? null, text: r.field?.text ?? null }))}
+        stuckCount={struckCount}
+        targetCount={tl.items.length}
         replies={flow.replies}
         lastReply={flow.lastReply}
         eventKeys={Object.keys(flow.events)}
-        struckCount={struckTargets.length}
-        targetCount={tl.items.length}
+        mapItems={tl.items.filter((t) => t.lng !== undefined).length}
       />
     </>
   )
-}
-
-/** 本屏在地图上画了什么（**只读**：`MapDraw.list` 快照，不改渲染）。 */
-function mapCounts(): Record<string, unknown> {
-  const targets = MapDraw.list('target') as unknown as { id: string; color?: string; status?: string; lng: number; lat: number }[]
-  const mine = targets.filter((t) => t.id.startsWith('RPT6:'))
-  const map = getMapInstance(DEFAULT_INSTANCE_ID)
-  return {
-    mine: mine.length,
-    targetTotal: targets.length,
-    items: mine.map((t) => ({ id: t.id, color: t.color ?? null, status: t.status ?? null, visible: MapDraw.isVisible('target', t.id) })),
-    drones: MapDraw.list('drone').length,
-    viewport: map ? { lng: map.getCenter().lng, lat: map.getCenter().lat, zoom: map.getZoom() } : null,
-  }
-}
-
-/** 把只读句柄挂到 `window.__p6Read`（步 11 补 `mapCounts`，步 10 的键保留）。 */
-function installP6Read() {
-  const w = window as unknown as { __p6Read?: Record<string, unknown> }
-  w.__p6Read = { ...(w.__p6Read ?? {}), mapCounts }
 }
 
 /** 自证句柄：`window.__p6Stats`（步 11 部分，与步 10 的键合并在同一对象上）。 */
 function P6SummaryProbe(props: {
   step: number
   phase: string
+  reportFrom: 'verb' | 'state' | 'none'
   reply: CommandReply | null
   rv: ReportView
   dv: DurationsView
-  /** alert-engine 的计数原文（脚本对账"界面上那个数就是回执里那个数"） */
   alertsRaw: unknown
   alertValue: number | null
   alertBy: string
-  showJson: boolean
+  metrics: MetricSpec[]
+  chips: { label: string; found: boolean; positive: boolean; value: string | null; note: string }[]
+  progress: { value?: number; note: string; color: string }
+  keyRows: { label: string; key: string | null; missing: boolean | null; text: string | null }[]
+  stuckCount: number
+  targetCount: number
   replies: Record<string, CommandReply>
   lastReply: CommandReply | null
   eventKeys: string[]
-  struckCount: number
-  targetCount: number
+  mapItems: number
 }) {
-  const { step, phase, reply, rv, dv, alertsRaw, alertValue, alertBy, showJson, replies, lastReply, eventKeys, struckCount, targetCount } = props
-  useEffect(() => { installP6Read() })
+  const {
+    step, phase, reportFrom, reply, rv, dv, alertsRaw, alertValue, alertBy,
+    metrics, chips, progress, keyRows, stuckCount, targetCount, replies, lastReply, eventKeys, mapItems,
+  } = props
   const w = window as unknown as { __p6Stats?: Record<string, unknown> }
   w.__p6Stats = {
     ...(w.__p6Stats ?? {}),
     step,
-    screen: 'summary',
+    screen: 'SH-18',
     phase,
     report: {
       reply,
-      /** 分组/字段/缺失（**逐字段**给脚本对账；值就是界面显示的那一份） */
-      groups: rv.groups.map((g) => ({
-        key: g.key, name: g.name, order: g.order ?? null,
-        fields: g.fields.map((f) => ({
-          key: f.key, name: f.name, unit: f.unit ?? null, text: f.text,
-          missing: f.missing, missingMarker: f.missingMarker ?? null,
-          value: f.value ?? null, source: f.source,
-        })),
-      })),
-      groupCount: rv.groups.length,
-      fieldCount: rv.fieldCount,
-      missingCount: rv.missingCount,
+      from: reportFrom,
       reportNo: rv.reportNo ?? null,
       generatedAt: rv.generatedAt ?? null,
       schemaVersion: rv.schemaVersion ?? null,
+      groupCount: rv.groups.length,
+      fieldCount: rv.fieldCount,
+      missingCount: rv.missingCount,
+      groups: rv.groups.map((g) => ({
+        key: g.key, name: g.name,
+        fields: g.fields.map((f) => ({ key: f.key, name: f.name, unit: f.unit ?? null, text: f.text, missing: f.missing, value: f.value ?? null, source: f.source })),
+      })),
       archive: rv.archive ?? null,
       render: rv.render ?? null,
       missingKeys: rv.missingKeys,
       warnings: rv.warnings,
     },
-    /** 时间轴（phase-engine `durations`）：段数与顺序**原样** */
     durations: {
-      raw: dv.raw ?? null,
       segCount: dv.segs.length,
       segs: dv.segs.map((s) => ({ key: s.key, phase: s.phase, seq: s.seq ?? null, enteredAt: s.enteredAt ?? null, leftAt: s.leftAt ?? null, dwellMs: s.dwellMs ?? null, current: s.current ?? null })),
       totalMs: dv.totalMs ?? null,
       missionId: dv.missionId ?? null,
-      /** 「时间轴段数 == 回执段数」的那两个数（脚本直接对账，见 .p6-ui.mjs 的断言） */
-      receiptSegs: dv.segs.length,
       domSegs: document.querySelectorAll('[data-testid="p6-timeline-seg"]').length,
     },
-    /** 预警计数：口径 + 值（与界面上那个数**同源**） */
     alerts: { value: alertValue, by: alertBy, raw: alertsRaw ?? null },
-    /** 地图（本屏画的台账目标）：失效数与总数 */
-    map: { struck: struckCount, targets: targetCount, counts: mapCounts() },
-    showJson,
+    /** SH-18 新增三块（图上逐字）——脚本可直接对账"界面上那个数 = 哪个字段" */
+    metricCards: metrics.map((m) => ({ label: m.label, value: m.value ?? null, unit: m.unit ?? null, text: m.text ?? null, source: m.source, missing: m.missing ?? null, testid: m.testid })),
+    statusChips: chips,
+    reportProgress: progress,
+    keyResults: keyRows,
+    map: { struck: stuckCount, targets: targetCount, mapped: mapItems },
     replies: Object.fromEntries(Object.entries(replies ?? {}).map(([k, v]) => [k, { verb: v.verb, code: v.code, message: v.error?.message ?? null }])),
     lastReply: lastReply ? { verb: lastReply.verb, code: lastReply.code, message: lastReply.error?.message ?? null } : null,
     eventKeys,
     dom: {
       groups: document.querySelectorAll('[data-testid="p6-report-group"]').length,
       fields: document.querySelectorAll('[data-testid="p6-report-field"]').length,
-      missingFields: Array.from(document.querySelectorAll('[data-testid="p6-report-field"]')).filter((el) => el.getAttribute('data-field-missing') === '1').length,
-      missingReasons: document.querySelectorAll('[data-testid="p6-field-missing-reason"]').length,
-      bigValues: document.querySelectorAll('[data-testid="p6-big-value"]').length,
-      timelineSegs: document.querySelectorAll('[data-testid="p6-timeline-seg"]').length,
-      alertCountText: document.querySelector('[data-testid="p6-alert-count"]')?.textContent ?? null,
+      cardCount: document.querySelectorAll('[data-testid="sh18-metrics"] > *').length,
+      chips: document.querySelectorAll('[data-testid="sh18-chips"] > *').length,
       hasExport: !!document.querySelector('[data-testid="p6-btn-export"]'),
+      hasBack: !!document.querySelector('[data-testid="p6-btn-back"]'),
+      detachDisabled: (document.querySelector('[data-testid="sh18-btn-detach"]') as HTMLButtonElement | null)?.disabled ?? null,
       jsonShown: !!document.querySelector('[data-testid="p6-report-json"]'),
       notReady: !!document.querySelector('[data-testid="p6-report-notready"]'),
       timelineEmpty: !!document.querySelector('[data-testid="p6-timeline-empty"]'),
+      alertCountText: document.querySelector('[data-testid="p6-alert-count"]')?.textContent ?? null,
     },
   }
   return null
 }
 
 // ---- 样式（一律 left/right/bottom 长写：**不写 inset 简写**）----
+//
+// 套在 App 的全局框架里（左导航 74 / 底部状态条 30 由壳让开）：
+//   · 顶部压条 top:0 h:28（StageStrip 自己定位）
+//   · 左右栏让开底部通栏（bottom:244 = 通栏高 196 + 24 间距 + 状态条 24）
+//   · 底部通栏 bottom:36（状态条 30 + 6 间距）
 const leftColStyle: CSSProperties = {
-  position: 'absolute', left: 12, top: 34, bottom: 58, zIndex: 20, width: 372,
+  position: 'absolute', left: 12, top: 34, bottom: 244, zIndex: 20, width: 340,
   display: 'flex', flexDirection: 'column', gap: 8, minHeight: 0, overflowY: 'auto', overflowX: 'hidden',
 }
 const rightColStyle: CSSProperties = {
-  position: 'absolute', right: 12, top: 34, bottom: 58, zIndex: 20, width: 300,
+  position: 'absolute', right: 12, top: 34, bottom: 244, zIndex: 20, width: 306,
   display: 'flex', flexDirection: 'column', gap: 8, minHeight: 0, overflowY: 'auto', overflowX: 'hidden',
 }
-const cardStyle: CSSProperties = {
-  position: 'absolute', left: 396, right: 324, bottom: 196, zIndex: 21, height: 158,
-}
-/**
- * 底栏按钮条：`bottom: 24` 是**算过的** —— 宿主底部有全局状态条
- * （`App.tsx` 的 `statusBarStyle`：`bottom:0; height:28`），贴底元素必须让开它。
- * 三个按钮 + 步号一行放得下（`nowrap`），免得换行把按钮顶出可视区。
- */
-const bottomStyle: CSSProperties = {
-  position: 'absolute', left: 396, right: 324, bottom: 24, zIndex: 22,
-  display: 'flex', alignItems: 'center', gap: 9, height: 30, flexWrap: 'nowrap', overflow: 'hidden',
+const bottomBlockStyle: CSSProperties = {
+  position: 'absolute', left: 12, right: 12, bottom: 36, zIndex: 21, height: 196,
+  display: 'flex', flexDirection: 'column',
+  border: `1px solid ${C.border}`, borderRadius: 10, background: 'rgba(6,26,47,.82)', padding: '8px 10px',
+  boxSizing: 'border-box',
 }
 const miniBtn: CSSProperties = {
   padding: '3px 10px', fontSize: 11.5, cursor: 'pointer', borderRadius: 6,
   background: 'rgba(10,20,36,.7)', border: `1px solid ${C.border}`, color: C.text,
 }
 const primaryBtn: CSSProperties = {
-  padding: '6px 18px', fontSize: 13, cursor: 'pointer', borderRadius: 8, whiteSpace: 'nowrap',
-  letterSpacing: 0.5, border: '1px solid rgba(34,197,94,.6)',
-  background: 'linear-gradient(180deg,#16a34a,#15803d)', color: '#eafff2',
+  padding: '6px 22px', fontSize: 13, cursor: 'pointer', borderRadius: 8, whiteSpace: 'nowrap',
+  letterSpacing: 0.5, border: '1px solid rgba(37,99,235,.8)',
+  background: 'linear-gradient(180deg,#2563eb,#1d4ed8)', color: '#eaf3ff',
 }
 const ghostBtn: CSSProperties = {
-  padding: '6px 14px', fontSize: 12.5, cursor: 'pointer', borderRadius: 8, whiteSpace: 'nowrap',
+  padding: '6px 18px', fontSize: 12.5, cursor: 'pointer', borderRadius: 8, whiteSpace: 'nowrap',
   background: 'rgba(10,20,36,.75)', border: `1px solid ${C.borderStrong}`, color: C.text,
+}
+const ghostDisabled: CSSProperties = {
+  padding: '6px 18px', fontSize: 12.5, cursor: 'not-allowed', borderRadius: 8, whiteSpace: 'nowrap',
+  background: 'rgba(10,20,36,.5)', border: `1px solid ${C.border}`, color: C.unknown,
 }
 
 export default SummaryScreen
