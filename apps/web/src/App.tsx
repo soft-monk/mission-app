@@ -20,7 +20,7 @@ import { TopBar } from './screens/Chrome'
 import { AppShell, MicBall, type NavKey } from './shell/AppShell'
 import { VoiceStrip, voiceLine, useLabels } from './shell/VoiceStrip'
 import { SCREEN_BY_ID, defaultScreenForStep, NAV_TARGET } from './screens/registry'
-import { BootScreen } from './screens/BootScreen'
+import { BootScreen, BOOT_HOLD_FOR_DEBUG } from './screens/BootScreen'
 import { SelfCheckScreen } from './screens/SelfCheckScreen'
 import { SituationScreen } from './screens/SituationScreen'
 import { SceneConfirmScreen } from './screens/SceneConfirmScreen'
@@ -113,6 +113,20 @@ export function App() {
   const activeId = screenId ?? defaultScreenForStep(step || 1)
   const def = SCREEN_BY_ID[activeId] ?? SCREEN_BY_ID['SH-03']
 
+  /**
+   * **启动页的调试闸门**（用户 2026-09-17 逐屏确认第 2 条）。
+   *
+   * 交付形态：`BOOT_HOLD_FOR_DEBUG = false` → 界面照宿主的步号走，启动加载一完成就自动落到下一屏。
+   * 调试形态（当前）：宿主的步号**其实已经推进到步 2**，但界面**先不跟**，继续停在 SH-01，
+   * 直到屏上的【进入下一屏（调试）】被点 —— 点之前 `bootReleased` 一直是 false。
+   *
+   * 为什么放在这一层：自动跳转是**宿主**的行为（boot 完成即推进步号），前端要"按住"它，
+   * 只能在**屏路由**这一层让 SH-01 的渲染优先于宿主步号。深链 `?screen=` 时闸门让位（拍图/排障要用）。
+   */
+  const [bootReleased, setBootReleased] = useState(!BOOT_HOLD_FOR_DEBUG)
+  const holdBoot = !bootReleased && !screenParam && step >= 1 && step <= 2
+  const showBootScreen = def.id === 'SH-01' || holdBoot
+
   const go = useCallback((id: string) => {
     const d = SCREEN_BY_ID[id]
     setScreenId(id)
@@ -159,12 +173,18 @@ export function App() {
   // ---- SH-01 / SH-02：图上另有版式（无左导航/状态条/麦克风）----
   // 注意：判据是**当前屏**而不是宿主步号 —— 这样 `?screen=SH-03` 在宿主还停在步 2 时也能直达
   // （截图脚本要靠它；屏上的数据可能未就绪，那是当期真实状态）。
-  if (def.id === 'SH-01') {
+  // `showBootScreen` 额外覆盖了"启动页调试闸门"按住的这一种情况（见上面的注释）。
+  if (showBootScreen) {
     return (
       <div style={{ position: 'absolute', inset: 0, background: C.bg, color: C.text }}>
         <TopBar linkOk={state.wsClients > 0} />
         <div style={{ position: 'absolute', top: 42, left: 0, right: 0, bottom: 0 }}>
-          <BootScreen state={state} running={busy} onStart={() => void run('boot.run', { pacingMs: 400 })} />
+          <BootScreen
+            state={state}
+            running={busy}
+            onStart={() => void run('boot.run', { pacingMs: 400 })}
+            onEnterNext={() => setBootReleased(true)}
+          />
         </div>
         <FlowBadge state={state} lastReply={lastReply} screenId="SH-01" />
         {screenParam && <ForcedNotice step={state.step} screen={def.id} />}

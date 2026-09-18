@@ -1,4 +1,4 @@
-// mission-app · apps/web/src/screens/SelfCheckScreen.tsx
+﻿// mission-app · apps/web/src/screens/SelfCheckScreen.tsx
 //
 // Excel 步 2 · 语音引导校验界面（参考图 `系统启动界面二.png`）。
 //
@@ -7,7 +7,7 @@
 // 动作只有三个信号：`selfcheck.run`（一键自检）、`selfcheck.recheck`（重新检测）、`flow.enter`（进入任务）。
 import { useState, type CSSProperties } from 'react'
 import { C, panel, panelTitle, statusColor } from '../theme'
-import { HintBar, StatusPanel } from './Chrome'
+import { HINT_BAR_H, HintBar, StatusPanel } from './Chrome'
 import type { FlowState, SelfCheckItem } from '../api'
 
 /** 通过/未通过：只看宿主给的 `status`（`normal` = 通过），不做二次判断。 */
@@ -31,7 +31,7 @@ export function SelfCheckScreen({ state, onRun, onRecheck, onEnter, busy, reply 
 
   return (
     <div style={{ position: 'absolute', inset: 0, background: `radial-gradient(120% 90% at 30% 20%, #0a2547 0%, ${C.bg} 55%, #02101f 100%)` }}>
-      <div style={{ position: 'absolute', top: 0, bottom: 34, left: 0, right: 0, display: 'flex', gap: 14, padding: 14 }}>
+      <div style={{ position: 'absolute', top: 0, bottom: HINT_BAR_H, left: 0, right: 0, display: 'flex', gap: 14, padding: 14 }}>
         {/* 左：标题 + Logo 动效 + 一键自检 */}
         <div style={{ ...panel, width: 250, flex: '0 0 auto', display: 'flex', flexDirection: 'column' }}>
           <div style={{ padding: '16px 16px 0' }}>
