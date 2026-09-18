@@ -66,7 +66,7 @@ function Section({ title, right, children, testid }: {
  * 规则包 key 同为 `measure`，而量算是用户本轮点名要接的能力（同类偏差已在 README 登记）。
  * 每一格**能不能点**不看这张表，一律由规则包 `view.compose` 的声明决定（VWC-TOOL-01/02）。
  */
-const SH13_TOOLS = toolsOf(['select', 'measure', 'measureArea', 'layers', 'mode3d', 'reset'])
+const SH13_TOOLS = toolsOf(['select', 'measure', 'measureArea', 'layers', 'reset'])
 
 /** 打击方案卡里的一行「名 + 值」（缺值显示"—" + 原因，**不补 0**）。 */
 function CRow({ k, v, miss, color, testid }: {
@@ -201,7 +201,7 @@ export function StrikeScreen({ state, flow, selectedPlanId, onSelectPlan, onNext
   return (
     <div data-testid="sh-13" data-screen="SH-13" style={wrap}>
       {/* 左上：地图工具栏（共享实现，真能点；坐标相对本屏浮层容器 `wrap`，故 left/top 归 0） */}
-      <MapToolbar testid="sh13-toolbar" items={SH13_TOOLS} state={mt} style={{ left: 0, top: 0 }} />
+      <MapToolbar testid="sh13-toolbar" items={SH13_TOOLS} state={mt} style={{ left: 0, top: -29 }} />
       <ToolModeNote state={mt} items={SH13_TOOLS} />
       <div data-testid="sh13-mode" style={{ ...modePill, right: RAIL_W + 12 }}>
         <span style={{ color: C.textDim }}>显示模式：</span>

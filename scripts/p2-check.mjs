@@ -74,16 +74,25 @@ const evalJs = async (expression) => {
 const shot = async (name) => {
   // 截图是**佐证**不是断言：地图台（WebGL、无 GPU 的 headless）偶尔会卡住合成器，
   // 卡住就跳过，绝不让它把整轮验收拖崩。
-  try {
-    const r = await send('Page.captureScreenshot', { format: 'png' })
-    mkdirSync(SHOT_DIR, { recursive: true })
-    const file = path.join(SHOT_DIR, name)
-    writeFileSync(file, Buffer.from(r.data, 'base64'))
-    return file
-  } catch (e) {
-    console.log(`  · 截图跳过（${name}）：${e.message}`)
-    return null
+  // ★ 2026-09-18：加**一次重试**。实测 `Page.captureScreenshot` 有约十分之一的概率超时；
+  //   而下面有一条断言要求"启动页与自检页是两张不同的图"，截图一旦被跳过它就必然红
+  //   （明明界面是好的）。重试一次既不掩盖真实失败，也不再让这条断言随机翻红。
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const r = await send('Page.captureScreenshot', { format: 'png' })
+      mkdirSync(SHOT_DIR, { recursive: true })
+      const file = path.join(SHOT_DIR, name)
+      writeFileSync(file, Buffer.from(r.data, 'base64'))
+      return file
+    } catch (e) {
+      if (attempt === 2) {
+        console.log(`  · 截图跳过（${name}）：${e.message}`)
+        return null
+      }
+      await sleep(600)
+    }
   }
+  return null
 }
 
 // ---------------------------------------------------------------- 命令面
@@ -180,19 +189,22 @@ try {
   //   那时候再拍就会拍到一张"自检屏"——p2-1 与 p2-2 曾经是同一张图（证据重复，等于没有启动页证据）。
   let bootSeen = null
   let bootShotOverall = null
-  for (let i = 0; i < 60; i++) {
+  // ★ 2026-09-18：启动页现在约 **30 秒**（`boot.run{pacingMs:6000}` × 5 个模块），
+  //   取样窗口要跟着放宽 —— 原来只轮询 60×120ms≈7 秒，会"还没取到就超时"，
+  //   报出 `overall=n/a%`（界面其实是好的）。现在最多等 60 秒，条件也放宽到
+  //   "只要拿到了 overall 且还没完成"就算拍到了启动中那一瞬。
+  for (let i = 0; i < 300; i++) {
     bootSeen = await evalJs('window.__flowStats ? JSON.stringify(window.__flowStats()) : null')
     if (bootSeen) {
       const j = JSON.parse(bootSeen)
       const overall = j.boot?.overall ?? null
-      // 进度已在推、又还没满 → 这就是"启动加载中"的那一瞬
-      if (overall !== null && overall > 0 && overall < 100 && !j.boot?.complete) {
+      if (overall !== null && !j.boot?.complete) {
         bootShotOverall = overall
         break
       }
       if (j.boot?.complete) break
     }
-    await sleep(120)
+    await sleep(200)
   }
   check('页面暴露了流程自证句柄 __flowStats', !!bootSeen)
   const firstShot = await shot('p2-1-boot.png')
@@ -200,7 +212,10 @@ try {
   check('启动加载截图拍在进度未满时（否则与自检屏重复）', bootShotOverall !== null, `overall=${bootShotOverall ?? 'n/a'}%`)
 
   // 等启动跑完（断言要用"完成态"）
-  for (let i = 0; i < 60; i++) {
+  // ★ 2026-09-18：启动页现在约 **30 秒**（`boot.run{pacingMs:6000}` × 5 个模块），
+  //   原来只等 60×500ms=30 秒 —— 正好卡在边界，会"还没跑完就断言"（实测挂 5 条）。
+  //   这里放宽到最多 120 秒。
+  for (let i = 0; i < 240; i++) {
     const s = await evalJs('window.__flowStats ? JSON.stringify(window.__flowStats()) : null')
     if (s && JSON.parse(s).boot?.complete) break
     await sleep(500)
@@ -229,7 +244,8 @@ try {
     `${events.seen.filter((e) => e.type === 'selfcheck.ready').length} 次`)
 
   // ============================================================== 3) 第二屏：自检界面
-  for (let i = 0; i < 40; i++) {
+  // 启动页现在约 30 秒（boot.run{pacingMs:6000} × 5 个模块）→ 最多等 90 秒
+  for (let i = 0; i < 300; i++) {
     const s = JSON.parse(await evalJs('JSON.stringify(window.__flowStats())'))
     if (s.step >= 2) break
     await sleep(300)

@@ -1,10 +1,10 @@
-// mission-app · apps/web/src/screens/SituationScreen.tsx
+﻿// mission-app · apps/web/src/screens/SituationScreen.tsx
 //
 // **SH-03 · 任务态势主界面**（参考图 `需求图与描述\场景1\T0-1.png`，需求专篇 DES-APP-001 §3 SH-03）。
 //
 // 版式照图（自上而下 / 自左而右）：
 //   · 顶部压条：**显示模式：综合态势** / 阶段 / 区域 / 目标 + 回执状态
-//   · 中区：二维瓦片底图（`MapStage`，本屏自带地图——App.tsx 的 `MapLayer` 明确跳过 SH-03）
+//   · 中区：二维瓦片底图（**由 App 的 `MapLayer` 统一渲染**，所有屏共用一张；2026-09-18 从本屏搬走）
 //           + 左上浮动工具栏（**工具与可用性全部由 `view.compose` 说了算**）
 //   · 右栏 3 面板：**AI任务分析** / **任务信息** / **资源概况**
 //   · 底部：**「请选择任务场景」+ 三张场景入口卡**（场景一：敏捷拒止布控 / 场景二：集群协同突击 /
@@ -31,7 +31,7 @@ import {
   uavTypeCN, useVerbOnce, type Metric,
 } from '../flow/useSituation'
 import { VerbVerdict } from './VerbVerdict'
-import { MapStage } from '../MapStage'
+
 import { MapToolbar, ToolModeNote, toolsOf, useMapToolState } from '../shell/MapTools'
 import { DiagBox, DiagLine } from '../shell/Diag'
 
@@ -58,7 +58,7 @@ const SCENES: { id: string; no: string; name: string; accent: string; implemente
  * 每一格**能不能点**不看这张表，一律由规则包 `view.compose` 说了算。
  */
 const SH03_TOOLS = toolsOf([
-  'select', 'create', 'fullscreen', 'area', 'measure', 'measureArea', 'draw', 'layers', 'clear', 'mode3d', 'reset',
+  'select', 'create', 'fullscreen', 'area', 'measure', 'measureArea', 'draw', 'layers', 'clear', 'reset',
 ])
 
 /** 一行计量：名 + 值（值缺失显示"—"，**不补 0**）。 */
@@ -215,10 +215,7 @@ export function SituationScreen({ state, flow, onGo }: {
 
   return (
     <>
-      {/* ---------------- 二维瓦片底图（SH-03 自带地图：App.tsx 的 MapLayer 跳过本屏）--------------- */}
-      <div style={{ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0 }}>
-        <MapStage phase={state.phase} />
-      </div>
+      {/* 底图不在这里：2026-09-18 起地图由 App 的 MapLayer 统一渲染（所有屏共用一张，清屏才做得干净） */}
 
       {/* ---------------- 左上：地图浮动工具栏 ----------------
            ★ 上一版这一排是**只读的 `<span>` 摆设**（点了没反应），而 map-2d 里量算/手绘/
@@ -230,16 +227,35 @@ export function SituationScreen({ state, flow, onGo }: {
         testid="sh03-toolbar"
         items={SH03_TOOLS}
         state={mt}
-        style={{ right: 328, left: 12, top: 12, width: 'auto' }}
+        style={{ right: 328, left: 12, top: 5, width: 'auto' }}
       />
-      <ToolModeNote state={mt} items={SH03_TOOLS} style={{ left: 12, top: 66 }} />
+      <ToolModeNote state={mt} items={SH03_TOOLS} style={{ left: 12, top: 46 }} />
 
-      {/* 显示模式（右上，图上的胶囊；取值只有 view.compose 给的那一档，不编模式清单） */}
-      <span
-        data-testid="sh03-display-mode"
-        title="显示模式由 view.compose 给出（本期只有「综合态势」这一档可用，其余按阶段启用）"
-        style={displayModePill}
-      >显示模式：{cmp.modeName ?? cmp.modeKey ?? '—'} ⌄</span>
+      {/* ---------------- 显示模式：**独立的下拉框**（不在工具条那一排里） ----------------
+          用户 2026-09-18 第 8 条："显示模式：综合态势，应该单独是一个下拉框，而不是和功能一起"。
+          候选清单来自宿主 `view.compose` 的 `modes[]`（宿主从引擎 availableModes() 补出来的，
+          前端**不自己编一份模式清单**）；选中即发 `view.mode{modeKey}`。
+          拿不到清单时退化成"只有当前这一档"的只读展示，并如实标注原因。 */}
+      <div style={displayModeBox}>
+        <span style={{ fontSize: 12, color: C.textDim, flex: '0 0 auto' }}>显示模式</span>
+        {cmp.modes.length > 0 ? (
+          <select
+            data-testid="sh03-display-mode"
+            value={cmp.modeKey ?? ''}
+            onChange={(e) => void flow.send('view.mode', { modeKey: e.target.value })}
+            title="显示模式（视图声明由规则包给出；切档即发 view.mode）"
+            style={displayModeSelect}
+          >
+            {cmp.modes.map((m) => <option key={m.key} value={m.key}>{m.name || m.key}</option>)}
+          </select>
+        ) : (
+          <span
+            data-testid="sh03-display-mode"
+            title="宿主没有给出可选显示模式清单（view.compose.modes 为空），这里只如实显示当前档"
+            style={{ fontSize: 12.5, color: C.accent }}
+          >{cmp.modeName ?? cmp.modeKey ?? '—'}（清单未提供）</span>
+        )}
+      </div>
 
       {/* 视图声明（图层组 / 控件 / 工具可用性）：收进折叠块，产品界面不再被它占满 */}
       <div style={composeDiagStyle}>
@@ -491,10 +507,21 @@ const rightColStyle: CSSProperties = {
 const bottomStyle: CSSProperties = {
   position: 'absolute', left: 12, right: 12, bottom: 56, zIndex: 20, height: 152,
 }
-const displayModePill: CSSProperties = {
-  position: 'absolute', right: 328, top: 12, zIndex: 22,
-  fontSize: 12, color: C.accent, border: `1px solid ${C.border}`, borderRadius: 8,
-  padding: '7px 12px', whiteSpace: 'nowrap', background: 'rgba(6,26,47,.86)',
+/**
+ * 显示模式：**独立的下拉框**（自己一块，不并进工具条那一排）。
+ * 位置在工具条同一水平带的最右侧（`right: 328` = 让开右侧面板 300px + 间距），
+ * `top: 5` 与工具条对齐。
+ */
+const displayModeBox: CSSProperties = {
+  position: 'absolute', right: 328, top: 5, zIndex: 22,
+  display: 'flex', alignItems: 'center', gap: 8,
+  padding: '4px 10px', borderRadius: 8,
+  background: 'rgba(6,26,47,.86)', border: `1px solid ${C.border}`, whiteSpace: 'nowrap',
+}
+const displayModeSelect: CSSProperties = {
+  fontSize: 12.5, color: C.accent, background: 'rgba(10,32,58,.9)',
+  border: `1px solid ${C.borderStrong}`, borderRadius: 6, padding: '3px 6px',
+  cursor: 'pointer', outline: 'none',
 }
 const composeDiagStyle: CSSProperties = {
   position: 'absolute', right: 328, top: 56, zIndex: 20, width: 320,

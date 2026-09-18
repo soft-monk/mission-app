@@ -485,7 +485,7 @@ function ClusterRail({ snapshotRaw, reply, busy, onRetry, testid }: {
  * 与参考图的一处有意偏差：量算在 map-2d 里是「测距 + 测面」两档，图上只有一格"测距"，
  * 故在"测距"后补一格"测面"（量算是用户明确点名要接的能力，见 `TOOL_SPECS` 的注释）。
  */
-const TARGETS_TOOLS = toolsOf(['select', 'draw', 'measure', 'measureArea', 'layers', 'mode3d', 'reset'])
+const TARGETS_TOOLS = toolsOf(['select', 'draw', 'measure', 'measureArea', 'layers', 'reset'])
 
 export function TargetsScreen({ state, flow, mode = 'list', onGo }: {
   state: FlowState
@@ -637,7 +637,7 @@ export function TargetsScreen({ state, flow, mode = 'list', onGo }: {
   return (
     <div data-testid={detailMode ? 'sh-12' : 'sh-11'} data-screen={detailMode ? 'SH-12' : 'SH-11'} style={wrap}>
       {/* 左上：地图工具栏（共享实现；`style` 以本屏浮层容器 `wrap` 为参照系 → 容器左上角） */}
-      <MapToolbar testid={`${P}-toolbar`} items={TARGETS_TOOLS} state={mt} style={{ left: 0, top: 0 }} />
+      <MapToolbar testid={`${P}-toolbar`} items={TARGETS_TOOLS} state={mt} style={{ left: 0, top: -29 }} />
       <ToolModeNote state={mt} items={TARGETS_TOOLS} />
       <ModePill prefix={P} name={modeName} right={RAIL_W + 12} />
 

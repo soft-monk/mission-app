@@ -95,7 +95,8 @@ try {
 
   await cmd('sim.reset'); await cmd('mission.reset'); await cmd('boot.reset')
   await send('Page.navigate', { url: `${BASE}/` }); await sleep(3500)
-  for (let i = 0; i < 60; i++) { const s = await st(); if (s.step >= 2) break; await sleep(500) }
+  // 启动页现在约 30 秒（boot.run{pacingMs:6000} × 5 个模块）→ 最多等 90 秒
+  for (let i = 0; i < 180; i++) { const s = await st(); if (s.step >= 2) break; await sleep(500) }
 
   console.log(`\n== 视口 ${VW}×${VH} ==`)
   await stepThrough('SH-02 【一键自检】', { re: '一键自检|重新自检' }, 'SH-02')

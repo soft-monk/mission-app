@@ -113,10 +113,15 @@ const AIRSPACE_ZONES: ScenarioZone[] = [
 
 /** 内联的场景数据（= data/scenario-1/ 三份 JSON 的并集） */
 export const DEFAULT_SCENARIO: ScenarioData = {
+  // ★ 2026-09-18 用户第 2 条："为什么地图缩放不能缩放，放大到一个城市后不能继续放大？之前不能全球都能看的吗"
+  //   原因就在这里：旧值 `minZoom: 10 / maxZoom: 14` 把地图**锁死在 z10–z14**（缩不出去、也放不大）。
+  //   瓦片包 `map-2d/tiles/raster` 实际有 **z0–z14**：下限放到 2 就能看全球；
+  //   上限放到 18 —— z14 以上由地图模块"超采样"父瓦片（画面变糊，但能继续放大，比卡死好）。
+  //   磁盘上的 `data/scenario-1/task-areas.json` 已同步改成同一组值（两份保持一致）。
   center: [116.574, 39.77],
   zoom: 12,
-  minZoom: 10,
-  maxZoom: 14,
+  minZoom: 2,
+  maxZoom: 18,
   areas: [...TASK_AREAS, ...DEPLOYMENT_AREAS],
   zones: AIRSPACE_ZONES,
   nodes: DEPLOYMENT_NODES,

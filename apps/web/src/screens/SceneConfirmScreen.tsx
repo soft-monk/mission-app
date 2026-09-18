@@ -73,7 +73,7 @@ function Section({ title, right, children, testid }: {
 
 /** 地图工具栏（图上那一排）—— 由 `shell/MapTools` 统一实现：**真能点**，可用性看规则包。
  *  这里只声明"图上有哪几个格"（键位/顺序/文字逐字照图 T0-2）。 */
-const SH04_TOOLS = toolsOf(['select', 'draw', 'measure', 'measureArea', 'layers', 'mode3d', 'reset'])
+const SH04_TOOLS = toolsOf(['select', 'draw', 'measure', 'measureArea', 'layers', 'reset'])
 
 export function SceneConfirmScreen({ state, flow, onGo, goto }: {
   state: FlowState
@@ -105,7 +105,7 @@ export function SceneConfirmScreen({ state, flow, onGo, goto }: {
         testid="sh04-toolbar"
         items={SH04_TOOLS}
         state={mt}
-        style={{ left: 0, top: 0 }}
+        style={{ left: 0, top: -3 }}
       />
       <ToolModeNote state={mt} items={SH04_TOOLS} />
 

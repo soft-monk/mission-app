@@ -174,7 +174,10 @@ private:
     std::string labelOf(const std::string& key) const;
 
     /// 启动加载：逐模块把**真实就绪判定**上报给引擎的进度源。可在工作线程里跑。
-    nlohmann::json bootRunOnce(int pacingMs);
+    ///
+    /// `gen` = **启动代号**（见 `bootGen_`）。跑的过程中每进一个模块都比对一次，
+    /// 对不上立即收手并返回 `{"aborted":true}` —— 这就是 `boot.reset` 打断在飞启动的机制。
+    nlohmann::json bootRunOnce(int pacingMs, uint64_t gen = 0);
     void startBoot(int pacingMs);
 
     /// 把流程状态（步 + 阶段）广播出去
@@ -351,6 +354,19 @@ private:
 #endif
 
     std::atomic<bool> bootRunning_{false};
+    /**
+     * **启动代号**：每发起一轮启动 +1，`boot.reset` 也 +1。
+     *
+     * 解决实测到的真缺陷（2026-09-18，把启动节拍从 2 秒调到 30 秒之后暴露）：
+     * 启动跑到一半时来一发 `boot.reset`，reset 清掉引擎的进度项，而在飞的那一轮启动
+     * **还在继续写** —— 第一个模块（map）的 100 被清掉后再没补回来，总进度只能到 80，
+     * `bootComplete()` 于是**永远不成立**，界面**永久卡在启动页**（实测：步 1 / overall=80 /
+     * complete=false 一路不复原）。启动只要 2 秒时这个窗口极小，30 秒就变成常踩。
+     *
+     * 机制：`startBoot` 领一个号并带进工作线程；`bootRunOnce` 每进一个模块比对一次，
+     * 号变了就立刻返回 `{"aborted":true}` 什么都不写；`boot.reset` 只负责把号 +1。
+     */
+    std::atomic<uint64_t> bootGen_{0};
     std::thread bootThread_;
 
     /// P7：`flow.runAll` 的并发闸门（前端连点两次"一键"就会撞上）。

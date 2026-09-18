@@ -434,6 +434,14 @@ export interface ComposeView {
   modeName?: string
   /** 可见的图层组（`visibleGroups` 的字符串数组，原样） */
   visibleGroups: string[]
+  /**
+   * **可选显示模式清单**（宿主 `view.compose` 的 `modes[]`，逐条原样）。
+   *
+   * 2026-09-18 加（用户第 8 条：显示模式"应该单独是一个下拉框"）：引擎的 `composeJson` 只给
+   * "当前这一档"，候选清单由宿主从 `availableModes()` 补出来。**拿不到就是空数组** ——
+   * 界面届时只显示当前档，不自己编一份模式清单（G-09）。
+   */
+  modes: { key: string; name: string }[]
   /** 可用工具（含"为什么不可用"的 reasons） */
   tools: { key: string; name: string; on: boolean; reason?: string }[]
   /** 控件（指北针/比例尺/缩放…） */
@@ -458,6 +466,10 @@ export function readCompose(data: unknown): ComposeView {
     visibleGroups: strList(src, 'visibleGroups').length
       ? strList(src, 'visibleGroups')
       : strList(obj(v0, 'layers'), 'visibleGroups'),
+    // 可选显示模式清单：宿主给 `modes[]`（{key,name}）就原样用；拿不到给空数组
+    modes: objList(src, 'modes')
+      .map((m) => ({ key: str(m, 'key') ?? '', name: str(m, 'name', 'label') ?? '' }))
+      .filter((m) => m.key),
     tools: objList(v0, 'tools').map((t, i) => {
       const key = str(t, 'key', 'id') ?? `t${i}`
       return {

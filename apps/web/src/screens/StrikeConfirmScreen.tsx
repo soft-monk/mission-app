@@ -92,7 +92,7 @@ function Section({ title, right, children, testid }: {
  * 规则包 key 同为 `measure`，而量算是用户本轮点名要接的能力（同类偏差已在 README 登记）。
  * 每一格**能不能点**不看这张表，一律由规则包 `view.compose` 的声明决定（VWC-TOOL-01/02）。
  */
-const SH14_TOOLS = toolsOf(['select', 'measure', 'measureArea', 'layers', 'mode3d', 'reset'])
+const SH14_TOOLS = toolsOf(['select', 'measure', 'measureArea', 'layers', 'reset'])
 
 /** 一行「名 + 值」：值缺失显示"—"，**不补 0**；`miss` 写明为什么缺。 */
 function Row({ k, v, color, miss, testid }: {
@@ -350,7 +350,7 @@ export function StrikeConfirmScreen({ state, flow, selectedPlanId, onSelectPlan,
   return (
     <div data-testid="sh-14" data-screen="SH-14" style={wrap}>
       {/* 左上：地图工具栏（共享实现，真能点；坐标相对本屏浮层容器 `wrap`，故 left/top 归 0） */}
-      <MapToolbar testid="sh14-toolbar" items={SH14_TOOLS} state={mt} style={{ left: 0, top: 0 }} />
+      <MapToolbar testid="sh14-toolbar" items={SH14_TOOLS} state={mt} style={{ left: 0, top: -29 }} />
       <ToolModeNote state={mt} items={SH14_TOOLS} />
       <div data-testid="sh14-mode" style={{ ...modePill, right: RAIL_W + 12 }}>
         <span style={{ color: C.textDim }}>显示模式：</span>

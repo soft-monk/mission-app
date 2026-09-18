@@ -94,7 +94,6 @@ export function ToolGlyph({ k, size = 16 }: { k: string; size?: number }) {
         <path d="M13.6 4.4A6.6 6.6 0 0 0 2.6 6.2" strokeDasharray="2 1.6" />
       </svg>
     )
-    case 'mode3d': return <svg {...common}><path d="M8 1.6l5.6 3.2v6.4L8 14.4 2.4 11.2V4.8z" /><path d="M8 8.2l5.6-3.4M8 8.2v6.2M8 8.2L2.4 4.8" /></svg>
     default: return <svg {...common}><circle cx="8" cy="8" r="5" /></svg>
   }
 }
@@ -141,6 +140,8 @@ export function MapToolbar({ items, state, testid, style }: {
   const setClearMode = useMapUiStore((s) => s.setClearMode)
   const layersOpen = useMapUiStore((s) => s.layersOpen)
   const toggleLayersPanel = useMapUiStore((s) => s.toggleLayersPanel)
+  // 选中的工具（map-2d 的 activeTool 只记"最后点过哪个"；绘制类以 drawMode 为准）
+  const activeTool = useMapUiStore((s) => s.activeTool)
   const setLayersPanel = useMapUiStore((s) => s.setLayersPanel)
   const setActiveTool = useMapUiStore((s) => s.setActiveTool)
 
@@ -170,9 +171,14 @@ export function MapToolbar({ items, state, testid, style }: {
           const on = t.always ? true : state.on(t.key)
           const reason = state.reason(t.key)
           const undeclared = !state.declared(t.key)
+          // ★「点击选中状态」：用户 2026-09-18 反馈"点击选中状态，无选中状态"。
+          //   原来的高亮太轻（半透明蓝 + 淡边），看起来跟没选一样。现在：
+          //   选中 = 实心蓝底 + 亮蓝描边 + 文字转亮 + 底部一条高亮短线，一眼能分辨。
+          const m2 = MAP2D_KEY[t.key]
           const active = t.key === 'clear'
             ? clearMode
-            : (t.mode ? drawMode === t.mode : (t.key === 'layers' ? layersOpen : false))
+            : (t.mode ? drawMode === t.mode
+              : (t.key === 'layers' ? layersOpen : (m2 ? activeTool === m2 : false)))
           const title = on
             ? (t.mode ? `${t.label}：单击落点，双击 / Enter 结束，Esc 取消` : t.label)
             : `${t.label}（不可用）：${reason
@@ -192,13 +198,15 @@ export function MapToolbar({ items, state, testid, style }: {
                 opacity: on ? 1 : 0.42,
                 cursor: on ? 'pointer' : 'not-allowed',
                 color: active ? '#eaf6ff' : (on ? C.text : C.unknown),
-                border: `1px solid ${active ? C.borderStrong : 'transparent'}`,
-                background: active ? 'rgba(29,78,216,.55)' : 'transparent',
+                border: `1px solid ${active ? '#5fb0ff' : 'transparent'}`,
+                background: active ? 'linear-gradient(180deg,#2563eb,#1d4ed8)' : 'transparent',
+                boxShadow: active ? '0 0 10px rgba(56,189,248,.45)' : undefined,
+                fontWeight: active ? 600 : 400,
               }}
             >
               <ToolGlyph k={t.id ?? t.key} size={15} />
-              <span style={{ fontSize: 11, lineHeight: 1.1 }}>{t.label}</span>
-              {t.sub && <span style={{ fontSize: 9, color: on ? C.accentDim : C.unknown }}>{t.sub}</span>}
+              <span style={{ fontSize: 11.5 }}>{t.label}</span>
+              {t.sub && <span style={{ fontSize: 9.5, color: on ? C.accentDim : C.unknown }}>{t.sub}</span>}
             </button>
           )
         })}
@@ -210,27 +218,37 @@ export function MapToolbar({ items, state, testid, style }: {
 }
 
 /**
- * 光标跟随的"量算读数条"。
+ * 「点击后的提示」—— 一条**独立的悬浮提示**，浮在工具条正下方。
  *
- * `DrawLayer` 自己已经渲染了一条交互提示浮层（落点数 / 实时长度面积 / 操作说明），
- * 这里**不再重复画一份**，只把"当前处于什么工具模式"如实标在工具条旁边
- * （哪一格高亮已经表达了它，所以本组件默认只在工具条下方补一行文字说明来源）。
+ * 用户 2026-09-18："点击后的提示，重新 new 一个悬浮的提示在工具栏下方就行，不是现在这样，很丑"。
+ * 所以它不看 `props.state`（工具可用性），只看"当前选中的是哪一格"，浮在工具条下方
+ * （工具条 top=5、高约 30px → 提示 top=41），不再把工具条撑高。
+ *
+ * `select`（选择）是"没有工具"的中性态，不弹提示；其余被选中的格子都会如实报出当前工具。
  */
-export function ToolModeNote({ state, items, note, style }: {
-  state: ReturnType<typeof useMapToolState>
+export function ToolModeNote({ items, note, style }: {
+  state?: ReturnType<typeof useMapToolState>
   items: MapToolSpec[]
   note?: string
   style?: CSSProperties
 }) {
   const drawMode = useInteraction((s) => s.mode)
-  if (drawMode === 'none' && !note) return null
-  const cur = items.find((t) => t.mode === drawMode)
+  const layersOpen = useMapUiStore((s) => s.layersOpen)
+  const clearMode = useMapUiStore((s) => s.clearMode)
+  const activeTool = useMapUiStore((s) => s.activeTool)
+  const cur = items.find((t) => {
+    if (t.mode) return t.mode === drawMode
+    if (t.key === 'layers') return layersOpen
+    if (t.key === 'clear') return clearMode
+    if (t.key === 'select') return false          // 中性态，不弹
+    return MAP2D_KEY[t.key] === activeTool
+  })
+  if (!cur && !note) return null
   return (
-    <div
-      data-testid="map-tool-note"
-      style={{ ...noteStyle, ...style }}
-    >
-      {cur && <span>当前工具：<b style={{ color: C.accent }}>{cur.label}</b>（map-2d 交互层，Esc 退出）　</span>}
+    <div data-testid="map-tool-note" style={{ ...noteStyle, ...style }}>
+      {cur && <>当前工具：<b style={{ color: C.accent }}>{cur.label}</b>
+        {cur.mode ? '（单击落点，双击 / Enter 结束，Esc 退出）' : ''}</>}
+      {cur && note ? '　' : ''}
       {note}
     </div>
   )
@@ -257,23 +275,36 @@ export function useEscExitDraw() {
   }, [setDrawMode])
 }
 
-/** 工具条容器：左上浮动（与参考图一致；`MapStage` 的自证信息条已不在产品屏出现，故 top 更小） */
+/** 工具条容器：左上浮动，**距顶 5px**（用户 2026-09-18："再靠近上方一些，留大概 5 像素即可"） */
 const toolbarStyle: CSSProperties = {
-  position: 'absolute', left: 12, top: 12, zIndex: 21,
-  display: 'flex', gap: 2, padding: '4px 6px', borderRadius: 8,
+  position: 'absolute', left: 12, top: 5, zIndex: 21,
+  display: 'flex', gap: 2, padding: '3px 5px', borderRadius: 8,
   background: 'rgba(6,26,47,.82)', border: `1px solid ${C.border}`,
 }
+/**
+ * 工具格：**单行**（图标 + 文字并排），高度就一个按钮那么高。
+ *
+ * 用户 2026-09-18："上方工具栏，点击太高了，**只要工具按钮那么高就行**"。
+ * 原来是三行竖排（图标 / 文字 / 小字），整个条高约 52px；改成单行后约 30px。
+ */
 const toolBtn: CSSProperties = {
-  display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2,
-  minWidth: 50, padding: '5px 8px', borderRadius: 6, cursor: 'pointer',
+  display: 'flex', flexDirection: 'row', alignItems: 'center', gap: 5,
+  padding: '5px 9px', borderRadius: 6, cursor: 'pointer',
   background: 'transparent', border: '1px solid transparent', color: C.text,
-  font: 'inherit',
+  font: 'inherit', lineHeight: 1, whiteSpace: 'nowrap',
 }
+/**
+ * 「点击后的提示」：**独立的一条悬浮提示，浮在工具条正下方**。
+ *
+ * 用户 2026-09-18："点击后的提示，**重新 new 一个悬浮的提示在工具栏下方就行**，不是现在这样，很丑"。
+ * 以前它跟工具条挤在同一块面板里（把工具条撑高）；现在脱离工具条单独浮在下面：
+ * 工具条 top=5、高约 30px，所以这里 top≈41。
+ */
 const noteStyle: CSSProperties = {
-  position: 'absolute', left: 0, top: 58, zIndex: 21, maxWidth: 460,
-  padding: '5px 10px', borderRadius: 8, fontSize: 11.5, lineHeight: 1.6,
-  background: 'rgba(6,26,47,.88)', border: `1px solid ${C.border}`, color: C.text,
-  pointerEvents: 'none',
+  position: 'absolute', left: 12, top: 41, zIndex: 21, maxWidth: 460,
+  padding: '5px 10px', borderRadius: 6, fontSize: 11.5, lineHeight: 1.5,
+  background: 'rgba(6,26,47,.92)', border: `1px solid ${C.border}`, color: C.text,
+  pointerEvents: 'none', boxShadow: '0 2px 10px rgba(0,0,0,.35)',
 }
 
 /** 供各屏按图声明工具条（键位/顺序/文字逐字照图；可用性一律由规则包给）。 */
@@ -290,19 +321,14 @@ export const TOOL_SPECS: Record<string, MapToolSpec> = {
   layers: { key: 'layers', label: '图层' },
   clear: { key: 'clear', label: '清屏' },
   fullscreen: { key: 'fullscreen', label: '全屏' },
-  mode3d: {
-    key: 'mode3d', label: '3D', sub: '2D/3D',
-    // 图上每个地图屏右上都有这枚 3D / 2D 角标；本轮**没有三维底图**（三维已放弃），
-    // 所以它恒灰置 —— 但原因不是"规则包忘了声明"，而是产品口径，这里如实写清楚。
-    noteWhenUndeclared: '本轮无三维底图（个性化需求：三维已放弃，底图为二维瓦片）',
-  },
+  // ★ 2026-09-18 用户："3d/2d/3d 功能直接删除，目前不需要" —— 这一格已删除（原 `mode3d`）。
   /** 复位视角 —— **宿主自带**（规则包没有这个 key），恒定可点；理由见 `MapToolSpec.always` */
   reset: { key: 'reset', label: '复位', always: true },
 }
 
 /**
  * 按 key 列表造一份 `MapToolSpec[]`（各屏一行搞定）。
- * `keys` 用 `TOOL_SPECS` 的键名；`mode3d` 是无行为键（图上只有一个 3D/2D 角标，
+ * `keys` 用 `TOOL_SPECS` 的键名（3D 那一格已按用户要求删除）。
  * 本轮没有三维底图，点了也没有可切的东西 → 界面如实灰置，见需求专篇 §12 数据缺口）。
  */
 export function toolsOf(keys: (keyof typeof TOOL_SPECS)[]): MapToolSpec[] {

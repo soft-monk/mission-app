@@ -35,7 +35,7 @@ const CLUSTER_PALETTE = ['#3b82f6', '#22c55e', '#eab308', '#a855f7', '#06b6d4', 
  * 「测面」插在「测距」后一格：map-2d 的量算本来就是测距/测面两档，图上只有一格"测距"，
  * 这是**有意偏差**（把已实现的量算真的接出来）；能不能点仍由规则包 view.compose 说了算。
  */
-const SH09_TOOLS = toolsOf(['select', 'measure', 'measureArea', 'layers', 'mode3d', 'reset'])
+const SH09_TOOLS = toolsOf(['select', 'measure', 'measureArea', 'layers', 'reset'])
 
 /** 快照 `groups[].role` 域 → 中文机型（词典；不认识就原样显示域，不猜）。 */
 const ROLE_CN: Record<string, string> = {
@@ -379,7 +379,7 @@ export function ReconExpandScreen({ state, flow, onGo, goto }: {
   return (
     <div data-testid="sh-09" data-screen="SH-09" style={wrap}>
       {/* ---------------- 左上：工具栏 5 键（图上逐字；点击落 map-2d，坐标以本屏 wrap 为准） ---------------- */}
-      <MapToolbar testid="sh09-toolbar" items={SH09_TOOLS} state={mt} style={{ left: 0, top: 0 }} />
+      <MapToolbar testid="sh09-toolbar" items={SH09_TOOLS} state={mt} style={{ left: 0, top: -29 }} />
       <ToolModeNote state={mt} items={SH09_TOOLS} />
 
       {/* ---------------- 右上：显示模式胶囊（可切"侦察展开 / 侦察融合"两屏，见需求专篇 §4.1 过渡①） ---------------- */}

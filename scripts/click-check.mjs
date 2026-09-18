@@ -120,7 +120,8 @@ try {
   await sleep(3000)
 
   console.log('\n== SH-01 启动加载（无交互，自动跳 SH-02）==')
-  for (let i = 0; i < 60; i++) { const s = await st(); if (s.step >= 2) break; await sleep(500) }
+  // 启动页现在约 30 秒（boot.run{pacingMs:6000} × 5 个模块）→ 最多等 90 秒
+  for (let i = 0; i < 180; i++) { const s = await st(); if (s.step >= 2) break; await sleep(500) }
   check('SH-01 → 步 2（自检）自动跳转', (await st()).step >= 2, `步 ${(await st()).step} · 徽标「${await badgeText()}」`)
 
   console.log('\n== SH-02 自检校验 ==')

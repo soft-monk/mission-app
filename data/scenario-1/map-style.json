@@ -59,5 +59,48 @@
     "highColor": "#ef4444",
     "midColor": "#f59e0b",
     "lowColor": "#22d3ee"
-  }
+  },
+  "controls": {
+    "coords": {
+      "show": true,
+      "anchor": "bottom-left",
+      "offset": [
+        0,
+        56
+      ]
+    },
+    "scale": {
+      "show": true,
+      "anchor": "bottom-right",
+      "offset": [
+        0,
+        56
+      ]
+    },
+    "compass": {
+      "show": false,
+      "anchor": "bottom-left",
+      "offset": [
+        0,
+        96
+      ]
+    },
+    "zoom": {
+      "show": false,
+      "anchor": "bottom-right",
+      "offset": [
+        0,
+        96
+      ]
+    },
+    "legend": {
+      "show": false,
+      "anchor": "bottom-right",
+      "offset": [
+        0,
+        136
+      ]
+    }
+  },
+  "controlsNote": "地图控件的显隐与落位（2026-09-18 按用户第 1 条新增）。anchor=四个角之一；offset=[dx,dy] 像素微调。"
 }

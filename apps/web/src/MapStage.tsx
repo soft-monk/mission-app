@@ -20,8 +20,8 @@
 //   产品屏一律 `debug={false}`（它属于开发自证，不该出现在交付界面上）；
 //   `?stage=map` 排障后门传 `debug` 保留原始信息条。
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
-import { DrawLayer, MapDraw, MapView, mapCommands, mapInstance, useInteraction, type MapData } from 'map-2d'
-import { DEFAULT_MAP_STYLE, groupColorOf, loadMapStyle, trackStyleOf } from './map-style'
+import { CoordReadout, DrawLayer, MapDraw, MapView, mapCommands, mapInstance, useInteraction, type MapData } from 'map-2d'
+import { DEFAULT_MAP_STYLE, controlSpecsOf, groupColorOf, loadMapStyle, trackStyleOf } from './map-style'
 import { DEFAULT_SCENARIO, toAreaItems, toLabelItems } from './scenario'
 import { DEFAULT_WS_URL, TelemetryStore, connectTelemetry, type LinkState } from './telemetry'
 
@@ -269,17 +269,23 @@ export function MapStage({ phase, bottomBar, debug = false }: {
   //   报 48/60 屏次"缩放按钮被面板遮挡"）。缩放用滚轮 / 双指 / 键盘 `+` `-` / 方向键平移都可用
   //   （M2-CTRL-14）；指北针在本应用里也不承载信息（`MapView` 建图时 `dragRotate:false`，
   //   它恒指正北）。**不做一个看不见或点不到的控件**，理由写在这里与 README §2.3。
+  // ★ 2026-09-18：控件不再写死 —— **显隐与位置都由配置说了算**（用户第 1 条）。
+  //   配置来自 `map-style.json` 的 `controls` 段（内联默认值同上；`?style=` 可整份覆盖）。
+  //   走的是 map-2d 新加的 `mapCommands.configureControls([{key,on,anchor,offset}])`。
   useEffect(() => {
     let timer = 0
     let alive = true
+    const specs = controlSpecsOf(styleCfg)
     const tick = () => {
       if (!alive) return
-      if (mapCommands.isReady()) mapCommands.showControls(['scale'])
-      else timer = window.setTimeout(tick, 120)
+      if (mapCommands.isReady()) {
+        if (specs) mapCommands.configureControls(specs as never)
+        else mapCommands.showControls(['scale'])   // 配置里没有 controls 段 → 回落模块缺省行为
+      } else timer = window.setTimeout(tick, 120)
     }
     tick()
     return () => { alive = false; window.clearTimeout(timer) }
-  }, [])
+  }, [styleCfg])
 
   // ---- 指标：每秒刷新一次（UAV 数 + 数据新鲜度）----
   useEffect(() => {
@@ -361,6 +367,10 @@ export function MapStage({ phase, bottomBar, debug = false }: {
         styleLoaded: mp && mp.isStyleLoaded ? mp.isStyleLoaded() : null,
         hasAreaSource: !!(mp && mp.getSource && mp.getSource('src-area')),
         mapLoaded: !!(mp && mp.loaded && mp.loaded()),
+        // 视角范围（用户第 2 条"为什么缩放不能缩放" —— 让自证脚本能直接读到 min/max）
+        zoom: mp && mp.getZoom ? mp.getZoom() : null,
+        minZoom: mp && mp.getMinZoom ? mp.getMinZoom() : null,
+        maxZoom: mp && mp.getMaxZoom ? mp.getMaxZoom() : null,
         sourceIds: mp && mp.getStyle ? Object.keys(mp.getStyle()?.sources ?? {}) : null,
         measurement: m
           ? {
@@ -406,6 +416,9 @@ export function MapStage({ phase, bottomBar, debug = false }: {
         {/* 交互层（量算 / 手绘 / 图元编辑）：map-2d 的实现，必须挂进 `<MapView>` 才生效。
             各屏工具栏的"测距 / 测面 / 区域 / 新建 / 标绘"就是把它切到对应绘制模式。 */}
         <DrawLayer />
+        {/* 鼠标经纬度读数：显隐与落位由配置决定（`map-style.json` 的 controls.coords）；
+            组件在控件关闭时自己返回 null，所以这里常挂即可 */}
+        <CoordReadout />
       </MapView>
 
       {note ? <div style={noteStyle}>{note}</div> : null}

@@ -17,7 +17,7 @@ import { useGoto } from './flow/useSituation'
 import { DEFAULT_WS_URL } from './telemetry'
 import { C } from './theme'
 import { TopBar } from './screens/Chrome'
-import { AppShell, MicBall, type NavKey } from './shell/AppShell'
+import { AppShell, MicBall, SHELL_METRICS, type NavKey } from './shell/AppShell'
 import { VoiceStrip, voiceLine, useLabels } from './shell/VoiceStrip'
 import { SCREEN_BY_ID, defaultScreenForStep, NAV_TARGET } from './screens/registry'
 import { BootScreen, BOOT_HOLD_FOR_DEBUG } from './screens/BootScreen'
@@ -39,6 +39,7 @@ import { SummaryScreen } from './screens/SummaryScreen'
 import { BigScreenExec } from './screens/BigScreenExec'
 import { BigScreenRecon } from './screens/BigScreenRecon'
 import { MapStage } from './MapStage'
+import { useMapUiStore } from 'map-2d'
 
 function param(name: string): string | null {
   try { return new URLSearchParams(window.location.search).get(name) } catch { return null }
@@ -75,6 +76,22 @@ export function App() {
   const [strikePlanId, setStrikePlanId] = useState<string | null>(null)
   const [nav, setNav] = useState<NavKey>('态势')
   const [voiceOpen, setVoiceOpen] = useState(false)
+  // 清屏模式（map-2d 的 UI 状态；工具栏的【清屏】把它置 true）
+  const clearMode = useMapUiStore((s) => s.clearMode)
+  const setClearMode = useMapUiStore((s) => s.setClearMode)
+  /**
+   * 清屏时按 **Esc** 退出（用户第 6 条："按 Esc 再次显示出来"）。
+   * 与 map-2d `DrawLayer` 自己的 Esc（退出绘制模式）互不冲突：那一条只把 mode 置 none。
+   * 两件事同时发生（退出绘制 + 退出清屏）符合直觉。
+   */
+  useEffect(() => {
+    if (!clearMode) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !document.fullscreenElement) setClearMode(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [clearMode, setClearMode])
   const [notice, setNotice] = useState<string | null>(null)
   /**
    * **走流程**：把"进入第 N 步"翻译成**先推进阶段、再落屏**。
@@ -182,7 +199,16 @@ export function App() {
           <BootScreen
             state={state}
             running={busy}
-            onStart={() => void run('boot.run', { pacingMs: 400 })}
+            /**
+             * 启动加载的**节拍**（每个模块体检完之后歇一下）。
+             *
+             * 用户 2026-09-18："启动界面太快了，**加载总长度 30 秒左右**，修改一下"。
+             * 宿主的 `boot.run{pacingMs}` 是"**每个模块**处理完后 sleep 这么多"，
+             * 而模块是 5 个（地图引擎/通信链路/AI引擎/集群管理/数据服务）→ 5 × 6000 ≈ **30 秒**。
+             * 注意：`demo.ps1 runAll` / `flow.runAll` 走的是它们自己的 pacing（默认 0），**不受这里影响**
+             * —— 一键演示不会因此变慢。
+             */
+            onStart={() => void run('boot.run', { pacingMs: 6000 })}
             onEnterNext={() => setBootReleased(true)}
           />
         </div>
@@ -236,53 +262,103 @@ export function App() {
   const hasVoice = !!(voiceLine(labels, vScreen, 'system') || voiceLine(labels, vScreen, 'question'))
   return (
     <div style={{ position: 'absolute', inset: 0, background: C.bg, color: C.text }}>
-      <TopBar linkOk={state.wsClients > 0} />
-      <div style={{ position: 'absolute', top: 42, left: 0, right: 0, bottom: 0 }} data-ma-stagestrip="1">
-        <AppShell
-          state={state}
-          nav={nav}
-          onNav={onNav}
-          voice={voiceOpen ? (
-            <div style={{ position: 'absolute', right: 16, bottom: 88, zIndex: 44, width: 340 }}>
-              {hasVoice
-                ? <VoiceStrip labels={labels} screen={vScreen} title={`AI语音（${def.title}）`} />
-                : <div style={{ border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px 12px', background: 'rgba(10,32,58,.85)', fontSize: 11.5, color: C.textDim }}>
-                    本屏图上没有语音台词（`flow.labels` 里没有 `voice.{vScreen}.*`）
-                  </div>}
-            </div>
-          ) : null}
-        >
-          {activeId !== 'SH-03' && <MapLayer state={state} screenId={activeId} />}
-          <ScreenBody
-            id={activeId}
+      {/* 地图层挪到下面 UI 之后渲染（见文件末尾）—— 那里有为什么 */}
+
+      {/* ---------------- 其余 UI：清屏时整体隐藏（保持挂载，图元不丢） ---------------- */}
+      <div style={{ display: clearMode ? 'none' : 'contents' }}>
+        <TopBar linkOk={state.wsClients > 0} />
+        <div style={{ position: 'absolute', top: 42, left: 0, right: 0, bottom: 0 }} data-ma-stagestrip="1">
+          <AppShell
             state={state}
-            flow={flow}
-            busy={busy}
-            lastReply={lastReply}
-            goto={goto}
-            go={go}
-            planId={planId}
-            setPlanId={setPlanId}
-            strikePlanId={strikePlanId}
-            setStrikePlanId={setStrikePlanId}
-          />
-        </AppShell>
-        <MicBall open={voiceOpen} onToggle={() => setVoiceOpen((v) => !v)} />
+            nav={nav}
+            onNav={onNav}
+            voice={voiceOpen ? (
+              <div style={{ position: 'absolute', right: 16, bottom: 88, zIndex: 44, width: 340 }}>
+                {hasVoice
+                  ? <VoiceStrip labels={labels} screen={vScreen} title={`AI语音（${def.title}）`} />
+                  : <div style={{ border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px 12px', background: 'rgba(10,32,58,.85)', fontSize: 11.5, color: C.textDim }}>
+                      本屏图上没有语音台词（`flow.labels` 里没有 `voice.{vScreen}.*`）
+                    </div>}
+              </div>
+            ) : null}
+          >
+            <ScreenBody
+              id={activeId}
+              state={state}
+              flow={flow}
+              busy={busy}
+              lastReply={lastReply}
+              goto={goto}
+              go={go}
+              planId={planId}
+              setPlanId={setPlanId}
+              strikePlanId={strikePlanId}
+              setStrikePlanId={setStrikePlanId}
+            />
+          </AppShell>
+          <MicBall open={voiceOpen} onToggle={() => setVoiceOpen((v) => !v)} />
+        </div>
+
+        {notice && (
+          <div data-testid="nav-notice" style={noticeStyle} onClick={() => setNotice(null)}>
+            {notice}（点这条提示关掉）
+          </div>
+        )}
       </div>
 
-      {notice && (
-        <div data-testid="nav-notice" style={noticeStyle} onClick={() => setNotice(null)}>
-          {notice}（点这条提示关掉）
-        </div>
-      )}
+      {/* ---------------- 地图层：**所有屏共用**（含 SH-03） ----------------
+          ★ 用户第 6 条："清屏功能，不同于全屏功能，清屏应该隐藏所有**没有绘制在地图上**的东西，
+            按 Esc 再次显示出来"。为实现它，地图从 SH-03 的屏内搬到这一层（`SituationScreen` 不再
+            自带 `MapStage`）：清屏 = UI 整体 `display:none`（**只隐藏、不卸载** —— 各屏往地图上画的
+            图元是命令式写入的，卸载会把它们一起清掉），地图原样留着。
+
+          ★ **为什么放在 UI 之后（DOM 顺序靠后）**：实测踩过 —— 放在 UI 之前时，`AppShell` 的
+            `CONTENT_INSET` 是一个铺满内容区的定位盒子，它会把地图上的**点击全部吃掉**
+            （表现：量算点不出点、量算自证 4/6 挂）。挪到 UI 之后，地图在"没有面板的地方"就是
+            最上层，点击直达地图；而各屏的面板都有 `z-index: 20+`，仍旧压在地图之上。
+          ★ 不在清屏时地图让开左侧导航（`NAV_W`）与顶栏；清屏时铺满整屏（导航顶栏都隐掉了）。 */}
+      <div
+        style={{
+          position: 'absolute',
+          top: clearMode ? 0 : 42,
+          left: clearMode ? 0 : SHELL_METRICS.NAV_W,
+          right: 0, bottom: 0,
+        }}
+        data-ma-stagestrip={clearMode ? undefined : '1'}
+      >
+        <MapLayer state={state} screenId={activeId} />
+      </div>
+
+      {/* 清屏时的唯一出口（图上没有；不给出口就出不来） */}
+      {clearMode && <ExitClearMode onExit={() => setClearMode(false)} />}
       <Probe state={state} screen={def.id} />
     </div>
   )
 }
 
-/** 地图台：除 SH-03（态势主界面自己带地图）外的屏都在同一张地图上叠面板。 */
+/** 清屏模式的退出按钮（右下角，Esc 同效）。 */
+function ExitClearMode({ onExit }: { onExit: () => void }) {
+  return (
+    <button
+      data-testid="exit-clear-mode"
+      onClick={onExit}
+      title="退出清屏（Esc）"
+      style={{
+        position: 'absolute', right: 16, bottom: 16, zIndex: 60,
+        padding: '7px 14px', fontSize: 12.5, cursor: 'pointer', borderRadius: 8,
+        background: 'rgba(10,20,36,.85)', border: `1px solid ${C.borderStrong}`, color: C.text,
+      }}
+    >退出清屏 (Esc)</button>
+  )
+}
+
+/**
+ * 地图台：**所有屏共用同一张地图**（含 SH-03，2026-09-18 从 `SituationScreen` 搬到这里，
+ * 好让"清屏"能统一实现：地图留在外面，其余 UI 整体隐藏）。
+ * SH-07 / SH-08 是拓扑屏（图上无地图）→ 返回 null。
+ */
 function MapLayer({ state, screenId }: { state: NonNullable<ReturnType<typeof useFlow>['state']>; screenId: string }) {
-  // SH-04/SH-05/SH-06/SH-09/SH-10/SH-11/SH-12 需要地图；SH-07/SH-08 是拓扑屏（图上无地图）
+  // SH-04/SH-05/SH-06/SH-09…SH-18 需要地图；SH-07/SH-08 是拓扑屏（图上无地图）
   const noMap = ['SH-07', 'SH-08'].includes(screenId)
   if (noMap) return null
   return (

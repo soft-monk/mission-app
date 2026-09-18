@@ -71,6 +71,56 @@ export const DEFAULT_MAP_STYLE: MapStyleConfig = {
     midColor: '#f59e0b',
     lowColor: '#22d3ee',
   },
+  /**
+   * **地图控件**的显隐与落位（2026-09-18 新增，用户第 1 条）。
+   *
+   * 用户原话："默认显示的鼠标坐标，显示的东西被遮挡了？如果是，那么修改 map2d 接口，
+   * 要求不只是 true false，可以自己使用配置文件和哪些之前写的配置文件一起，**可配置显影与位置**"。
+   *
+   * 事实核查：坐标读数此前**根本没显示**（`controls.coords` 默认 false，且 `CoordReadout`
+   * 要宿主自己渲染 —— 宿主没渲染）。现在按这份配置开启并定位：
+   *   · `show`   —— 显隐
+   *   · `anchor` —— `top-left` / `top-right` / `bottom-left` / `bottom-right`
+   *   · `offset` —— 在锚点基础上的像素微调 `[dx, dy]`
+   * 字段与 `data/scenario-1/map-style.json` 的 `controls` 段**逐字段一致**（两份同步改）。
+   */
+  controls: {
+    // 鼠标经纬度：左下角，往上抬 56px —— 避开底部那条全局状态条与比例尺
+    coords: { show: true, anchor: 'bottom-left', offset: [0, 56] },
+    // 比例尺：右下角（模块缺省位置），往上抬 56px 同样避开状态条
+    scale: { show: true, anchor: 'bottom-right', offset: [0, 56] },
+    // 指北针：**默认关**。模块缺省把它放在右上角，而本应用每个地图屏的右上角都是右栏面板，
+    // 开了会被面板盖住（实测）。要用的话把 show 改 true 并给一个不被遮挡的锚点。
+    compass: { show: false, anchor: 'bottom-left', offset: [0, 96] },
+    // 缩放按钮同理默认关（滚轮/键盘 ± 可用）
+    zoom: { show: false, anchor: 'bottom-right', offset: [0, 96] },
+    legend: { show: false, anchor: 'bottom-right', offset: [0, 136] },
+    layerPanel: { show: false, anchor: 'top-left', offset: [0, 44] },
+    modeBadge: { show: false, anchor: 'top-right', offset: [0, 0] },
+  },
+}
+
+/** 一个控件的配置（`map-style.json` 的 `controls.<key>`） */
+export interface ControlCfgEntry {
+  show?: boolean
+  anchor?: 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right'
+  offset?: [number, number]
+}
+
+/**
+ * 把配置里的 `controls` 段翻成 map-2d 的 `ControlSpec[]`（**只做翻译，不做判断**）。
+ * 拿不到配置就给 `undefined` —— 调用方届时用模块缺省行为，**不自己编一份控件清单**。
+ */
+export function controlSpecsOf(style: MapStyleConfig): { key: string; on?: boolean; anchor?: ControlCfgEntry['anchor']; offset?: [number, number] }[] | undefined {
+  const c = (style as unknown as { controls?: Record<string, ControlCfgEntry> }).controls
+  if (!c || typeof c !== 'object') return undefined
+  const out: { key: string; on?: boolean; anchor?: ControlCfgEntry['anchor']; offset?: [number, number] }[] = []
+  for (const [key, v] of Object.entries(c)) {
+    if (!v || typeof v !== 'object') continue
+    const off = Array.isArray(v.offset) && v.offset.length === 2 ? [Number(v.offset[0]) || 0, Number(v.offset[1]) || 0] as [number, number] : undefined
+    out.push({ key, on: typeof v.show === 'boolean' ? v.show : undefined, anchor: v.anchor, offset: off })
+  }
+  return out.length ? out : undefined
 }
 
 /** 编队配色兜底（`groupColors` 里没有该 groupId 时用） */

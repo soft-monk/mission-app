@@ -63,7 +63,7 @@ function rows(v: unknown, key: string): J[] {
  * 「测面」插在「测距」后一格：map-2d 的量算本来就是测距/测面两档，图上只有一格"测距"，
  * 这是**有意偏差**（把已实现的量算真的接出来）；能不能点仍由规则包 view.compose 说了算。
  */
-const SH10_TOOLS = toolsOf(['select', 'draw', 'measure', 'measureArea', 'layers', 'mode3d', 'reset'])
+const SH10_TOOLS = toolsOf(['select', 'draw', 'measure', 'measureArea', 'layers', 'reset'])
 
 // ---------------------------------------------------------------------------
 // ① 媒体通道：事件 → verb → /api/state.media（三级来源，逐级如实标注）
@@ -529,7 +529,7 @@ export function ReconFusionScreen({ state, flow, onGo, goto }: {
   return (
     <div data-testid="sh-10" data-screen="SH-10" style={wrap}>
       {/* ---------------- 左上：工具栏 6 键（图上逐字；点击落 map-2d，坐标以本屏 wrap 为准） ---------------- */}
-      <MapToolbar testid="sh10-toolbar" items={SH10_TOOLS} state={mt} style={{ left: 0, top: 0 }} />
+      <MapToolbar testid="sh10-toolbar" items={SH10_TOOLS} state={mt} style={{ left: 0, top: -29 }} />
       <ToolModeNote state={mt} items={SH10_TOOLS} />
 
       {/* ---------------- 右上：显示模式胶囊 ---------------- */}

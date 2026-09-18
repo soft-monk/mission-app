@@ -424,8 +424,11 @@ nlohmann::json FlowEngine::itemsJson(const std::vector<selfcheck::ItemResult>& i
 //   100 = 规则包判定该模块就绪（`status == "ok"`，取值口径由规则包 levels 段给出）
 // 未到 100 的会按 `waitMs` 轮询等待——"接入层还没收到第一个包""台账里还没有在线设备"
 // 在启动阶段是**正常的瞬时状态**，等的就是它自己变好。
-nlohmann::json FlowEngine::bootRunOnce(int pacingMs) {
+nlohmann::json FlowEngine::bootRunOnce(int pacingMs, uint64_t gen) {
     nlohmann::json out = nlohmann::json::object();
+    // 本轮的"启动代号"对不上当前代号 = 已被 `boot.reset` 打断 → 立刻收手，**什么都不写**。
+    // （不写是关键：写了就会把 reset 之后干净的进度又搅成"少一个模块"的坏状态。）
+    const auto aborted = [this, gen]() { return gen != 0 && bootGen_.load() != gen; };
 #if MA_WITH_SELFCHECK
     if (!selfCheckReady_) {
         out["ok"] = false;
@@ -458,6 +461,16 @@ nlohmann::json FlowEngine::bootRunOnce(int pacingMs) {
     for (const auto& src : sources) {
         const std::string key = src.key;
         if (key.empty()) continue;
+        // ★ 每进一个模块先看"启动代号"还在不在：被 boot.reset 打断就立刻收手。
+        //   放在模块**开头**（而不是结尾），保证不会在 reset 之后还往进度源里写东西。
+        if (aborted()) {
+            out["ok"] = false;
+            out["aborted"] = true;
+            out["complete"] = false;
+            out["interruptedBy"] = "boot.reset";
+            LOG_INFO << "[flow] 启动加载被 boot.reset 打断，本轮作废（不写进度）";
+            return out;
+        }
 
         // ① 开始体检
         {
@@ -530,11 +543,19 @@ nlohmann::json FlowEngine::bootRunOnce(int pacingMs) {
 void FlowEngine::startBoot(int pacingMs) {
     if (bootRunning_.exchange(true)) return;
     if (bootThread_.joinable()) bootThread_.join();
-    bootThread_ = std::thread([this, pacingMs] {
+    // 领一个**启动代号**带进工作线程：`boot.reset` 会把代号 +1，本轮随即作废（见 bootGen_ 注释）
+    const uint64_t gen = bootGen_.fetch_add(1) + 1;
+    bootThread_ = std::thread([this, pacingMs, gen] {
         // ★ 工作线程里的异常**必须**自己收住：跨线程逃逸会直接 std::terminate，
         //   而"启动没动静"最难查的就是这种静默死亡。收住之后如实记一行。
         try {
-            const nlohmann::json r = bootRunOnce(pacingMs);
+            const nlohmann::json r = bootRunOnce(pacingMs, gen);
+            if (r.value("aborted", false)) {
+                // 被 boot.reset 打断 → 本轮作废：既不落 lastBoot_、也不推进步骤
+                LOG_INFO << "[flow] 启动加载本轮作废（被 boot.reset 打断），保持复位后的状态";
+                bootRunning_ = false;
+                return;
+            }
             {
                 std::lock_guard<std::mutex> lk(mtx_);
                 lastBoot_ = r;
@@ -5697,6 +5718,10 @@ nlohmann::json FlowEngine::command(const std::string& verb, const nlohmann::json
     if (verb == "boot.reset") {
 #if MA_WITH_SELFCHECK
         if (!selfCheckReady_) return reply(verb, 1005, {{"message", selfCheckNote_}});
+        // ★ 先把**启动代号 +1**：正在飞的那一轮启动随即作废（它每进一个模块比对一次代号，
+        //   发现对不上就收手、不再往进度源里写）。不这么做的话，reset 清掉的进度会被在飞的那轮
+        //   半途写回，总进度永远停在 80、bootComplete 永远不成立 —— 界面**永久卡在启动页**（实测复现）。
+        bootGen_.fetch_add(1);
         int reloadCode = 0;
         {
             std::lock_guard<std::mutex> lk(mtx_);
@@ -6197,7 +6222,18 @@ nlohmann::json FlowEngine::command(const std::string& verb, const nlohmann::json
         const view_composer::json vcSnap = view_composer::json::parse(ledgerSnapshotLocked().dump());
         const view_composer::json composed =
             engines_.viewComposer->composeJson(vc, hiddenGroups, hiddenTools, {}, vcSnap);
-        return reply(verb, 0, nlohmann::json::parse(composed.dump()));
+        nlohmann::json out = nlohmann::json::parse(composed.dump());
+        // ★ 2026-09-18：把**可选显示模式清单**一并交给界面（用户第 8 条："显示模式……应该单独是一个下拉框"）。
+        //   引擎的 composeJson 只给"当前这一档"（views[].mode），下拉框需要全部候选；
+        //   清单来自规则包 viewModes.json（引擎的 availableModes()，宿主不解析规则包原文）。
+        {
+            nlohmann::json modes = nlohmann::json::array();
+            for (const auto& m : engines_.viewComposer->availableModes()) {
+                modes.push_back({{"key", m.key}, {"name", m.name}});
+            }
+            out["modes"] = modes;
+        }
+        return reply(verb, 0, out);
 #else
         return reply(verb, 1005, {{"message", "view-composer 未装配（编译期 MA_WITH_VIEW_COMPOSER=0）"}});
 #endif

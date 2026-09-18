@@ -127,7 +127,16 @@ try {
       const st = await js(`(window.__measureProbe ? window.__measureProbe() : null)`)
       console.log(`      落点 (${x},${y}) → 交互层 ${JSON.stringify(st)}`)
     }
-    const live = await js(`(() => { const d = Array.from(document.querySelectorAll('div')).find(x => /长度/.test(x.innerText||'') && x.children.length <= 3); return d ? (d.innerText||'').replace(/\\s+/g,' ').slice(0,120) : '' })()`)
+    // 找**包含「长度」的最深那个 div**。
+    // 原来用"children.length <= 3"当"这是浮层不是整页"的启发式 —— DOM 结构一变
+    // （2026-09-18 清屏改造把地图层挪到 UI 之后）就会抓到最外层那个装下整页的 div，
+    // 于是明明有读数却断言失败。改成按"文本最短"挑，稳。
+    const live = await js(`(() => {
+      const hits = Array.from(document.querySelectorAll('div')).filter(x => /长度/.test(x.innerText||''))
+      if (!hits.length) return ''
+      hits.sort((a,b) => (a.innerText||'').length - (b.innerText||'').length)
+      return (hits[0].innerText||'').replace(/\\s+/g,' ').slice(0,140)
+    })()`)
     check('落点后界面出现实时量算读数', /长度/.test(live), `浮层「${live}」`)
 
     // 双击结束 → 测量结果落到 map-2d 的 interaction 状态（界面读的就是它）
