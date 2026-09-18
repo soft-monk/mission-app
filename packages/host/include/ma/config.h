@@ -42,6 +42,18 @@ struct HostConfig {
     // ---- selfcheck 规则包（可选；文件不存在则跳过装载，如实记 note）
     std::string selfcheckPolicies;
     std::string selfcheckCapabilities;
+    /**
+     * 演示口径：**本场景是否声明「有卫星链路」**（`config.json` 的 `selfcheck.satcomLinkUp`）。
+     *
+     * 为什么要有这个开关：本工程没有真实卫星链路，而 selfcheck 的 `satcomLink` 探针只有
+     * ok / failed 两态、**没有"未配置"分支**（`selfcheck/probes/mapapp/probe_pack.cc:166`），
+     * 于是"没有卫星链路"被判成"卫星链路中断"，把第 2 屏的「通信链路检测」整块拉红。
+     * 需求方 2026-09-18 的处置是"改配置"：把这条**声明**放进配置，缺省 `false`（＝如实报"没有"）。
+     *
+     * 注意：这是**能力声明（配置）**，不是测量值 —— 与 `linkUdpReceiving`（真收包）、
+     * `meshLinkUp`（真客户端数）不同，后两者**永远取实测**，不受本开关影响。
+     */
+    bool selfcheckSatcomLinkUp = false;
 
     // ---- 接入点（ingest.points[]）：仿真那条 UDP 流落到这里
     struct IngestPoint {

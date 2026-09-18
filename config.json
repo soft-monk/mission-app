@@ -90,7 +90,10 @@
 
   "selfcheck": {
     "policies": "../selfcheck/policies/mapapp/probes.json",
-    "capabilities": "../selfcheck/probes/mapapp/capabilities.json"
+    "capabilities": "../selfcheck/probes/mapapp/capabilities.json",
+
+    "satcomLinkUp": true,
+    "satcomLinkUpNote": "演示口径（需求方 2026-09-18 决定『改配置』）：本场景**声明有卫星链路**。本工程没有真实卫星链路，而 selfcheck 的 satcomLink 探针只有 ok/failed 两态、缺『未配置』分支（selfcheck/probes/mapapp/probe_pack.cc:166），所以如实报 false 会把第 2 屏『通信链路检测』整块拉红（原因显示『通信链路中断』）。这里按配置声明为可用。**改回 false 即可复现那条红项。** 同组的数传/组网两条不受本开关影响，永远取实测（真收包 / 真客户端数）。"
   },
 
   "webDist": "apps/web/dist"

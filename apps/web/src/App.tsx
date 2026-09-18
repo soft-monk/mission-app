@@ -186,9 +186,8 @@ export function App() {
             onEnterNext={() => setBootReleased(true)}
           />
         </div>
-        <FlowBadge state={state} lastReply={lastReply} screenId="SH-01" />
         {screenParam && <ForcedNotice step={state.step} screen={def.id} />}
-        <Probe state={state} />
+        <Probe state={state} screen={def.id} />
       </div>
     )
   }
@@ -203,12 +202,15 @@ export function App() {
             reply={lastReply}
             onRun={() => void run('selfcheck.run', { bypassCache: true })}
             onRecheck={() => void run('selfcheck.recheck', {})}
+            // 逐项重检：屏上按 4 秒节拍一项一项发（合计约 20 秒，落在"15~30 秒"里）。
+            // 每一下都是真的 selfcheck.recheck{keys:[该项]}，引擎只重跑该项的探针、其余项沿用上次结论
+            //（selfcheck/src/engine.cc:737-739）。
+            onRecheckOne={(key) => send('selfcheck.recheck', { keys: [key] }).then(() => undefined)}
             onEnter={() => void run('flow.enter', {})}
           />
         </div>
-        <FlowBadge state={state} lastReply={lastReply} screenId="SH-02" />
         {screenParam && <ForcedNotice step={state.step} screen={def.id} />}
-        <Probe state={state} />
+        <Probe state={state} screen={def.id} />
       </div>
     )
   }
@@ -223,8 +225,7 @@ export function App() {
             ? <BigScreenExec state={state} flow={flow} />
             : <BigScreenRecon state={state} flow={flow} />}
         </div>
-        <FlowBadge state={state} lastReply={lastReply} screenId={def.id} />
-        <Probe state={state} />
+        <Probe state={state} screen={def.id} />
         <BackToFlow onBack={() => { locked.current = false; setScreenId(null) }} />
       </div>
     )
@@ -274,8 +275,7 @@ export function App() {
           {notice}（点这条提示关掉）
         </div>
       )}
-      <FlowBadge state={state} lastReply={lastReply} screenId={activeId} />
-      <Probe state={state} />
+      <Probe state={state} screen={def.id} />
     </div>
   )
 }
@@ -327,23 +327,16 @@ function ScreenBody(p: {
   }
 }
 
-/** 左下角流程徽标：`步 N/11 · 屏名 · 阶段`（屏名取注册表，与左上角口径一致）。 */
-function FlowBadge({ state, lastReply, screenId }: {
-  state: NonNullable<ReturnType<typeof useFlow>['state']>
-  lastReply: ReturnType<typeof useFlow>['lastReply']
-  screenId: string
-}) {
-  const def = SCREEN_BY_ID[screenId]
-  return (
-    <div style={flowBadgeStyle} data-testid="flow-badge" data-screen={screenId}>
-      步 {state.step}/11 · {def?.title ?? (state.stepTitle || state.stepKey)}
-      {state.phase ? ` · 阶段 ${state.phase}` : ''}
-      {lastReply && lastReply.code !== 0
-        ? ` · 命令失败 code=${lastReply.code}（${lastReply.error?.message ?? ''}）`
-        : ''}
-    </div>
-  )
-}
+/**
+ * 左下角**流程徽标已按用户要求删除**（2026-09-18："左下角，每个界面都有的第几阶段那个去除，
+ * 没必要使用，演示也不需要，删除吧"）。
+ *
+ * 它原先显示 `步 N/11 · 屏名 · 阶段 Tx`，并在命令失败时追加一行 `命令失败 code=…`。
+ * 删除后：
+ *   · "当前在哪一屏"这件事仍可从 `window.__flowStats().screen` 读到（原来是靠这个徽标的
+ *     `data-screen` 属性，验收脚本都在读它 —— 见下面的 `Probe`，**脚本因此不用改口径**）；
+ *   · "哪条命令失败了"仍有出口：各屏自己的红字回执 + 右栏/折叠块里的「命令回执」。
+ */
 
 /** `?screen=` 深链与宿主当前步不一致时的如实提示（截图脚本会用到这个能力）。 */
 function ForcedNotice({ step, screen }: { step: number; screen: string }) {
@@ -373,21 +366,25 @@ function BackToFlow({ onBack }: { onBack: () => void }) {
   )
 }
 
-const flowBadgeStyle = {
-  position: 'absolute' as const, left: 12, bottom: 36, zIndex: 40, fontSize: 11.5,
-  color: C.textDim, background: 'rgba(6,26,47,.72)', border: `1px solid ${C.border}`,
-  borderRadius: 6, padding: '2px 8px', pointerEvents: 'none' as const,
-}
 const noticeStyle = {
   position: 'absolute' as const, left: 90, bottom: 44, zIndex: 60, fontSize: 12,
   color: C.text, background: 'rgba(120,60,10,.92)', border: '1px solid rgba(245,158,11,.6)',
   borderRadius: 8, padding: '6px 10px', cursor: 'pointer', maxWidth: 520,
 }
 
-/** 把当前流程状态挂到 window 上供脚本断言（只读，不影响渲染）。 */
-function Probe({ state }: { state: NonNullable<ReturnType<typeof useFlow>['state']> }) {
+/**
+ * 把当前流程状态挂到 window 上供脚本断言（只读，不影响渲染）。
+ *
+ * ★ `screen` 是 2026-09-18 从**已删除的左下角流程徽标**搬过来的：那个徽标原先带着
+ * `data-screen`，四个验收脚本（`click-check` / `click-real` / `screenshots` / `p3-check`）
+ * 都靠它判断"现在在哪一屏"。徽标按用户要求删掉后，"在哪一屏"这件事改由这里提供 ——
+ * **脚本的口径因此不必变**（它们改成读 `__flowStats().screen` 即可）。
+ */
+function Probe({ state, screen }: { state: NonNullable<ReturnType<typeof useFlow>['state']>; screen: string }) {
   const w = window as unknown as { __flowStats?: () => unknown }
   w.__flowStats = () => ({
+    /** 当前渲染的是哪一屏（SH-01…SH-20）—— 从已删除的流程徽标搬来 */
+    screen,
     step: state.step,
     stepKey: state.stepKey,
     stepTitle: state.stepTitle,

@@ -247,8 +247,10 @@ json capabilitySnapshot(const ma::HostConfig& cfg, ma::Engines& e, ma::Registry&
     c["beidouServiceUp"] = false;
 
     // ---- 通信链路子项（自检的"卫星/数传/组网"三条）：
-    //      数传 = 接入点真的在收包；组网 = 实时广播网已起且有客户端；卫星 = 未配置
-    c["satcomLinkUp"] = false;
+    //      数传 = 接入点**真的在收包**；组网 = 实时广播网已起**且有客户端**；这两条永远取实测。
+    //      卫星 = 本工程没有真实卫星链路 → 取值来自**配置声明** `selfcheck.satcomLinkUp`
+    //      （缺省 false = 如实报"没有"；置 true 见 config.h 里的说明——探针只有 ok/failed 两态）。
+    c["satcomLinkUp"] = cfg.selfcheckSatcomLinkUp;
     c["dataLinkUp"] = c.value("linkUdpReceiving", false);
     c["meshLinkUp"] = hub.transport() != nullptr && hub.hub().clientCount() > 0;
 

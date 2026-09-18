@@ -1,11 +1,18 @@
-﻿// mission-app · apps/web/src/screens/SelfCheckScreen.tsx
+// mission-app · apps/web/src/screens/SelfCheckScreen.tsx
 //
 // Excel 步 2 · 语音引导校验界面（参考图 `系统启动界面二.png`）。
 //
 // 五张自检卡片的**名称、子说明、状态文案、失败原因、处置建议**全部来自宿主的 `selfCheck.items[]`
 // ——那是 selfcheck 引擎按规则包 `selfCheck` 段聚合出来的结果，前端一个字都不写死。
 // 动作只有三个信号：`selfcheck.run`（一键自检）、`selfcheck.recheck`（重新检测）、`flow.enter`（进入任务）。
-import { useState, type CSSProperties } from 'react'
+//
+// ★ 2026-09-18 用户逐屏确认（SH-02）改的三条：
+//   ① 左栏宽度 250 → 320（让「提示：自检过程预计耗时 15~30 秒」稳单行 + 留盈余）；
+//   ② 自检**真的要走 15~30 秒**：不再是"点一下 13 ms 就出结果"，而是**逐项重检 + 项间节拍**
+//      （见 `runPaced`）。逐项重检是**真重算**（selfcheck 引擎对单项重检会保留其余项的结论，
+//      engine.cc:737-738），所以这段时间不是空等；
+//   ③ 五张卡片用素材库图标（按宿主给的 `key` 认领），替掉原先的空方块。
+import { useEffect, useRef, useState, type CSSProperties } from 'react'
 import { C, panel, panelTitle, statusColor } from '../theme'
 import { HINT_BAR_H, HintBar, StatusPanel } from './Chrome'
 import type { FlowState, SelfCheckItem } from '../api'
@@ -15,10 +22,30 @@ function isNormal(it: SelfCheckItem): boolean {
   return (it.status ?? '').toLowerCase() === 'normal' || (it.status ?? '').toLowerCase() === 'ok'
 }
 
-export function SelfCheckScreen({ state, onRun, onRecheck, onEnter, busy, reply }: {
+/**
+ * 自检逐项重检的**项间节拍**（毫秒）。
+ *
+ * 用户 2026-09-18："重新检测，速度太快，也是需要按照 15~30 秒流程重来一次"。
+ * 5 项 × 4000 ms ≈ **20 秒**，落在屏上提示的 15~30 秒区间里。
+ * 每一下都是真的 `selfcheck.recheck{keys:[该项]}`（引擎会重跑该项的探针），节拍只加在"项与项之间"。
+ */
+const PACE_MS = 4000
+
+/** 五张卡片的图标：素材库（`C:\Users\softmonk\Desktop\png库`），按**宿主给的 key** 认领。 */
+const CHECK_ICON: Record<string, string> = {
+  comm: '/check-comm.png',          // ← 通信链路检测.png
+  position: '/check-position.png',  // ← 定位系统检测.png
+  cluster: '/check-cluster.png',    // ← 集群节点检测.png
+  command: '/check-command.png',    // ← 后方指控检测.png
+  security: '/check-security.png',  // ← 系统安全检测.png
+}
+
+export function SelfCheckScreen({ state, onRun, onRecheck, onRecheckOne, onEnter, busy, reply }: {
   state: FlowState
   onRun: () => void
   onRecheck: () => void
+  /** 单项重检（逐项走 15~30 秒流程时用）；不传就退回"点一下全量重检"的老行为 */
+  onRecheckOne?: (key: string) => Promise<void>
   onEnter: () => void
   busy: boolean
   reply: { code: number; error?: { message?: string }; verb?: string } | null
@@ -28,12 +55,43 @@ export function SelfCheckScreen({ state, onRun, onRecheck, onEnter, busy, reply 
   const done = !!sc && items.length > 0
   const allNormal = done && items.every(isNormal)
   const [expanded, setExpanded] = useState<string | null>(null)
+  /** 逐项自检的进度（null = 没在跑；跑的时候是 1..N / N） */
+  const [paceStep, setPaceStep] = useState<{ i: number; n: number } | null>(null)
+  const alive = useRef(true)
+  useEffect(() => () => { alive.current = false }, [])
+
+  /**
+   * **15~30 秒的自检流程**：逐项重检，项与项之间留 `PACE_MS`。
+   * 执行顺序取宿主上一份报告里的项序（前端不自己编顺序，也不编项名）。
+   */
+  const runPaced = async () => {
+    const keys = items.map((i) => i.key).filter(Boolean)
+    if (!onRecheckOne || keys.length === 0) { onRecheck(); return }  // 拿不到项清单 → 退回老行为
+    try {
+      for (let i = 0; i < keys.length; i++) {
+        if (!alive.current) return
+        setPaceStep({ i: i + 1, n: keys.length })
+        await onRecheckOne(keys[i])
+        if (!alive.current) return
+        if (i < keys.length - 1) await new Promise((r) => setTimeout(r, PACE_MS))
+      }
+    } finally {
+      if (alive.current) setPaceStep(null)
+    }
+  }
+  const pacing = paceStep !== null
+  const btnBusy = busy || pacing
 
   return (
     <div style={{ position: 'absolute', inset: 0, background: `radial-gradient(120% 90% at 30% 20%, #0a2547 0%, ${C.bg} 55%, #02101f 100%)` }}>
       <div style={{ position: 'absolute', top: 0, bottom: HINT_BAR_H, left: 0, right: 0, display: 'flex', gap: 14, padding: 14 }}>
-        {/* 左：标题 + Logo 动效 + 一键自检 */}
-        <div style={{ ...panel, width: 250, flex: '0 0 auto', display: 'flex', flexDirection: 'column' }}>
+        {/* 左：标题 + Logo 动效 + 一键自检
+            ★ 2026-09-18 用户逐屏确认（SH-02 第 1 条）："左侧系统状态自检太小了，将宽度扩大，
+              起码能一行显示『提示：自检过程预计耗时 15~30 秒』还有盈余最佳"。
+              实测：提示那行文字在 11.5px 下实宽 181px；原宽 250 − 左右内边距 32 = 内容 218px，
+              只余 37px —— 换台机器字体渲染稍宽（Windows 上 CJK 回落到雅黑）就会挤成两行。
+              改 250 → 320：内容宽 288px，余量约 107px，任何常见字体设置下都稳定单行。 */}
+        <div style={{ ...panel, width: 320, flex: '0 0 auto', display: 'flex', flexDirection: 'column' }}>
           <div style={{ padding: '16px 16px 0' }}>
             <div style={{ fontSize: 16, letterSpacing: 1 }}>系统状态自检</div>
             <div style={{ fontSize: 12, color: C.textDim, marginTop: 6, lineHeight: 1.7 }}>
@@ -46,14 +104,20 @@ export function SelfCheckScreen({ state, onRun, onRecheck, onEnter, busy, reply 
               border: `1px solid ${C.borderStrong}`,
               boxShadow: '0 0 40px rgba(95,176,255,.35) inset, 0 0 24px rgba(95,176,255,.25)',
               display: 'flex', alignItems: 'center', justifyContent: 'center',
-              animation: busy ? 'pulse 1.4s ease-in-out infinite' : undefined,
+              animation: btnBusy ? 'pulse 1.4s ease-in-out infinite' : undefined,
             }}>
               <img src="/logo.png" alt="" style={{ width: 68, height: 68, objectFit: 'contain' }} />
             </div>
           </div>
           <div style={{ padding: 16 }}>
-            <button onClick={done ? onRecheck : onRun} disabled={busy} style={primaryBtn(busy)}>
-              {busy ? '自检中…' : done ? '重新自检' : '一键自检'}
+            <button
+              onClick={() => { if (done) void runPaced(); else onRun() }}
+              disabled={btnBusy}
+              style={primaryBtn(btnBusy)}
+            >
+              {pacing
+                ? `自检中… ${paceStep!.i}/${paceStep!.n}`
+                : btnBusy ? '自检中…' : done ? '重新自检' : '一键自检'}
             </button>
           </div>
           <div style={{ padding: '0 16px 14px', fontSize: 11.5, color: C.textDim }}>
@@ -76,10 +140,14 @@ export function SelfCheckScreen({ state, onRun, onRecheck, onEnter, busy, reply 
               return (
                 <div key={it.key} style={{ ...cardStyle, borderColor: ok ? 'rgba(34,197,94,.35)' : 'rgba(239,68,68,.4)' }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                    <span style={{
-                      width: 30, height: 30, borderRadius: 7, flex: '0 0 auto',
-                      border: `1px solid ${C.border}`, background: 'rgba(95,176,255,.08)',
-                    }} />
+                    {/* 卡片图标：素材库按宿主给的 key 认领；认不到仍回落空方块（不硬套一个图标） */}
+                    {CHECK_ICON[it.key]
+                      ? <img src={CHECK_ICON[it.key]} alt=""
+                          style={{ width: 30, height: 30, flex: '0 0 auto', objectFit: 'contain' }} />
+                      : <span style={{
+                        width: 30, height: 30, borderRadius: 7, flex: '0 0 auto',
+                        border: `1px solid ${C.border}`, background: 'rgba(95,176,255,.08)',
+                      }} />}
                     <span style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontSize: 13.5 }}>{it.name}</div>
                       {it.sub && <div style={{ fontSize: 11.5, color: C.textDim, marginTop: 2 }}>{it.sub}</div>}

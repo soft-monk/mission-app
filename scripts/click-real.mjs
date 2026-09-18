@@ -29,7 +29,7 @@ const js = async (e) => (await send('Runtime.evaluate', { expression: e, returnB
 const st = async () => (await (await fetch(`${BASE}/api/state`)).json())
 const cmd = async (verb, params = {}) => (await (await fetch(`${BASE}/api/command`, {
   method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ verb, params }) })).json())
-const screen = async () => js(`(document.querySelector('[data-testid="flow-badge"]')||{}).dataset?.screen || ''`)
+const screen = async () => js(`((window.__flowStats && window.__flowStats().screen) || (document.querySelector('[data-testid="flow-badge"]')||{}).dataset?.screen || '')`)
 
 /** 在页面里找到元素几何中心，并做命中测试；返回 {x,y,top,blocked,text} */
 const locate = async (spec) => JSON.parse(await js(`JSON.stringify((() => {

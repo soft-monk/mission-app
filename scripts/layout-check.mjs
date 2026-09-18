@@ -1,4 +1,4 @@
-// mission-app · scripts/layout-check.mjs
+﻿// mission-app · scripts/layout-check.mjs
 //
 // **排版与可点性自证（20 屏 × 多视口）**——回答一个 click-check 答不了的问题：
 // 「人用真鼠标点得到吗？」
@@ -16,7 +16,7 @@
 // 用法：node scripts/layout-check.mjs [url] [--viewports 1536x1024,1366x768] [--screens SH-03,SH-04]
 // 前置：宿主已起（demo.ps1 serve）；本脚本用 `?screen=` 深链逐屏检查，**不改流程状态**。
 import { spawn } from 'node:child_process'
-import { existsSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -169,6 +169,8 @@ try {
   const byKind = {}
   for (const r of results) for (const p of r.bad) byKind[p.kind] = (byKind[p.kind] ?? 0) + 1
   console.log('  分类：' + Object.entries(byKind).map(([k, v]) => `${k}=${v}`).join('  '))
+  // 报告目录可能被清过（点开头的临时目录），写之前先确保它在
+  mkdirSync(path.resolve('docs/screens/.layout'), { recursive: true })
   writeFileSync(path.resolve('docs/screens/.layout/report.json'), JSON.stringify(results, null, 1))
   console.log('  报告：docs/screens/.layout/report.json')
   try { ws?.close() } catch { }; chrome.kill()

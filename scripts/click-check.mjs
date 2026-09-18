@@ -42,8 +42,13 @@ const check = (name, ok, detail) => {
   console.log(`  ${ok ? '✓' : '✗'} ${name}${detail ? ` —— ${detail}` : ''}`)
 }
 /** 当前屏（左下流程徽标带 data-screen；取不到就退回页面文字） */
-const currentScreen = async () => js(`(document.querySelector('[data-testid="flow-badge"]')||{}).dataset?.screen || ''`)
-const badgeText = async () => js(`(document.querySelector('[data-testid="flow-badge"]')||{}).innerText || ''`)
+const currentScreen = async () => js(`((window.__flowStats && window.__flowStats().screen) || (document.querySelector('[data-testid="flow-badge"]')||{}).dataset?.screen || '')`)
+/** 徽标文案（左下角流程徽标已删；这里用 __flowStats() 现拼一条等价的可读文本，仅供日志） */
+const badgeText = async () => {
+  const raw = await js(`window.__flowStats ? JSON.stringify(window.__flowStats()) : null`)
+  if (!raw) return ''
+  try { const o = JSON.parse(raw); return `步 ${o.step}/11 · ${o.screen || '?'} · 阶段 ${o.phase || '—'}` } catch { return '' }
+}
 const visibleButtons = async () => JSON.parse(await js(`JSON.stringify(Array.from(document.querySelectorAll('button')).filter(b => {
   const r = b.getBoundingClientRect(); return r.width > 0 && r.height > 0
 }).map(b => ({ t: (b.innerText||'').trim().replace(/\\s+/g,' ').slice(0,40), disabled: !!b.disabled, tid: b.getAttribute('data-testid')||'' })))`))

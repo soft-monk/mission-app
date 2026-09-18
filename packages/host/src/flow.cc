@@ -5755,6 +5755,12 @@ nlohmann::json FlowEngine::command(const std::string& verb, const nlohmann::json
 #if MA_WITH_SELFCHECK
         if (!selfCheckReady_) return reply(verb, 1005, {{"message", selfCheckNote_}});
         const bool bypass = params.value("bypassCache", true);
+        // ★ 跑之前先把能力快照刷一遍：探针注册时是**按值捕获**快照的，不刷就一直是上一份。
+        //   实测踩过：页面刚打开时 WS 还没连上 → 快照里 `meshLinkUp=false` → 报告把"组网链路"
+        //   判成 `mesh-down`；之后客户端连上了，`/api/state` 的 5 秒定时器虽然刷新了**探针**，
+        //   但**报告**不会自己重算，于是屏上一直红到用户手动重检 —— 而重检用的还是旧快照。
+        //   刷新是廉价的（查瓦片目录、读接入计数、读 hub 客户端数），每次自检前做一次。
+        refreshCapabilities();
         const selfcheck::Report rep = runSelfCheck(bypass, {}, false);
         storeReport(rep);
         return reply(verb, 0, rep.toJson());
@@ -5767,6 +5773,7 @@ nlohmann::json FlowEngine::command(const std::string& verb, const nlohmann::json
 #if MA_WITH_SELFCHECK
         if (!selfCheckReady_) return reply(verb, 1005, {{"message", selfCheckNote_}});
         const auto keys = params.value("keys", std::vector<std::string>{});
+        refreshCapabilities();   // 同上：先刷新能力快照，再重检（否则重检用的还是旧快照）
         if (keys.empty()) {
             const selfcheck::Report rep = runSelfCheck(true, {}, false);
             storeReport(rep);

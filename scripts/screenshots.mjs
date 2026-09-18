@@ -67,8 +67,10 @@ const shoot = async (id, name) => {
   await send('Runtime.enable'); await send('Page.enable')
       await send('Emulation.setDeviceMetricsOverride', { width: W, height: H, deviceScaleFactor: 1, mobile: false })
       await sleep(3600)
-      const badge = await js(`(document.querySelector('[data-testid="flow-badge"]')||{}).innerText || ''`)
-      const scr = await js(`(document.querySelector('[data-testid="flow-badge"]')||{}).dataset?.screen || ''`)
+      const fs2 = await js(`window.__flowStats ? JSON.stringify(window.__flowStats()) : null`)
+      let badge = ''
+      try { const o = JSON.parse(fs2 || 'null'); badge = o ? `步 ${o.step}/11 · ${o.screen || '?'} · 阶段 ${o.phase || '—'}` : '' } catch { badge = '' }
+      const scr = await js(`((window.__flowStats && window.__flowStats().screen) || (document.querySelector('[data-testid="flow-badge"]')||{}).dataset?.screen || '')`)
       const r = await send('Page.captureScreenshot', { format: 'png' }, 20000)
       const file = path.join(OUT, `${id}-${name}.png`)
       writeFileSync(file, Buffer.from(r.data, 'base64'))

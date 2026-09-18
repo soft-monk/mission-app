@@ -412,10 +412,16 @@ try {
   //   那件事（态势 / 编组 / 方案确认三屏共用同一个 MapStage）。实测踩过：不钉屏时这条会随
   //   宿主推进的时机偶发红，而界面其实完全正常。
   await send('Page.navigate', { url: `${URL_}/?screen=SH-05` })
-  await sleep(2500)
-  const hasMap = await evalJs(`!!document.querySelector('.maplibregl-map canvas')`)
-  const mapScreen = await evalJs(`(document.querySelector('[data-testid="flow-badge"]')||{}).dataset?.screen || ''`)
-  check('第 3 步起地图台仍挂载（态势与编组共用 MapStage）', hasMap === true, `实测屏=${mapScreen} canvas=${hasMap}`)
+  // ★ 深链是**整页重载**：等页面真的到位（`__flowStats().screen === 'SH-05'`）再看有没有 canvas。
+  //   原先写死 sleep(2500)，宿主状态重时偶发"页面还没起来就断言"→ 误报红（界面其实正常）。
+  let mapScreen = ''
+  let hasMap = false
+  for (let i = 0; i < 40; i++) {
+    await sleep(400)
+    mapScreen = await evalJs(`(window.__flowStats && window.__flowStats().screen) || ''`)
+    if (mapScreen === 'SH-05') { hasMap = await evalJs(`!!document.querySelector('.maplibregl-map canvas')`); break }
+  }
+  check('第 3 步起地图台仍挂载（态势与编组共用 MapStage）', hasMap === true, `实测屏=${mapScreen || '(未就绪)'} canvas=${hasMap}`)
   const s = await shot('p3-1-grouping.png')
   if (s) console.log(`  · 截图：${s}`)
 

@@ -120,6 +120,8 @@ bool HostConfig::loadFile(const std::string& path, HostConfig& out, std::string&
     const auto& sc = sub(j, "selfcheck", scratch);
     if (!getString(sc, "policies", out.selfcheckPolicies, error)) return false;
     if (!getString(sc, "capabilities", out.selfcheckCapabilities, error)) return false;
+    // 演示口径：是否声明"有卫星链路"（缺省 false = 如实报"没有"；理由见 config.h 的注释）
+    if (!getBool(sc, "satcomLinkUp", out.selfcheckSatcomLinkUp, error)) return false;
 
     // ---- ingest（接入点）：ingest.points[] = { id, group, port, parserId, deviceType, topic }
     {
