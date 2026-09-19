@@ -20,10 +20,11 @@
 //   产品屏一律 `debug={false}`（它属于开发自证，不该出现在交付界面上）；
 //   `?stage=map` 排障后门传 `debug` 保留原始信息条。
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
-import { CoordReadout, DrawLayer, MapDraw, MapView, mapCommands, mapInstance, useInteraction, type MapData } from 'map-2d'
-import { DEFAULT_MAP_STYLE, controlSpecsOf, groupColorOf, loadMapStyle, trackStyleOf } from './map-style'
-import { DEFAULT_SCENARIO, toAreaItems, toLabelItems } from './scenario'
+import { CoordReadout, DrawLayer, MapDraw, MapView, draw, mapCommands, mapInstance, useInteraction, type MapData } from 'map-2d'
+import { DEFAULT_MAP_STYLE, controlSpecsOf, droneColorOf, groupColorOf, loadMapStyle, trackStyleOf } from './map-style'
+import { DEFAULT_SCENARIO, drawScenario } from './scenario'
 import { DEFAULT_WS_URL, TelemetryStore, connectTelemetry, type LinkState } from './telemetry'
+import { uavTypeCN } from './flow/useSituation'
 
 /** 瓦片模板缺省值（与 config.json 的 tiles.template 一致；运行时以宿主 /runtime-config 为准） */
 const DEFAULT_TILE_TEMPLATE = '/tiles/{z}/{x}/{y}.jpg'
@@ -87,6 +88,26 @@ const noteStyle: CSSProperties = {
 }
 
 /**
+ * ★ 2026-09-18：**删除确认条**（选中图元后按 Delete 出现）。
+ * 放在底部中间偏上，不挡工具栏与右栏；两个按钮都带 `data-testid` 便于自测。
+ */
+const deleteBarStyle: CSSProperties = {
+  position: 'absolute', left: '50%', transform: 'translateX(-50%)', bottom: 56, zIndex: 30,
+  display: 'flex', alignItems: 'center', gap: 10,
+  padding: '8px 12px', borderRadius: 8, fontSize: 12.5, color: '#eaf6ff',
+  background: 'rgba(30,12,8,.94)', border: '1px solid rgba(245,158,11,.65)',
+  boxShadow: '0 6px 20px rgba(0,0,0,.5)',
+}
+const deleteYesStyle: CSSProperties = {
+  padding: '4px 10px', borderRadius: 6, cursor: 'pointer', font: 'inherit', fontSize: 12,
+  background: 'rgba(220,38,38,.85)', border: '1px solid rgba(248,113,113,.8)', color: '#fff',
+}
+const deleteNoStyle: CSSProperties = {
+  padding: '4px 10px', borderRadius: 6, cursor: 'pointer', font: 'inherit', fontSize: 12,
+  background: 'transparent', border: '1px solid rgba(148,163,184,.5)', color: '#cfe3f5',
+}
+
+/**
  * 图内同步层：只在 `<MapView>` 的 children 里渲染（此时地图已就绪）。
  *
  * 两个 effect 各管一件事：
@@ -94,15 +115,23 @@ const noteStyle: CSSProperties = {
  *   · 实时态势：订阅 flux 的节拍回调，按"脏 uavId"增量更新，整表最多 120 ms 重建一次
  */
 function SituationLayer({ store, styleCfg }: { store: TelemetryStore; styleCfg: typeof DEFAULT_MAP_STYLE }) {
-  const scene = DEFAULT_SCENARIO
-  const areas = useMemo(() => toAreaItems(scene), [scene])
-  const labels = useMemo(() => toLabelItems(scene), [scene])
+  // ★ 2026-09-18：**把样式配置登记给 map-2d**。
+  //   以前应用只把 `map-style.json` 用在自己的取色/取线宽上，**从没调用过 `MapDraw.setStyle()`** ——
+  //   于是模块的"位图图标"能力一直没被点亮，无人机只能是画点（这就是"没看到无人机图标"的原因）。
+  //   登记之后：`drone.useIcon` + `byType[type].icon.url` 生效，模块负责加载位图，
+  //   并按"图元字段 > 机型段 > 顶层"解析颜色；加载失败会自动回落画点（不报错）。
+  useEffect(() => { MapDraw.setStyle(styleCfg as never) }, [styleCfg])
 
-  // ---- 静态态势：区域多边形 + 标注 ----
-  useEffect(() => {
-    MapDraw.set('area', areas)
-    MapDraw.set('label', labels)
-  }, [areas, labels])
+  // ---- 静态态势：区域 + 出航通道 + 航线，**全部走 map-2d 的几何原语 + 绑定文本框** ----
+  //
+  // ★ 2026-09-18 业务层改造：以前是把 `toAreaItems/toLabelItems` 的结果塞进
+  //   `MapDraw.set('area'|'label')`，标注是**手挂的 label 图元**（和图形是两条互不相干的东西）。
+  //   现在：图形用 `draw.polygon / draw.line`（几何原语），文字用几何原语的 `text` 字段。
+  // ★ 2026-09-18（需求方："每次启动态势界面后，不是直接读取显示固定文件，而是显示什么都没有画的地图，
+  //   我手动选择计划文件，读取我选择的计划文件，来进行绘制"）：
+  //   **这里原来会 `drawScenario()` 把内联场景画死** —— 现在不画了，进屏就是空地图；
+  //   由用户从工具条的【计划 → 打开计划】挑一份计划文件，再画（见 apps/web/src/plan-file.ts）。
+  useEffect(() => { /* 故意留空：等用户打开计划 */ }, [])
 
   // ---- 实时态势：按节拍把累积结果上屏 ----
   useEffect(() => {
@@ -123,9 +152,16 @@ function SituationLayer({ store, styleCfg }: { store: TelemetryStore; styleCfg: 
               lng: u.lng,
               lat: u.lat,
               type: u.type,
-              // 编队配色取自 map-style.json 的 groupColors[groupId]
-              color: groupColorOf(styleCfg, u.groupId),
-              label: u.uavId,
+              // ★ 2026-09-18：颜色改成**按机型取**（`drone.byType[type].point.color`），
+              //   与下面航迹用的是**同一个函数** —— 需求方要求"航迹与无人机颜色一样"。
+              //   这个色同时也是"图标加载失败时回落画点"的颜色，以及图标本身的同色系。
+              color: droneColorOf(styleCfg, u.type),
+              // ★ 用户 2026-09-18 第 3 条："画出来的所有东西，都需要有文本文字标签，**包括这一开始加载的**"。
+              //   无人机是开机后由遥测增量画上来的（不是用户画的），原来只有点、没有文字。
+              //   ★ 文字现在由 map-2d 的**原生 symbol 图层**画（`lyr-text` 读要素的 `label` 字段），
+              //     所以这里直接把"机型 + 编号"作为 `label` 一起提交 —— 与点位同一次更新，
+              //     不会出现"点到了、字还没到"，也不再需要单独的绑定调用。
+              label: `${uavTypeCN(u.type)} ${u.uavId.replace(/^uav-/, '')}`,
             })
           }
         })
@@ -137,7 +173,9 @@ function SituationLayer({ store, styleCfg }: { store: TelemetryStore; styleCfg: 
         return {
           id: `TRK:${t.uavId}`,
           points: t.points,
-          color: groupColorOf(styleCfg, u?.groupId),
+          // ★ 2026-09-18：航迹颜色与**无人机颜色同源**（同一个 `droneColorOf`），
+          //   需求方："需要航迹与无人机颜色一样"。
+          color: droneColorOf(styleCfg, u?.type),
           widthPx: trk.widthPx,
           dashed: trk.dashed,
           opacity: trk.opacity,
@@ -162,6 +200,14 @@ export function MapStage({ phase, bottomBar, debug = false }: {
   const [cfg, setCfg] = useState<RuntimeConfig | null>(null)
   const [health, setHealth] = useState<string>('(未探测)')
   const [note, setNote] = useState<string>('')
+  /**
+   * ★ 2026-09-18：**待确认的删除**。
+   *
+   * map-2d 已经把"点图元即选中 + 虚线高亮"做在模块里；用户在选中状态下按 `Delete`
+   * 时模块只是**把"想删哪个"报出来**（`mapCommands.onDeleteRequest`）——
+   * 这里存下来、弹一条确认，确认了才真删（误删不可逆，这一步不能省）。
+   */
+  const [pendingDelete, setPendingDelete] = useState<{ kind: string; id: string; label: string } | null>(null)
   const [styleCfg, setStyleCfg] = useState(() => DEFAULT_MAP_STYLE)
   const [styleSource, setStyleSource] = useState('内联默认值')
   const [link, setLink] = useState<LinkState>({ state: 'connecting', reconnects: 0 })
@@ -188,6 +234,20 @@ export function MapStage({ phase, bottomBar, debug = false }: {
   }, [])
 
   // ---- 装配信息（瓦片模板 + 各引擎是否就绪）----
+  // ★ 2026-09-18：注册"用户按了 Delete"的回调 —— 弹确认条，确认后才调 `deleteSelection()`。
+  useEffect(() => {
+    mapCommands.onDeleteRequest((sel) => {
+      // 显示名取图元自己的文本/名字，没有就退回 id（面板里也是这么显示的）
+      const items = MapDraw.list(sel.kind as never) as unknown as { id?: string; text?: string; label?: string; name?: string }[]
+      const it = items.find((x) => x?.id === sel.id)
+      const label = it?.text || it?.label || it?.name || sel.id
+      setPendingDelete({ kind: sel.kind, id: sel.id, label })
+    })
+    // ★ 2026-09-18：点地图空白处会取消选中 → 确认条也要跟着收起（不然它会挂在没有选中对象的画面上）
+    const offSel = mapCommands.onSelectionChange((sel) => { if (!sel) setPendingDelete(null) })
+    return () => { mapCommands.onDeleteRequest(null); offSel() }
+  }, [])
+
   useEffect(() => {
     let alive = true
     fetch('/runtime-config')
@@ -341,6 +401,13 @@ export function MapStage({ phase, bottomBar, debug = false }: {
       rejected: store.rejected,
       unknownEventTypes: store.unknownEventTypes(),
       drones: MapDraw.list('drone').length,
+      // 自证用（2026-09-18 第 2 条要能验）：跟随文本的内容、圆形/扇区的**实际半径**
+      labelTexts: (MapDraw.list('label') ?? []).map((i: { id: string; text?: string }) => ({ id: i.id, text: i.text })),
+      shapeRadii: (MapDraw.list('shape') ?? []).map((i: { id: string; radiusKm?: number; radiusKmMinor?: number }) => ({ id: i.id, radiusKm: i.radiusKm, minor: i.radiusKmMinor })),
+      // 航线顶点（自证"A\* 真的绕开了威胁区"）
+      routePoints: (MapDraw.list('route') ?? []).map((i: { id: string; points?: [number, number][] }) => ({ id: i.id, points: i.points })),
+      // 区域面的虚线标记（自证"区域能不能画实线"这条链路的**第一段**：图元 → 属性）
+      areaDashed: (MapDraw.list('area') ?? []).map((i: { id: string; dashed?: boolean }) => ({ id: i.id, dashed: i.dashed === true })),
       tracksOnMap: MapDraw.list('track').length,
       areas: MapDraw.list('area').length,
       labels: MapDraw.list('label').length,
@@ -367,6 +434,22 @@ export function MapStage({ phase, bottomBar, debug = false }: {
         styleLoaded: mp && mp.isStyleLoaded ? mp.isStyleLoaded() : null,
         hasAreaSource: !!(mp && mp.getSource && mp.getSource('src-area')),
         mapLoaded: !!(mp && mp.loaded && mp.loaded()),
+        // 自证用：把 map 实例挂到 window（只读，方便脚本查图层/要素）
+        __mapForProbe: (() => {
+          const w = window as unknown as { __maMapRef?: unknown; __maDraw?: unknown }
+          w.__maMapRef = mp
+          w.__maDraw = MapDraw   // 自证脚本要能直接调新 API（on('change') / add / setVisible …）
+          ;(w as unknown as { __maDrawApi?: unknown }).__maDrawApi = draw   // 几何原语 API
+          ;(w as unknown as { __maCommands?: unknown }).__maCommands = mapCommands  // 自证：setGeometry 等
+          return true
+        })(),
+        // 自证"区域能不能画实线"链路的**第二段**：两条区域边界图层在不在、各自有没有 dasharray
+        areaLayers: mp && mp.getLayer
+          ? ['lyr-area-line', 'lyr-area-line-dashed'].map((id) => {
+            const l = mp.getLayer(id) as { id: string; paint?: Record<string, unknown> } | undefined
+            return l ? { id, dasharray: (l.paint ?? {})['line-dasharray'] ?? null } : { id, missing: true }
+          })
+          : null,
         // 视角范围（用户第 2 条"为什么缩放不能缩放" —— 让自证脚本能直接读到 min/max）
         zoom: mp && mp.getZoom ? mp.getZoom() : null,
         minZoom: mp && mp.getMinZoom ? mp.getMinZoom() : null,
@@ -420,6 +503,33 @@ export function MapStage({ phase, bottomBar, debug = false }: {
             组件在控件关闭时自己返回 null，所以这里常挂即可 */}
         <CoordReadout />
       </MapView>
+
+      {/* ★ 2026-09-18（需求方："点击选中状态，按键盘 delete，提示删除，确认删除"）：
+          选中与高亮由 map-2d 负责（点图元即选中，虚线高亮）；
+          用户按 Delete 时模块**只把"想删"报出来**，确认框在这里 —— 确认了才真删。 */}
+      {pendingDelete && (
+        <div data-testid="delete-confirm" style={deleteBarStyle}>
+          <span>
+            删除图元 <b style={{ color: '#ffd400' }}>{pendingDelete.label}</b>？
+            <span style={{ color: '#8fb0cc' }}>（{pendingDelete.kind}）</span>
+          </span>
+          <button
+            data-testid="delete-confirm-yes"
+            onClick={() => {
+              // ★ 2026-09-18（需求方："左下角的已删除提示，删除，不需要"）：
+              //   删完**不写任何提示**（原来会往左下角的 note 条写"已删除 xxx"）。
+              mapCommands.deleteSelection()
+              setPendingDelete(null)
+            }}
+            style={deleteYesStyle}
+          >确认删除</button>
+          <button
+            data-testid="delete-confirm-no"
+            onClick={() => setPendingDelete(null)}
+            style={deleteNoStyle}
+          >取消</button>
+        </div>
+      )}
 
       {note ? <div style={noteStyle}>{note}</div> : null}
 

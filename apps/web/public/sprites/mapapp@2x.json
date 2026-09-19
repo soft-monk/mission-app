@@ -1,0 +1,41 @@
+﻿{
+    "textbox-tag":  {
+                        "x":  0,
+                        "y":  0,
+                        "width":  64,
+                        "height":  32,
+                        "pixelRatio":  2,
+                        "content":  [
+                                        8,
+                                        8,
+                                        56,
+                                        24
+                                    ]
+                    },
+    "textbox-card":  {
+                         "x":  64,
+                         "y":  0,
+                         "width":  64,
+                         "height":  32,
+                         "pixelRatio":  2,
+                         "content":  [
+                                         8,
+                                         8,
+                                         56,
+                                         24
+                                     ]
+                     },
+    "textbox-callout":  {
+                            "x":  128,
+                            "y":  0,
+                            "width":  64,
+                            "height":  32,
+                            "pixelRatio":  2,
+                            "content":  [
+                                            8,
+                                            8,
+                                            56,
+                                            24
+                                        ]
+                        }
+}

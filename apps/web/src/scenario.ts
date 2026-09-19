@@ -1,4 +1,4 @@
-// mission-app · apps/web/src/scenario.ts
+﻿// mission-app · apps/web/src/scenario.ts
 //
 // 场景几何（区域多边形 / 标注）——**内联为前端默认值**，理由与 map-style.ts 相同：
 // 宿主的 `/` 只托管 apps/web/dist，不托管 `data/scenario-1/`，运行时 fetch 必然 404。
@@ -10,7 +10,8 @@
 //
 // ★ 纪律：本文件只做"数据 → map-2d 图元"的**翻译**，不做业务判断
 //   （不算威胁等级、不判越界、不推导航路）。颜色的语义令牌 → 十六进制也只在这里做一次。
-import type { AreaItem, LabelItem } from 'map-2d'
+import { aStar, rectPolygon, simplify, degLatPerKm } from './route-plan'
+import { draw } from 'map-2d'
 
 // ---------------------------------------------------------------- 输入数据的形状（照抄 JSON）
 export interface ScenarioArea {
@@ -32,6 +33,8 @@ export interface ScenarioZone {
   /** 通道宽度（米）——只有 corridor 有；用来把折线扩成一条带状面 */
   widthM?: number
   color?: string
+  /** 是否虚线（用户布置里的「红色虚线」「蓝色虚线」用这个） */
+  dashed?: boolean
   polygon?: [number, number][]
   line?: [number, number][]
 }
@@ -59,56 +62,115 @@ export interface ScenarioData {
   corridor?: ScenarioZone
 }
 
-// ---------------------------------------------------------------- 内联数据（照抄 JSON）
+// ---------------------------------------------------------------- 内联数据（**用户 2026-09-18 亲自安排的布局**）
+//
+// 用户原话："画的太杂乱了，我来安排，还是现在的北京位置"：
+//   · **任务区**：矩形中心 `116.527, 39.864`，边长 **4km**，**红色实线**
+//   · **我方集结区**：`116.527, 39.70`，边长 **1km** 的矩形，**绿色实线**
+//   · **威胁区**：两个中心连线之间、**靠近任务区一些**，**2km × 4km** 的长条矩形、**横在中间**，**红色虚线**
+//   · **出航通道**：用 **A\*** 从集结区到任务区规划一条避开威胁区的航线，航线扩展 **1km** 宽，
+//     **蓝色虚线**
+//
+// 所以：区域几何**由中心点 + 边长推导**（`rectPolygon`），航线与通道由 `route-plan.ts` 现算
+// —— 用户以后挪区域，只改下面这几个中心点/边长即可，航线和通道自动跟着重算。
+//
+// 旧的 A/B/C 区、敌方潜在部署区、核心禁飞区、电子围栏、前沿指挥节点、老的出航通道折线
+// **全部删掉**（用户："画的太杂乱了"）。
+
+/** 任务区：中心 + 边长 4km × 4km */
+export const TASK_AREA_CENTER = { lng: 116.527, lat: 39.864 }
+export const TASK_AREA_SIDE_KM = 4
+/** 我方集结区：中心 + 边长 1km × 1km */
+export const ASSEMBLY_CENTER = { lng: 116.527, lat: 39.700 }
+export const ASSEMBLY_SIDE_KM = 1
+/**
+ * 威胁区：2km（南北）× 4km（东西）的长条，横在两地之间、**靠近任务区**。
+ *
+ * "靠近任务区一些"取**从任务区往集结区走三成**的位置：
+ *   任务区南沿 39.8459 → 集结区北沿 39.7045，跨度 0.1414°；
+ *   39.8459 − 0.3 × 0.1414 ≈ **39.8035**（离任务区更近，肉眼一眼能看出偏上）。
+ */
+export const THREAT_CENTER = { lng: 116.527, lat: 39.8035 }
+export const THREAT_W_KM = 4
+export const THREAT_H_KM = 2
+
+const TASK_RECT = rectPolygon(TASK_AREA_CENTER, TASK_AREA_SIDE_KM, TASK_AREA_SIDE_KM)
+const ASSEMBLY_RECT = rectPolygon(ASSEMBLY_CENTER, ASSEMBLY_SIDE_KM, ASSEMBLY_SIDE_KM)
+const THREAT_RECT = rectPolygon(THREAT_CENTER, THREAT_W_KM, THREAT_H_KM)
+
+/**
+ * **把本场景画到地图上** —— 全部走 map-2d 的几何原语 + 绑定文本框。
+ *
+ * 用户 2026-09-18 布置的四件事，逐个对应：
+ *   · 任务区     → `draw.polygon` 红色**实线**，文本「任务区」
+ *   · 我方集结区 → `draw.polygon` 绿色**实线**，文本「我方集结区」
+ *   · 威胁区     → `draw.polygon` 红色**虚线**，文本「威胁区」
+ *   · 出航通道   → A\* 航线扩展 1km 宽的带状面，蓝色**虚线**，文本「出航通道（1000 m）」
+ *   · 规划航线   → `draw.line` 蓝色实线，文本「规划航线」
+ *
+ * 幂等：每条都用固定 id（`SCN:*`），重复调用是**覆盖**而不是叠加。
+ * 文字全部由模块的 `TextOverlay` 画 —— 本文件不再手挂 `label` 图元。
+ */
+export function drawScenario(): void {
+  draw.polygon({
+    id: 'SCN:task', ring: TASK_RECT,
+    color: '#ef4444', fillColor: '#ef4444', fillOpacity: 0.1,
+    strokeWidthPx: 2, dashed: false,
+    text: '任务区',
+  })
+  draw.polygon({
+    id: 'SCN:assembly', ring: ASSEMBLY_RECT,
+    color: '#22c55e', fillColor: '#22c55e', fillOpacity: 0.1,
+    strokeWidthPx: 2, dashed: false,
+    text: '我方集结区',
+  })
+  draw.polygon({
+    id: 'SCN:threat', ring: THREAT_RECT,
+    color: '#ef4444', fillColor: '#ef4444', fillOpacity: 0.12,
+    strokeWidthPx: 2, dashed: true,
+    text: '威胁区',
+  })
+
+  if (PLANNED_ROUTE.length < 2) return
+  const line = PLANNED_ROUTE.map((p) => [p.lng, p.lat] as [number, number])
+  draw.line({ id: 'SCN:route', points: line, color: '#38bdf8', widthPx: 2, dashed: false, text: '规划航线' })
+  const band = corridorBand(line, 1000)
+  if (band.length >= 3) {
+    draw.polygon({
+      id: 'SCN:corridor', ring: band,
+      color: '#3b82f6', fillColor: '#3b82f6', fillOpacity: 0.08,
+      strokeWidthPx: 1.4, dashed: true,
+      text: '出航通道（1000 m）',
+    })
+  }
+}
+
+
+/**
+ * **A\* 规划出来的航线**：从集结区北沿中点到任务区南沿中点，绕开威胁区。
+ *
+ * 起终点取两条边的**中点**（正对着，最自然）；若规划不出来（起终点落在威胁区里等）
+ * 就是空数组 —— 界面届时只画区域、不画航线和通道，**不编一条假的**。
+ */
+const ROUTE_START = { lng: ASSEMBLY_CENTER.lng, lat: ASSEMBLY_CENTER.lat + (ASSEMBLY_SIDE_KM / 2) * degLatPerKm() }
+const ROUTE_GOAL = { lng: TASK_AREA_CENTER.lng, lat: TASK_AREA_CENTER.lat - (TASK_AREA_SIDE_KM / 2) * degLatPerKm() }
+export const PLANNED_ROUTE: { lng: number; lat: number }[] =
+  simplify(aStar(ROUTE_START, ROUTE_GOAL, [THREAT_RECT], 0.25))
+
 const DEPLOYMENT_AREAS: ScenarioArea[] = [
-  {
-    key: 'friendly-assembly-a',
-    name: '我方集结区 A',
-    role: 'assembly',
-    polygon: [[116.595, 39.735], [116.625, 39.735], [116.625, 39.755], [116.595, 39.755]],
-  },
+  // **绿色实线**（用户："我方集结区……绿色实线"）→ `dashed: false`
+  { key: 'friendly-assembly', name: '我方集结区', role: 'assembly', color: 'green', dashed: false, polygon: ASSEMBLY_RECT },
 ]
 
-const DEPLOYMENT_NODES: { key: string; name: string; position: [number, number] }[] = [
-  { key: 'friendly-forward-node', name: '前沿指挥节点', position: [116.61, 39.745] },
-]
+const DEPLOYMENT_NODES: { key: string; name: string; position: [number, number] }[] = []
 
 const TASK_AREAS: ScenarioArea[] = [
-  {
-    key: 'area-a', name: 'A 区', role: 'assembly', color: 'blue',
-    polygon: [[116.586, 39.744], [116.618, 39.744], [116.618, 39.764], [116.586, 39.764]],
-  },
-  {
-    key: 'area-b', name: 'B 区', role: 'monitor', color: 'green',
-    polygon: [[116.556, 39.782], [116.604, 39.782], [116.604, 39.806], [116.556, 39.806]],
-  },
-  {
-    key: 'area-c', name: 'C 区', role: 'hvt', color: 'red',
-    polygon: [[116.528, 39.752], [116.568, 39.752], [116.568, 39.776], [116.528, 39.776]],
-  },
-  {
-    key: 'area-enemy-deploy', name: '敌方潜在部署区', role: 'threat', color: 'red', dashed: true,
-    polygon: [[116.494, 39.792], [116.556, 39.792], [116.556, 39.826], [116.494, 39.826]],
-  },
+  // **红色实线**（用户："任务区……红色实线"）→ `dashed: false`
+  { key: 'area-task', name: '任务区', role: 'hvt', color: 'red', dashed: false, polygon: TASK_RECT },
 ]
 
 const AIRSPACE_ZONES: ScenarioZone[] = [
-  {
-    key: 'nfz-core', name: '核心禁飞区', kind: 'no-fly', hardness: 'hard', color: 'red',
-    polygon: [[116.56, 39.764], [116.582, 39.764], [116.582, 39.78], [116.56, 39.78]],
-  },
-  {
-    key: 'threat-sam', name: '威胁区（防空）', kind: 'threat', level: 'high', color: 'orange',
-    polygon: [[116.54, 39.784], [116.568, 39.784], [116.568, 39.798], [116.54, 39.798]],
-  },
-  {
-    key: 'geofence-ew', name: '电子围栏', kind: 'geofence', action: 'warn', color: 'yellow',
-    polygon: [[116.5, 39.76], [116.522, 39.76], [116.522, 39.778], [116.5, 39.778]],
-  },
-  {
-    key: 'corridor-main', name: '出航通道', kind: 'corridor', widthM: 800, color: 'cyan',
-    line: [[116.6, 39.742], [116.578, 39.752], [116.552, 39.766]],
-  },
+  { key: 'threat-mid', name: '威胁区', kind: 'threat', level: 'high', color: 'red', dashed: true, polygon: THREAT_RECT },
 ]
 
 /** 内联的场景数据（= data/scenario-1/ 三份 JSON 的并集） */
@@ -118,14 +180,23 @@ export const DEFAULT_SCENARIO: ScenarioData = {
   //   瓦片包 `map-2d/tiles/raster` 实际有 **z0–z14**：下限放到 2 就能看全球；
   //   上限放到 18 —— z14 以上由地图模块"超采样"父瓦片（画面变糊，但能继续放大，比卡死好）。
   //   磁盘上的 `data/scenario-1/task-areas.json` 已同步改成同一组值（两份保持一致）。
-  center: [116.574, 39.77],
-  zoom: 12,
+  // 视角中心取两个区域的中点（116.527, 39.782），zoom 11 能把两地一屏放下
+  center: [116.527, 39.782],
+  zoom: 11,
   minZoom: 2,
   maxZoom: 18,
   areas: [...TASK_AREAS, ...DEPLOYMENT_AREAS],
   zones: AIRSPACE_ZONES,
   nodes: DEPLOYMENT_NODES,
-  corridor: AIRSPACE_ZONES.find((z) => z.kind === 'corridor'),
+  // 出航通道：**由 A\* 规划出的航线扩展 1km 宽**（用户："这条航线扩展宽度为 1km 的矩形，画出出航通道"）。
+  // 走已有的 `corridorBand(line, widthM)` 通路（`toAreaItems` 会把它摊成带状面），
+  // 不另写一套加宽算法 —— 两份实现迟早会不一致。
+  corridor: PLANNED_ROUTE.length >= 2
+    ? {
+      key: 'corridor-outbound', name: '出航通道', kind: 'corridor', widthM: 1000, color: 'blue', dashed: true,
+      line: PLANNED_ROUTE.map((p) => [p.lng, p.lat] as [number, number]),
+    }
+    : undefined,
 }
 
 /**
@@ -192,59 +263,7 @@ export function corridorBand(line: [number, number][], widthM: number): [number,
   return [...left, ...right.reverse()]
 }
 
-// ---------------------------------------------------------------- 数据 → 图元
-/** 区域（含我方集结区与空域各要素）→ `AreaItem[]`；`dashed` 只对显式给了的数据生效 */
-export function toAreaItems(data: ScenarioData): AreaItem[] {
-  const items: AreaItem[] = []
-  const push = (id: string, name: string, polygon: [number, number][], color?: string, dashed?: boolean, opacity = 0.1) => {
-    if (polygon.length < 3) return
-    items.push({ id, polygon, color: resolveColor(color), label: name, dashed: dashed ?? true, opacity })
-  }
-
-  for (const a of data.areas) push(`AREA:${a.key}`, a.name, a.polygon, a.color, a.dashed)
-  for (const z of data.zones) {
-    if (z.kind === 'corridor') continue                      // 通道单独处理（线 → 面）
-    push(`ZONE:${z.key}`, z.name, z.polygon ?? [], z.color, true, z.kind === 'no-fly' ? 0.16 : 0.1)
-  }
-  // 出航通道：`line` + `widthM` → 带状面（宽度取自数据，不猜）
-  if (data.corridor?.line && data.corridor.widthM) {
-    const band = corridorBand(data.corridor.line, data.corridor.widthM)
-    push(`ZONE:${data.corridor.key}`, `${data.corridor.name}（${data.corridor.widthM} m）`, band, data.corridor.color, true, 0.12)
-  }
-  return items
-}
-
-/** 区域名 / 节点名 → `LabelItem[]`（每个面一个名，便于在图上直接读） */
-export function toLabelItems(data: ScenarioData): LabelItem[] {
-  const items: LabelItem[] = []
-  const centroid = (ring: [number, number][]): [number, number] => {
-    const n = ring.length || 1
-    return [ring.reduce((s, p) => s + p[0], 0) / n, ring.reduce((s, p) => s + p[1], 0) / n]
-  }
-
-  for (const a of data.areas) {
-    if (a.polygon.length < 3) continue
-    items.push({ id: `LBL:${a.key}`, ...toLngLat(centroid(a.polygon)), text: a.name, color: resolveColor(a.color) ?? '#cfe3f5', size: 12, radius: 0 })
-  }
-  for (const z of data.zones) {
-    if (z.kind === 'corridor') {
-      const line = z.line ?? []
-      if (!line.length) continue
-      const mid = line[Math.floor(line.length / 2)]
-      items.push({ id: `LBL:${z.key}`, lng: mid[0], lat: mid[1], text: z.name, color: resolveColor(z.color) ?? '#cfe3f5', size: 11, radius: 0 })
-      continue
-    }
-    if (!z.polygon || z.polygon.length < 3) continue
-    items.push({ id: `LBL:${z.key}`, ...toLngLat(centroid(z.polygon)), text: z.name, color: resolveColor(z.color) ?? '#cfe3f5', size: 12, radius: 0 })
-  }
-  for (const n of data.nodes) {
-    // 节点额外画一个标记点（radius > 0 才会画点，见 LabelItem 契约）
-    items.push({ id: `LBL:${n.key}`, lng: n.position[0], lat: n.position[1], text: n.name, color: '#7fd1ff', size: 12, radius: 4 })
-  }
-  return items
-}
-
 /** `[lng, lat]` → `{ lng, lat }`（只是解构，避免手写 repeat） */
-function toLngLat(p: [number, number]): { lng: number; lat: number } {
+export function toLngLat(p: [number, number]): { lng: number; lat: number } {
   return { lng: p[0], lat: p[1] }
 }

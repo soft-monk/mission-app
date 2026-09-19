@@ -28,10 +28,17 @@ export const DEFAULT_MAP_STYLE: MapStyleConfig = {
   schemaVersion: '1.0.0',
   note: '个性化需求 1/2。useIcon=false 或缺 icon.url → 回落画点，不报错。',
   drone: {
-    useIcon: false,
+    // ★ 需求方 2026-09-18：用他们给的四张无人机图标（绿/黄/洋红/蓝），四个机型各一张。
+    //   `byType[type].point.color` 与图标**同色** —— MapStage 里"无人机颜色"和"航迹颜色"
+    //   都取这同一个值，所以"航迹与无人机颜色一致"是同一个来源，不会走偏。
+    //
+    // ⚠️ **图标文件必须是 24×24 像素**（不是随便多大）：map-2d 把图标按**1:1 像素**注册，
+    //    `icon-size = sizePx / 24`。所以 200×200 的素材会渲染成 200×(sizePx/24) ≈ 200px 的巨图
+    //    （实测踩到：四张图糊成一片彩色大团）。四张素材已缩到 24×24，`sizePx` 也一致给 24。
+    useIcon: true,
     icon: {
       url: '/icons/uav-optical.png',
-      sizePx: [28, 28],
+      sizePx: [24, 24],
       anchor: 'center',
     },
     point: {
@@ -41,10 +48,22 @@ export const DEFAULT_MAP_STYLE: MapStyleConfig = {
       strokeWidthPx: 1,
     },
     byType: {
-      optical: { point: { color: '#22d3ee' } },
-      radar: { point: { color: '#f59e0b' } },
-      electronic: { point: { color: '#a855f7' } },
-      comm: { point: { color: '#22c55e' } },
+      optical: {
+        icon: { url: '/icons/uav-optical.png', sizePx: [24, 24], anchor: 'center' },
+        point: { color: '#2f9be0' },   // 蓝（图标同色）
+      },
+      radar: {
+        icon: { url: '/icons/uav-radar.png', sizePx: [24, 24], anchor: 'center' },
+        point: { color: '#22c55e' },   // 绿（图标同色）
+      },
+      electronic: {
+        icon: { url: '/icons/uav-electronic.png', sizePx: [24, 24], anchor: 'center' },
+        point: { color: '#db2777' },   // 洋红（图标同色）
+      },
+      comm: {
+        icon: { url: '/icons/uav-comm.png', sizePx: [24, 24], anchor: 'center' },
+        point: { color: '#eab308' },   // 黄（图标同色）
+      },
     },
   },
   track: {
@@ -85,10 +104,16 @@ export const DEFAULT_MAP_STYLE: MapStyleConfig = {
    * 字段与 `data/scenario-1/map-style.json` 的 `controls` 段**逐字段一致**（两份同步改）。
    */
   controls: {
-    // 鼠标经纬度：左下角，往上抬 56px —— 避开底部那条全局状态条与比例尺
-    coords: { show: true, anchor: 'bottom-left', offset: [0, 56] },
-    // 比例尺：右下角（模块缺省位置），往上抬 56px 同样避开状态条
-    scale: { show: true, anchor: 'bottom-right', offset: [0, 56] },
+    // 鼠标经纬度：**左下角最下一条**，距地图下沿 15px（gap 12 + offset 3）。
+    // 用户 2026-09-18 第 1 条："经纬度与缩放比例尺，都放在左下角，比例尺在经纬度上方，
+    // 排为一列，距离下方移动到 15 像素点，现在看不到"。
+    coords: { show: true, anchor: 'bottom-left', offset: [0, 18] },
+    // 比例尺：**左下角、经纬度上方**，与经纬度排成一列。
+    // 经纬度那条高约 33px，所以比例尺从底边往上让 15 + 33 + 6（间距）≈ 54px。
+    // 实测：经纬度条高 33px、距底 15px → 它的上沿在 48px；比例尺底边要 ≥ 48+6=54 才不叠。
+    // 原生控件的 offset 走 margin（见 map-2d pplyNativeOffset），实测 offset 42 → 距底 42px，
+    // 所以这里给 54（实测会落在 54px 处），与经纬度之间正好留 6px。
+    scale: { show: true, anchor: 'bottom-left', offset: [0, 69] },
     // 指北针：**默认关**。模块缺省把它放在右上角，而本应用每个地图屏的右上角都是右栏面板，
     // 开了会被面板盖住（实测）。要用的话把 show 改 true 并给一个不被遮挡的锚点。
     compass: { show: false, anchor: 'bottom-left', offset: [0, 96] },
@@ -131,6 +156,24 @@ export function groupColorOf(style: MapStyleConfig, groupId?: string | null): st
   if (!groupId) return FALLBACK_GROUP_COLOR
   const table = style.groupColors as Record<string, string> | undefined
   return table?.[groupId] ?? FALLBACK_GROUP_COLOR
+}
+
+/** 无人机取色兜底（`byType` 与顶层都没有时用；与内联默认值的 `point.color` 一致） */
+const FALLBACK_DRONE_COLOR = '#22d3ee'
+
+/**
+ * **无人机按机型取色**（★ 2026-09-18，需求方："航迹与无人机颜色一样"）。
+ *
+ * 取 `drone.byType[type].point.color`，没有就退到 `drone.point.color`。
+ * **无人机图元与它的航迹都用这一个函数取色** —— 同源，所以不可能跑偏。
+ * （这个色同时也是"图标加载失败回落画点"时的点色，以及图标本身的同色系。）
+ */
+export function droneColorOf(style: MapStyleConfig, type?: string | null): string {
+  const drone = style.drone as
+    | { point?: { color?: string }; byType?: Record<string, { point?: { color?: string } }> }
+    | undefined
+  const byType = type ? drone?.byType?.[type]?.point?.color : undefined
+  return byType ?? drone?.point?.color ?? FALLBACK_DRONE_COLOR
 }
 
 /** 轨迹线样式（按 `track` 段取值，缺字段时给 map-2d 的同一套缺省） */

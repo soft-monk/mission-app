@@ -1,0 +1,14 @@
+{
+  "schemaVersion": "1.0.0",
+  "note": [
+    "计划文件对话框的默认位置与默认文件名 —— 换电脑、换浏览器时改这个文件即可（不用改代码、不用重编宿主）。",
+    "为什么只有这几个值：浏览器出于安全不允许网页写死某个盘符路径，只接受下面这些『已知目录』名字，",
+    "或者『上一次用过的那份文件句柄』（浏览器自己记着，存在 IndexedDB 里）。优先级：上次用过的目录 > 这里的 startIn。",
+    "改完刷新页面生效（本文件按 no-cache 读取）。改这个文件请用能保持 UTF-8 的编辑器，别用 PowerShell 往返。"
+  ],
+  "startIn": "documents",
+  "startInOptions": ["documents", "downloads", "desktop", "pictures", "music", "videos"],
+  "saveNamePrefix": "态势计划",
+  "defaultPlanUrl": "",
+  "defaultPlanNote": "可选：填了就在进入态势屏时自动打开这份计划（例如 /plans/scenario-1.json）。留空 = 进屏是空地图，由用户自己选。"
+}

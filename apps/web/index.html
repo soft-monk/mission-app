@@ -17,6 +17,23 @@
       [data-ma-stagestrip] div[style*="flex-wrap: wrap"] > span {
         max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
       }
+
+      /* **不画滚动条**（用户 2026-09-18："把滚动条删了……视觉干净"）。
+         实测：态势屏右栏四个面板加起来 1098px、可视区只有 705px → 浏览器画出竖 15px + 横 15px
+         两条滚动条，用户看到"一条又细又长、里面什么都没有的栏"，不知道那是什么。
+         这里只**隐藏滚动条的皮**：内容仍可用滚轮滚（不裁内容、不影响点击），只是不再画那两条灰条。
+         锚点：带 `data-ma-noscrollbar` 的容器。 */
+      [data-ma-noscrollbar] { scrollbar-width: none; -ms-overflow-style: none; }
+      [data-ma-noscrollbar]::-webkit-scrollbar { width: 0; height: 0; display: none; }
+
+      /* ★★ 2026-09-19 修 bug（需求方："点击场景1进入…不能对地图进行操作" → 实测地图拖不动、缩不动）。
+         根因：**SH-04（场景确认）的整屏容器铺满地图区**（`left/right:12, top/bottom:8`，`zIndex:20`），
+         `pointer-events` 默认是 `auto` → 它把地图上的指针事件全吃了；地图本身没事
+         （实测 `dragPan:on` / `scrollZoom:on`，但 `elementFromPoint` 命中的是这层容器）。
+         修法：容器自身**事件穿透**，它的**直接子块**（工具条 / 右栏 / 按钮 / 胶囊）保持可点。
+         选 CSS 而不是改 JSX：这样不用逐个给子块加 `pointerEvents:'auto'`，将来加子块也不会再踩。 */
+      [data-testid="sh-04"] { pointer-events: none; }
+      [data-testid="sh-04"] > * { pointer-events: auto; }
     </style>
   </head>
   <body>

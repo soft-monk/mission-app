@@ -730,9 +730,19 @@ void HostServer::registerRoutes() {
     // ---- 静态托管：dist 下的 assets 等（index.html 由上面那条显式返回）
     {
         const fs::path dir = webDistDir(cfg_.webDist);
+        // ★ 2026-09-18：drogon 的静态托管是**按扩展名白名单**的（`setFileTypes`），
+        //   默认那套里**没有 `pbf` / `json`**。实测：`/t.txt` `/t.png` → 200，而 `/t.json` `/t.pbf` → 404
+        //   （文件明明在 dist 里）。地图的字形就是 `.pbf` —— 这条不补上，前端 `glyphs` 请求永远拿不到字形，
+        //   文字就画不进地图。**注意 `setFileTypes` 是整体替换**，所以这里把整套前端产物类型一次列全。
+        app.setFileTypes({
+            "html", "htm", "js", "mjs", "css", "json", "map", "txt", "xml",
+            "png", "jpg", "jpeg", "webp", "gif", "svg", "ico", "bmp",
+            "pbf", "woff", "woff2", "ttf", "otf", "eot", "wasm",
+        });
+        app.registerCustomExtensionMime("pbf", "application/x-protobuf");
         if (fs::exists(dir / "index.html")) {
             app.setDocumentRoot(dir.string());
-            LOG_INFO << "[host] 静态托管: " << dir.string();
+            LOG_INFO << "[host] 静态托管: " << dir.string() << "（含 pbf 字形）";
         } else {
             LOG_WARN << "[host] 前端产物不存在（" << indexHint_ << "），/ 返回提示页";
         }

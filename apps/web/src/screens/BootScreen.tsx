@@ -58,6 +58,34 @@ export function BootScreen({ state, onStart, running, onEnterNext }: {
     onStart()
   }, [onStart])
 
+  /**
+   * **启动被打断后的自愈**（2026-09-18 补）。
+   *
+   * 背景：`boot.reset` 现在会把**正在飞的那一轮启动作废**（见 `flow.h` 的 `bootGen_` 注释）——
+   * 这修掉了"进度卡在 80%、永远完不成"的旧缺陷，但留下一个新状态：启动被作废后**没人再发起**，
+   * 页面就停在 0%。实测踩过：启动页刚起来时外部来一发 `boot.reset`，整页**永久停在 0%**。
+   *
+   * 判据刻意收得很窄：**只在"总进度还是 0、一个模块都没动过、也不在跑"时才重发**。
+   * 这样既能救回被作废的那一轮，又不会在"某个模块本来就绪不了"（那时进度 > 0，
+   * 例如 80%）的情况下把 30 秒的启动反复重跑。最多重发 3 次，之后交给屏上的【重新加载】。
+   */
+  const retries = useRef(0)
+  const overall0 = boot.progress?.overall ?? boot.overall ?? 0
+  const untouched = overall0 === 0 && modules.every((m) => !(m.percent ?? 0))
+  // `onStart` 是宿主传进来的内联箭头，**每次渲染都换身份** —— 直接进依赖数组会让 8 秒定时器
+  // 被反复清掉（页面每秒都在收状态更新），重发就永远等不到。所以放进 ref，依赖只留状态量。
+  const onStartRef = useRef(onStart)
+  onStartRef.current = onStart
+  useEffect(() => {
+    if (running || boot.complete || !untouched) return
+    if (retries.current >= 3) return
+    const t = window.setTimeout(() => {
+      retries.current += 1
+      onStartRef.current()
+    }, 8000)
+    return () => window.clearTimeout(t)
+  }, [running, boot.complete, untouched])
+
   return (
     <div style={{ ...rootStyle }}>
       <div style={{ position: 'absolute', top: 0, bottom: HINT_BAR_H, left: 0, right: 0, display: 'flex', gap: 14, padding: 14 }}>

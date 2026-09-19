@@ -1,4 +1,4 @@
-﻿// mission-app · apps/web/src/screens/SituationScreen.tsx
+// mission-app · apps/web/src/screens/SituationScreen.tsx
 //
 // **SH-03 · 任务态势主界面**（参考图 `需求图与描述\场景1\T0-1.png`，需求专篇 DES-APP-001 §3 SH-03）。
 //
@@ -22,7 +22,7 @@
 //   · 图上是**三维地形底图**，我们只有**二维瓦片** —— 如实写一行小字，**不假装三维**。
 //   · 样式一律 `left/right/top/bottom` 长写（**不用 `inset` 简写**：React 的 style diff 曾把
 //     `top` 连带清掉、整屏塌成 0 高，见 `流程接口冻结.md` §7）。
-import { useState, type CSSProperties } from 'react'
+import { useCallback, useEffect, useState, type CSSProperties } from 'react'
 import { C, panel, panelTitle } from '../theme'
 import type { FlowState } from '../api'
 import type { UseFlow } from '../flow/useFlow'
@@ -33,7 +33,15 @@ import {
 import { VerbVerdict } from './VerbVerdict'
 
 import { MapToolbar, ToolModeNote, toolsOf, useMapToolState } from '../shell/MapTools'
-import { DiagBox, DiagLine } from '../shell/Diag'
+import { BIZ_MENUS, TEXT_STYLE_OPTIONS, bizEntry } from '../biz-catalog'
+// map-2d：`mapInstance` 取当前地图实例（"落点即创建"要挂 click）；`useInteraction` 取绘制模式
+import { MapDraw, boundStyleOf, boundTextOf, mapCommands, setBoundStyle, setBoundText, useInteraction, type TextStyle } from 'map-2d'
+// ★ 2026-09-18「计划」：计划文件的读写（空地图 + 手动打开计划）
+import { applyPlan, loadPlanConfig, parsePlan, pickPlanToOpen, pickPlanToSave, savableCount, serializePlan } from '../plan-file'
+// ★ 2026-09-18「规划航线」：A* 按界面上画的集结区/任务区算航线 + 航道
+import { classifyAreas, planAndDrawRoute } from '../route-compute'
+// ★ 2026-09-18：`DiagBox/DiagLine`（`../shell/Diag`）的 import 随"视图声明"浮层一起删掉了 ——
+//   本屏不再显示任何诊断浮层；工具可用性仍然照发 `view.compose`（见下面的 `cmp`）。
 
 /**
  * 三张场景入口卡（**文案逐字来自参考图**，不是引擎数据）。
@@ -58,8 +66,21 @@ const SCENES: { id: string; no: string; name: string; accent: string; implemente
  * 每一格**能不能点**不看这张表，一律由规则包 `view.compose` 说了算。
  */
 const SH03_TOOLS = toolsOf([
-  'select', 'create', 'fullscreen', 'area', 'measure', 'measureArea', 'draw', 'layers', 'clear', 'reset',
-])
+  'select', 'create', 'fullscreen', 'area', 'measure', 'measureArea', 'draw',
+  // ★ 用户 2026-09-18 第 3 条：「选择场景功能，添加到上方工具栏中，点击后才显示」
+  'scene',
+  // ★ 用户 2026-09-18："功能界面添加，计划，子菜单为，打开计划，保存计划"（先做打开）
+  'plan',
+  'layers', 'clear', 'reset',
+  // ★ 用户 2026-09-18 第 1 条：新建/区域/标绘 三格挂**子菜单**（见 draw-catalog.ts）。
+  //   挂在数据上而不是改 toolsOf —— 菜单内容是"能画什么"，属于本屏的绘制目录。
+]).map((t) => (BIZ_MENUS[t.key] ? { ...t, submenu: BIZ_MENUS[t.key] } : t))
+  // ★★ 2026-09-19（需求方实测："新建和区域功能都无法使用了"）：
+  //   根因**不是**功能坏了 —— 规则包在 T0 阶段没声明 `create`/`area` 可用（`view.compose` 里
+  //   它们是 hidden），界面就如实灰置了；而"画计划"（画集结区/任务区）是**流程之外**的事，
+  //   不该等阶段推进才让画。所以这两格在本屏**常开**（`always: true` 的语义见 `MapToolSpec`）。
+  //   只覆盖本屏 —— 别的屏仍按规则包声明走，不扩大影响面。
+  .map((t) => (t.key === 'create' || t.key === 'area' ? { ...t, always: true } : t))
 
 /** 一行计量：名 + 值（值缺失显示"—"，**不补 0**）。 */
 function MetricRow({ m }: { m: Metric }) {
@@ -154,6 +175,8 @@ export function SituationScreen({ state, flow, onGo }: {
   const inv = useVerbOnce(flow, 'alloc.inventory', {}, true)
   // 工具可用性：一律以规则包 `view.compose` 的声明为准（VWC-TOOL-01/02）
   const mt = useMapToolState(flow)
+  // 绘制模式（子菜单里"交给交互层拖画"那几项用）：map-2d 的交互状态
+  const setDrawMode = useInteraction((s) => s.setMode)
 
   const sit = readSituation(snap.data)
   const cmp = readCompose(compose.data)
@@ -210,8 +233,157 @@ export function SituationScreen({ state, flow, onGo }: {
   const online = iv.totals.find((t) => t.key === 'onlineRate')
   const clustersAvailable = sit.groups.length
 
-  const okTools = cmp.tools.filter((t) => t.on)
-  const offTools = cmp.tools.filter((t) => !t.on)
+  // 「场景」面板开合（用户第 3 条：点了工具栏的【场景】才显示）
+  const [sceneOpen, setSceneOpen] = useState(false)
+  /**
+   * **正在改的跟随文本**（用户第 2 条："画完给个输入框 / 点文本可改"）。
+   *
+   * ★ 2026-09-18 解耦合后：**文本框由模块的 `TextOverlay` 画、绑定关系存在模块里**，
+   *   宿主不再自己挂 `label` 图元。这里只留"编辑"这一件事，改文本走模块的 `setBoundText`。
+   */
+  const [editing, setEditing] = useState<{ id: string; text: string; style: TextStyle } | null>(null)
+  /** ★ 2026-09-18「计划」的结果回执（打开成功/失败都写这里，不给假成功） */
+  const [planMsg, setPlanMsg] = useState<string | null>(null)
+
+  /**
+   * **打开计划**：弹系统选文件框 → 读 JSON → 校验 → 画到图上（替换上一个计划）。
+   *
+   * 为什么用 `<input type="file">` 而不是后端上传：计划是本地文件，浏览器直读即可，
+   * 不引入新的宿主接口（需求方只要求"我手动选择计划文件"）。
+   */
+  const openPlanFile = useCallback(async () => {
+    try {
+      // ★ 2026-09-18：改用带**默认目录**的系统对话框（File System Access API），
+      //   不支持时 `pickPlanToOpen` 自己退回 `<input type=file>`。
+      const picked = await pickPlanToOpen()
+      if (!picked) return                       // 用户取消 → 什么都不做
+      const { plan, error } = parsePlan(picked.text)
+      if (error || !plan) { setPlanMsg(`计划读取失败：${error ?? '未知原因'}`); return }
+      const { drawn, failed } = applyPlan(plan)
+      setPlanMsg(failed.length
+        ? `已打开 ${picked.name}：画了 ${drawn} 个，${failed.length} 个有问题 —— ${failed.join('；')}`
+        : `已打开 ${picked.name}：${plan.name ? `「${plan.name}」` : ''}画了 ${drawn} 个图元`)
+    } catch (e) {
+      setPlanMsg(`计划读取失败：${String((e as Error)?.message ?? e)}`)
+    }
+  }, [])
+
+  /** **保存计划**：弹"另存为"对话框（默认文件名，可改）→ 存到所选/默认目录 */
+  const savePlanFile = useCallback(async () => {
+    const plan = serializePlan('态势计划')
+    // ★ 修 bug：以前这里是 `plan.items.length`，而"手动标绘"的图元不在 items 里 →
+    //   画了一堆却提示"没有可保存的计划图元"。现在数**整图快照**里的条数。
+    const n = savableCount(plan)
+    if (!n) { setPlanMsg('当前没有可保存的图元（先打开一份计划，或在地图上画点东西）'); return }
+    try {
+      // 默认文件名来自 /plan-config.json（换机器改配置即可），带日期便于区分
+      const name = await pickPlanToSave(plan)
+      if (!name) return                       // 用户取消
+      setPlanMsg(`已保存 ${n} 个图元 → ${name}`)
+    } catch (e) {
+      setPlanMsg(`保存失败：${String((e as Error)?.message ?? e)}`)
+    }
+  }, [])
+
+  /**
+   * ★ 2026-09-18 配置兜底：`/plan-config.json` 里填了 `defaultPlanUrl` 就在进屏时自动打开它。
+   * 留空（默认）= 空地图，由用户自己选计划 —— 需求方要的正是"进屏什么都没有画"。
+   */
+  useEffect(() => {
+    let alive = true
+    void (async () => {
+      const cfg = await loadPlanConfig()
+      if (!cfg.defaultPlanUrl || !alive) return
+      try {
+        const r = await fetch(cfg.defaultPlanUrl, { cache: 'no-cache' })
+        if (!r.ok) throw new Error(`HTTP ${r.status}`)
+        const { plan, error } = parsePlan(await r.text())
+        if (error || !plan) throw new Error(error ?? '解析失败')
+        const { drawn } = applyPlan(plan)
+        if (alive) setPlanMsg(`按配置自动打开了 ${cfg.defaultPlanUrl}（${drawn} 个图元）`)
+      } catch (e) {
+        if (alive) setPlanMsg(`配置里的 defaultPlanUrl 打不开：${String((e as Error)?.message ?? e)}`)
+      }
+    })()
+    return () => { alive = false }
+  }, [])
+
+  /**
+   * ★ 2026-09-18 **规划航线**（需求方："使用 a* 算法，用界面上绘制的集结区与任务区算；
+   *   都只有一个区域就直接算，有多个就让用户选是哪两个"）。
+   *
+   * 认区域靠**文本**：含「集结」/「任务」/「威胁」（画完可用"点文本改字"改名）。
+   * 恰好各一个 → 直接算；否则弹选择框（见下面的 `routePick`）。
+   */
+  const [routePick, setRoutePick] = useState<{ assemblyId: string; taskId: string } | null>(null)
+
+  /** 算并画，把结果如实写到回执条 */
+  const runRoutePlan = useCallback((assemblyId: string, taskId: string) => {
+    const r = planAndDrawRoute(assemblyId, taskId)
+    setRoutePick(null)
+    setPlanMsg(r.ok
+      ? `已规划航线：${r.points} 个航路点、约 ${r.lengthKm?.toFixed(1)} km，绕开 ${r.avoided} 个威胁区，并画出 ${1000} m 宽航道`
+      : `规划航线失败：${r.reason ?? '未知原因'}`)
+  }, [])
+
+  const startRoutePlan = useCallback(() => {
+    const { assemblies, tasks, threats } = classifyAreas()
+    if (!assemblies.length || !tasks.length) {
+      setPlanMsg(`规划航线需要图上有「集结区」和「任务区」：现在集结区 ${assemblies.length} 个、任务区 ${tasks.length} 个`
+        + `（区域图元的文本里分别要含「集结」「任务」；用"点文本改字"可改）`)
+      return
+    }
+    // 恰好各一个 → 直接算（需求方："如果都只有一个区域，那就直接算"）
+    if (assemblies.length === 1 && tasks.length === 1) {
+      runRoutePlan(assemblies[0].id, tasks[0].id)
+      return
+    }
+    // 多个 → 让用户选是哪两个（默认选第一个，减少点击）
+    setRoutePick({
+      assemblyId: assemblies[0].id,
+      taskId: tasks[0].id,
+    })
+    setPlanMsg(`图上有 ${assemblies.length} 个集结区、${tasks.length} 个任务区，请选择要算哪两个`
+      + `（会自动绕开 ${threats.length} 个威胁区）`)
+  }, [runRoutePlan])
+
+  /**
+   * **点地图上的文本就能改它**（用户第 2 条："点文本可改"）。
+   *
+   * 走 map-2d 的图元命中回调 `MapDraw.on('click')`：命中的若是"某个图元的点/面"，
+   * 且那个图元**绑了文本**，就把编辑器打开改它。
+   */
+  useEffect(() => {
+    const off = MapDraw.on('click', (e) => {
+      const cur = boundTextOf(e.id)
+      if (cur === null) return          // 这个图元没绑文本 → 不弹编辑器
+      setEditing({ id: e.id, text: cur, style: boundStyleOf(e.id) ?? 'tag' })
+    })
+    return off
+  }, [])
+
+  /**
+   * ★ 2026-09-18（需求方："无人机仿真一直开着的？让无人机动起来"）：
+   * **进态势屏就自动启动仿真**（`sim.start`，1 倍速）。
+   *
+   * 仿真不是常开的：它由 `sim.start` / `sim.pause` 驱动（按钮在"链路/执行"屏上），
+   * 不启动时遥测只是一张静止的快照 —— 所以在态势屏上看着"无人机不动"。
+   * 这里只发一次；已经在跑时再发 `sim.start` 是幂等的（引擎侧就是"启动/继续"）。
+   */
+  useEffect(() => {
+    void flow.send('sim.start', {})
+    void flow.send('sim.speed', { speed: 1 })
+    // 只在进入本屏时发一次
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  /** 保存正在编辑的文本框：**文字与样式都写回模块**（绑定关系在模块里，宿主不自己存） */
+  const saveEditing = () => {
+    if (!editing) return
+    setBoundText(editing.id, editing.text)
+    setBoundStyle(editing.id, editing.style)
+    setEditing(null)
+  }
 
   return (
     <>
@@ -227,9 +399,82 @@ export function SituationScreen({ state, flow, onGo }: {
         testid="sh03-toolbar"
         items={SH03_TOOLS}
         state={mt}
-        style={{ right: 328, left: 12, top: 5, width: 'auto' }}
+        style={{ left: 12, top: 5 }}
+        onLocal={(k) => {
+          if (k === 'scene') { setSceneOpen((v) => !v); return }
+          // ★ 2026-09-18「计划」子菜单（需求方："打开计划、保存计划，先做打开计划"）
+          if (k === 'plan-open') { void openPlanFile(); return }
+          if (k === 'plan-save') { savePlanFile(); return }
+          // ★「规划航线」：只有一个集结区 + 一个任务区时**直接算**；有多个才弹选择框
+          if (k === 'plan-route') { startRoutePlan(); return }
+          // ---------------- 子菜单选中的业务图元 ----------------
+          // ★ 业务层改造后：宿主只把「借哪种几何交互 + 预设样式 + 业务名字」交给模块，**一次调用**；
+          //   落点/两下/多点、预览、收笔、挂文本框全在 map-2d 里。
+          //   不是几何原语的业务物件（军标/距离环/扫描扇区…）走 `make` 钩子：
+          //   交互仍在模块，造什么由业务目录 `biz-catalog.ts` 决定。
+          const e = bizEntry(k)
+          if (!e) return
+          setDrawMode('none')   // 关掉老的 mode，避免两套交互打架
+          mapCommands.setGeometry({
+            key: e.start.geo,
+            color: e.start.color,
+            widthPx: e.start.widthPx,
+            sizePx: e.start.sizePx,
+            dashed: e.start.dashed,
+            fillColor: e.start.fillColor,
+            fillOpacity: e.start.fillOpacity,
+            make: e.start.make,
+            text: e.label,            // 默认就把业务名挂上，用户随后可改
+            textStyle: 'tag',
+            // 画完自动弹编辑器，让用户把文字改成想写的（用户第 2 条"画完给个输入框"）
+            onDone: (id) => { if (id) setEditing({ id, text: e.label, style: 'tag' }) },
+          })
+        }}
+        activeKeys={{ scene: sceneOpen }}
       />
       <ToolModeNote state={mt} items={SH03_TOOLS} style={{ left: 12, top: 46 }} />
+
+      {/* ---------------- 跟随文本的编辑器（用户第 2 条 + 第 3 条） ----------------
+          两个入口共用这一个框：画完自动弹（预填默认文案）、点地图上的图元也能弹出来改。
+          Enter 或【确定】保存；Esc 或【取消】不写回。
+          ★ 文本框的**三种样式**（角标 / 卡片 / 引线标注）在这里切换 —— 用户第 3 条要的
+            "可以绑定**几种**文本框的方式"，样式列表来自 map-2d 的 `TEXT_STYLES`。 */}
+      {editing && (
+        <div data-testid="text-editor" style={textEditorStyle}>
+          <span style={{ fontSize: 11.5, color: C.textDim }}>文字</span>
+          <input
+            data-testid="text-editor-input"
+            autoFocus
+            value={editing.text}
+            onChange={(e) => setEditing({ ...editing, text: e.target.value })}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') { saveEditing(); }
+              if (e.key === 'Escape') setEditing(null)
+            }}
+            style={textInputStyle}
+          />
+          <span style={{ fontSize: 11.5, color: C.textDim, marginLeft: 4 }}>样式</span>
+          {TEXT_STYLE_OPTIONS.map((o) => (
+            <button
+              key={o.key}
+              data-testid={`text-style-${o.key}`}
+              title={o.note}
+              onClick={() => { setBoundStyle(editing.id, o.key); setEditing({ ...editing, style: o.key }) }}
+              style={{
+                ...editorBtnStyle,
+                background: editing.style === o.key ? 'rgba(37,99,235,.75)' : 'rgba(29,78,216,.25)',
+                borderColor: editing.style === o.key ? '#5fb0ff' : C.border,
+              }}
+            >{o.name}</button>
+          ))}
+          <button
+            data-testid="text-editor-ok"
+            onClick={saveEditing}
+            style={editorBtnStyle}
+          >确定</button>
+          <button data-testid="text-editor-cancel" onClick={() => setEditing(null)} style={editorBtnStyle}>取消</button>
+        </div>
+      )}
 
       {/* ---------------- 显示模式：**独立的下拉框**（不在工具条那一排里） ----------------
           用户 2026-09-18 第 8 条："显示模式：综合态势，应该单独是一个下拉框，而不是和功能一起"。
@@ -257,28 +502,14 @@ export function SituationScreen({ state, flow, onGo }: {
         )}
       </div>
 
-      {/* 视图声明（图层组 / 控件 / 工具可用性）：收进折叠块，产品界面不再被它占满 */}
-      <div style={composeDiagStyle}>
-        <DiagBox testid="compose-panel" title="视图声明（view.compose）">
-          <DiagLine k="显示模式" v={`${cmp.modeName ?? cmp.modeKey ?? '—'}（modeKey=${cmp.modeKey ?? '—'}）`} />
-          <DiagLine k="可见图层组" v={cmp.visibleGroups.length ? cmp.visibleGroups.join(' / ') : '—'} />
-          <DiagLine k="可用工具" v={okTools.length ? okTools.map((t) => `${t.name}(${t.key})`).join(' / ') : '—'} />
-          <DiagLine
-            warn={offTools.length > 0}
-            k="不可用工具"
-            v={offTools.length ? offTools.map((t) => `${t.name}(${t.key})：${t.reason ?? '规则包未给原因'}`).join('；') : '—'}
-          />
-          <DiagLine k="地图控件" v={cmp.controls.length ? cmp.controls.map((c) => c.name).join(' / ') : '—'} />
-          <DiagLine k="态势快照" v={snap.reply === null
-            ? '读取中…'
-            : snap.reply.code === 0 ? 'code=0（situation.snapshot）' : replyText(snap.reply)} />
-          {compose.reply && compose.reply.code !== 0 && <DiagLine warn k="view.compose" v={replyText(compose.reply)} />}
-          {!cmp.tools.length && <DiagLine warn k="工具" v="工具栏未就绪（view.compose 未给出 tools）" />}
-        </DiagBox>
-      </div>
+      {/* ★ 2026-09-18（需求方："这个删除，不需要显示"）：原来这里浮着一个
+          「视图声明（view.compose）」折叠块（图层组/控件/工具可用性/快照出处）。
+          产品界面上不需要它 —— 已整块移除。
+          注意：**`compose` 这条 verb 仍然照发**（工具栏的可用性、显示模式清单都靠它，
+          见上面 `useVerbOnce(flow, 'view.compose')`），只是不再把结果显示成一块浮层。 */}
 
       {/* ---------------- 右栏：AI任务分析 / 任务信息 / 资源概况 ---------------- */}
-      <div style={rightColStyle}>
+      <div style={rightColStyle} data-ma-noscrollbar="1">
         <Section
           title="AI任务分析"
           testid="analysis-panel"
@@ -388,12 +619,64 @@ export function SituationScreen({ state, flow, onGo }: {
       {/* ---------------- 场景二/三的提示（可关闭；不遮地图关键区）---------------- */}
       {notice && (
         <div data-testid="sh03-scene-notice" style={noticeStyle} onClick={() => setNotice(null)}>
-          {notice}（点这条提示关掉）
+          {notice}
         </div>
       )}
 
-      {/* ---------------- 底部：「请选择任务场景」+ 三张场景入口卡 ---------------- */}
-      <div style={bottomStyle}>
+      {/* ★ 2026-09-18「计划」结果回执：打开成功/失败都如实显示，点一下关掉 */}
+      {planMsg && (
+        <div data-testid="sh03-plan-msg" style={planMsgStyle} onClick={() => setPlanMsg(null)}>
+          📄 {planMsg}
+        </div>
+      )}
+
+      {/* ★ 2026-09-18 规划航线：图上有多个集结区/任务区时，让用户选是哪两个 */}
+      {routePick && (() => {
+        const { assemblies, tasks, threats } = classifyAreas()
+        const opts = (list: { id: string; text: string }[]) =>
+          list.map((a) => <option key={a.id} value={a.id}>{a.text || a.id}</option>)
+        return (
+          <div data-testid="sh03-route-pick" style={routePickStyle}>
+            <div style={{ fontWeight: 600, marginBottom: 6 }}>规划航线：选择起终点区域</div>
+            <label style={routePickRow}>
+              <span style={{ color: C.textDim, width: 62 }}>集结区</span>
+              <select
+                data-testid="route-pick-assembly"
+                value={routePick.assemblyId}
+                onChange={(e) => setRoutePick({ ...routePick, assemblyId: e.target.value })}
+                style={routeSelectStyle}
+              >{opts(assemblies)}</select>
+            </label>
+            <label style={routePickRow}>
+              <span style={{ color: C.textDim, width: 62 }}>任务区</span>
+              <select
+                data-testid="route-pick-task"
+                value={routePick.taskId}
+                onChange={(e) => setRoutePick({ ...routePick, taskId: e.target.value })}
+                style={routeSelectStyle}
+              >{opts(tasks)}</select>
+            </label>
+            <div style={{ fontSize: 11.5, color: C.textDim, margin: '4px 0 8px' }}>
+              自动绕开 {threats.length} 个「威胁」区域；算出来会画<b>规划航线</b>与 <b>1000 m 宽航道</b>
+            </div>
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <button
+                data-testid="route-pick-ok"
+                onClick={() => runRoutePlan(routePick.assemblyId, routePick.taskId)}
+                style={deleteYesStyleInApp}
+              >计算并画出</button>
+              <button data-testid="route-pick-cancel" onClick={() => setRoutePick(null)} style={deleteNoStyleInApp}>取消</button>
+            </div>
+          </div>
+        )
+      })()}
+
+      {/* ---------------- 「请选择任务场景」：**点了工具栏的【场景】才弹** ----------------
+           用户 2026-09-18 第 3 条："选择场景功能，添加到上方工具栏中，点击后才显示"。
+           原来它常驻屏幕底部（一直占 152px 高）；现在收进工具条，弹在工具条正下方，
+           不点就不占地方 —— 地图也因此多出 152px 可视高度。 ---------------- */}
+      {sceneOpen && (
+      <div style={{ position: 'absolute', left: 12, right: 292, top: 46, height: 152, zIndex: 22 }}>
         <div style={{ ...panel, flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
           <div style={panelTitle}>
             请选择任务场景
@@ -443,6 +726,7 @@ export function SituationScreen({ state, flow, onGo }: {
           </div>
         </div>
       </div>
+      )}
 
       <SituationProbe
         situationRaw={snap.data}
@@ -500,9 +784,38 @@ function SituationProbe({ situationRaw, composeRaw, inventoryRaw, snapshotReply,
 
 // ---- 样式（一律 left/right/bottom 长写：**不写 inset 简写**，见 App.tsx 的踩坑注释）----
 // 顶部压条已删（`MapStage` 的自证信息条不再出现在产品屏），所以各面板的 top 从 34 收到 12
+/**
+ * 右栏：**变窄 + 用满整条高度 + 不画滚动条**（用户 2026-09-18 第 4 条："把滚动条删了，
+ * 右栏整体变窄/重排（视觉干净）"）。
+ *
+ * 实测病因：四块面板加起来 **1098px**，可视区只有 **705px**（`top:12` + `bottom:216` ——
+ * 那 216px 是给旧的常驻"请选择任务场景"面板留的位，现在它已收进工具条、这块地空出来了），
+ * 于是浏览器画出竖 15px + 横 15px 两条滚动条。
+ *
+ * 三处一起改：
+ *   · `bottom: 216 → 8`  —— 把场景面板让出来的 208px 收回来（可视区 705 → 962）
+ *   · `width: 300 → 264` —— 变窄（用户点名）
+ *   · `gap: 8 → 6`；滚动条的"皮"隐藏掉（`data-ma-noscrollbar`，规则在 index.html）
+ */
 const rightColStyle: CSSProperties = {
-  position: 'absolute', right: 12, top: 12, bottom: 216, zIndex: 20, width: 300,
-  display: 'flex', flexDirection: 'column', gap: 8, overflowY: 'auto',
+  position: 'absolute', right: 12, top: 12, bottom: 8, zIndex: 20, width: 264,
+  display: 'flex', flexDirection: 'column', gap: 6, overflowY: 'auto',
+}
+/** 跟随文本编辑器：浮在工具条下方，和子菜单同一带 */
+const textEditorStyle: CSSProperties = {
+  position: 'absolute', left: 12, top: 41, zIndex: 25,
+  display: 'flex', alignItems: 'center', gap: 6,
+  padding: '6px 9px', borderRadius: 8,
+  background: 'rgba(6,26,47,.96)', border: `1px solid ${C.borderStrong}`,
+  boxShadow: '0 6px 20px rgba(0,0,0,.45)',
+}
+const textInputStyle: CSSProperties = {
+  width: 210, fontSize: 12, padding: '4px 7px', borderRadius: 5,
+  background: 'rgba(10,32,58,.9)', border: `1px solid ${C.border}`, color: C.text, outline: 'none',
+}
+const editorBtnStyle: CSSProperties = {
+  fontSize: 11.5, padding: '3px 9px', borderRadius: 5, cursor: 'pointer', font: 'inherit',
+  background: 'rgba(29,78,216,.45)', border: `1px solid ${C.border}`, color: C.text,
 }
 const bottomStyle: CSSProperties = {
   position: 'absolute', left: 12, right: 12, bottom: 56, zIndex: 20, height: 152,
@@ -513,7 +826,7 @@ const bottomStyle: CSSProperties = {
  * `top: 5` 与工具条对齐。
  */
 const displayModeBox: CSSProperties = {
-  position: 'absolute', right: 328, top: 5, zIndex: 22,
+  position: 'absolute', right: 292, top: 5, zIndex: 22,
   display: 'flex', alignItems: 'center', gap: 8,
   padding: '4px 10px', borderRadius: 8,
   background: 'rgba(6,26,47,.86)', border: `1px solid ${C.border}`, whiteSpace: 'nowrap',
@@ -523,13 +836,36 @@ const displayModeSelect: CSSProperties = {
   border: `1px solid ${C.borderStrong}`, borderRadius: 6, padding: '3px 6px',
   cursor: 'pointer', outline: 'none',
 }
-const composeDiagStyle: CSSProperties = {
-  position: 'absolute', right: 328, top: 56, zIndex: 20, width: 320,
-}
 const noticeStyle: CSSProperties = {
   position: 'absolute', left: 12, bottom: 216, zIndex: 24, maxWidth: 560,
   fontSize: 12, color: C.text, background: 'rgba(120,60,10,.94)',
   border: '1px solid rgba(245,158,11,.6)', borderRadius: 8, padding: '6px 10px', cursor: 'pointer',
+}
+/** ★「计划」结果回执（打开/保存后的一条短提示，点一下关掉） */
+const planMsgStyle: CSSProperties = {
+  position: 'absolute', left: 12, bottom: 258, zIndex: 25, maxWidth: 620,
+  fontSize: 12, color: C.text, background: 'rgba(8,40,70,.96)',
+  border: '1px solid rgba(95,176,255,.55)', borderRadius: 8, padding: '6px 10px', cursor: 'pointer',
+}
+/** ★「规划航线」的起终点选择框（图上有多个集结区/任务区时才出现） */
+const routePickStyle: CSSProperties = {
+  position: 'absolute', left: '50%', top: 96, transform: 'translateX(-50%)', zIndex: 32,
+  width: 320, padding: '10px 12px', borderRadius: 10, fontSize: 12.5, color: C.text,
+  background: 'rgba(6,26,47,.97)', border: `1px solid ${C.borderStrong}`,
+  boxShadow: '0 8px 24px rgba(0,0,0,.5)',
+}
+const routePickRow: CSSProperties = { display: 'flex', alignItems: 'center', gap: 8, padding: '3px 0' }
+const routeSelectStyle: CSSProperties = {
+  flex: 1, fontSize: 12, color: C.accent, background: 'rgba(10,32,58,.9)',
+  border: `1px solid ${C.borderStrong}`, borderRadius: 6, padding: '3px 6px', outline: 'none',
+}
+const deleteYesStyleInApp: CSSProperties = {
+  padding: '4px 10px', borderRadius: 6, cursor: 'pointer', font: 'inherit', fontSize: 12,
+  background: 'linear-gradient(180deg,#2563eb,#1d4ed8)', border: '1px solid #5fb0ff', color: '#eaf6ff',
+}
+const deleteNoStyleInApp: CSSProperties = {
+  padding: '4px 10px', borderRadius: 6, cursor: 'pointer', font: 'inherit', fontSize: 12,
+  background: 'transparent', border: '1px solid rgba(148,163,184,.5)', color: C.text,
 }
 const notImplChip: CSSProperties = {
   fontSize: 10.5, color: C.warn, border: '1px solid rgba(245,158,11,.45)', borderRadius: 4, padding: '0 5px',

@@ -49,6 +49,14 @@ import {
 import { readGuidance, type GuidanceView } from '../flow/useStrike'
 import { useLabels, voiceLine } from '../shell/VoiceStrip'
 import { StageStrip } from './StageOverlay'
+// ★ 2026-09-19（需求方实测："点击场景1进入引导控制界面后，不能对地图进行操作"）：
+//   需求文档（`docs/需求/图片清单/C-T5T6T7.md`）写明 T6-2 引导控制屏**地图区左上应有工具条**
+//   「选择 / 测距 / 图层 / 3D / 2D-3D」，而本屏是唯一**没挂 `MapToolbar`** 的地图屏 →
+//   地图上既没有选择/测距也没有图层面板，用户观感就是"地图不能操作"。这里补上（3D 已按需求删除）。
+import { MapToolbar, ToolModeNote, toolsOf, useMapToolState } from '../shell/MapTools'
+
+/** 本屏工具条（照需求文档：选择 / 测距 / 图层；3D 已删） + 测面（模块具备、与其它屏一致） + 复位 */
+const SH16_TOOLS = toolsOf(['select', 'measure', 'measureArea', 'layers', 'reset'])
 
 /** 本屏往地图上画的图元 id 前缀（清理与计数只认它们；MapStage 的图元一个都不碰）。 */
 const P_TARGET = 'G6T:'
@@ -270,6 +278,8 @@ export function GuidanceScreen({ state, flow, mode = 'exec', onNext, onGo }: {
   onGo?: (id: string) => void
 }) {
   const labels = useLabels()
+  /** 地图工具条状态（可用性照旧由规则包 `view.compose` 说了算） */
+  const mt = useMapToolState(flow)
 
   // ---- 台账（静态属性 + 基准状态）----
   const list = useVerbOnce(flow, 'targets.list', {}, true)
@@ -548,6 +558,12 @@ export function GuidanceScreen({ state, flow, mode = 'exec', onNext, onGo }: {
 
   return (
     <>
+      {/* ★ 2026-09-19：补上地图工具条（需求文档里这屏就有「选择/测距/图层」；
+          以前整屏没挂 `MapToolbar` → 地图上什么都点不了，用户报"不能对地图进行操作"）。
+          坐标与其它屏一致：左上角、压条下方一点。 */}
+      <MapToolbar testid="sh16-toolbar" items={SH16_TOOLS} state={mt} style={{ left: 12, top: 44 }} />
+      <ToolModeNote state={mt} items={SH16_TOOLS} />
+
       {/* ---------------- 顶部压条（显示模式/阶段/锁定目标/事件） ---------------- */}
       <StageStrip
         items={[

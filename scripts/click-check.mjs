@@ -1,4 +1,4 @@
-﻿// mission-app · scripts/click-check.mjs
+// mission-app · scripts/click-check.mjs
 //
 // **手点通路自证（20 屏）**：只用界面上的按钮/卡片（除了少数图上确实没有入口的过渡）从 SH-01 走到 SH-18，
 // 每一步都按《宿主需求专篇》DES-APP-001 §4.1 的流程点，并断言"当前屏 / 落到哪一屏 / 哪个步号"。
@@ -134,6 +134,12 @@ try {
   await clickUntil('SH-02 → SH-03', { re: '进入任务', screen: 'SH-03', timeoutMs: 20000 })
 
   console.log('\n== SH-03 任务态势主界面 → SH-04 场景确认 ==')
+  // ★ 2026-09-18（用户第 3 条）：场景面板**默认收起**，要先点工具栏的【场景】才显示。
+  //   原来它常驻屏底、脚本直接点卡就行；现在多一步"点开面板"（这一步不换屏，js 点击即可）。
+  await js(`document.querySelector('[data-testid="sh03-toolbar-scene"]').click()`)
+  await sleep(600)
+  check('SH-03 点【场景】后工具格高亮（选中态）',
+    await js(`document.querySelector('[data-testid="sh03-toolbar-scene"]').dataset.toolActive`) === '1')
   const cards03 = (await visibleButtons()).filter((b) => /场景[一二三]/.test(b.t))
   check('SH-03 三张场景卡存在（图上逐字）', cards03.length === 3, cards03.map((b) => b.t).join(' / '))
   await clickUntil('SH-03 点场景卡（场景一）→ SH-04', { sel: '[data-testid="sh03-scene-card"][data-scene="scenario-1"]', screen: 'SH-04', timeoutMs: 12000 })

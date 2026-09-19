@@ -1,4 +1,4 @@
-﻿// 临时排障：**真实鼠标**手点通路（CDP Input 域 + elementFromPoint 命中测试）。
+// 临时排障：**真实鼠标**手点通路（CDP Input 域 + elementFromPoint 命中测试）。
 // 与 click-check.mjs 的差别：后者用 el.click()（JS 合成事件，绕过命中测试与遮挡），
 // 所以"脚本能点通、人点不通"这类问题它看不见。本脚本模拟真人的鼠标按下/抬起。
 //
@@ -101,7 +101,9 @@ try {
   console.log(`\n== 视口 ${VW}×${VH} ==`)
   await stepThrough('SH-02 【一键自检】', { re: '一键自检|重新自检' }, 'SH-02')
   await stepThrough('SH-02 【进入任务】→ SH-03', { re: '进入任务' }, 'SH-03')
-  // 用真鼠标点三张场景卡（含 ▶ 播放圈所在位置）
+  // ★ 2026-09-18（用户第 3 条）：场景面板默认收起 —— 先用真鼠标点工具栏【场景】把它点开
+  await stepThrough('SH-03 点工具栏【场景】', { tid: 'sh03-toolbar-scene' }, 'SH-03')
+  // 再用真鼠标点场景一卡（含 ▶ 播放圈所在位置）
   await stepThrough('SH-03 场景一卡（卡面）→ SH-04', { sel: '[data-testid="sh03-scene-card"][data-scene="scenario-1"]' }, 'SH-04')
   await stepThrough('SH-04 【进入任务执行】→ SH-05', { re: '进入任务执行' }, 'SH-05', 4)
   await stepThrough('SH-05 【确认采用推荐方案】→ SH-06', { tid: 'btn-adopt-recommended' }, 'SH-06')
