@@ -58,12 +58,17 @@ function makeKind(
   }
 }
 
-/** 纯几何原语条目（点 / 线 / 闭合线 / 真面 / 圆 / 椭圆）—— 直接照抄模块清单的缺省样式 */
+/**
+ * 纯几何原语条目（点 / 线 / 闭合线 / 真面 / 圆 / 椭圆） 直接照抄模块清单的缺省样式。
+ * 2026-09-20 需求：模块原语的「线」「面」在业务层叫「标注线」「标注面」（菜单与图上默认文本都用这个名）。
+ */
+const GEO_NAME: Record<string, string> = { line: '标注线', polygon: '标注面' }
+
 function geoEntries(): BizEntry[] {
   const menuOf = (g: string): BizEntry['menu'] => (g === '点' ? 'create' : g === '线' ? 'draw' : 'area')
   return PRIMITIVE_CATALOG.map((d) => ({
     key: `geo:${d.key}`,
-    label: d.name,
+    label: GEO_NAME[d.key] ?? d.name,
     note: `${d.geometry} 原语 · ${d.interaction === 'click' ? '落点即建' : d.interaction === 'two-point' ? '两下：中心 → 尺寸' : '多点，双击/Enter 结束'}`,
     menu: menuOf(d.geometry),
     start: {
@@ -229,6 +234,56 @@ export const BIZ_MENUS: Record<string, BizEntry[]> = {
 }
 
 export const bizEntry = (key: string): BizEntry | undefined => BIZ_CATALOG.find((e) => e.key === key)
+
+/**
+ * **四个一级分类**（用户 2026-09-19："新建、区域、标绘，合并为一个功能叫「新建」，一级子菜单显示分类，
+ * 二级子菜单才显示当前的内容"）。
+ *
+ * 分类按**几何维度**走：点 / 线 / 面；几何表达不了的那一批（距离环、方位圈、九宫格、军标）单列「标绘」。
+ * 2026-09-20 起：点 2 项、线 2 项、面 4 项、标绘 10 项 = **18 项**（被删的条目按需求只从菜单去掉，
+ *   代码仍留在本文件里，以后要加回只需在下面的 keys 里添一行）。
+ *
+ * 为什么用 `keys` 显式列、而不是按 `menu` 字段分组：`menu` 是**旧版工具栏那三格**（新建/区域/标绘），
+ * 用户点名要"另起分类名"；显式列也方便单改某一类。`BIZ_MENUS` 原样保留（没有别的引用，留着对照）。
+ */
+export interface BizGroup {
+  key: string
+  label: string
+  items: BizEntry[]
+}
+
+const GROUP_KEYS: { key: string; label: string; keys: string[] }[] = [
+  {
+    key: 'point', label: '点',
+    keys: ['biz:mark-point', 'biz:target-point'],
+  },
+  {
+    key: 'line', label: '线',
+    keys: ['geo:line', 'biz:route'],
+  },
+  {
+    key: 'area', label: '面',
+    keys: [
+      'geo:polygon',
+      'biz:task-area', 'biz:assembly', 'biz:threat-area',
+    ],
+  },
+  {
+    key: 'mark', label: '标绘',
+    keys: [
+      'biz:ring', 'biz:bearing-ring', 'biz:grid',
+      'biz:sym-infantry', 'biz:sym-armor', 'biz:sym-artillery', 'biz:sym-missile',
+      'biz:sym-radar', 'biz:sym-command', 'biz:sym-recon',
+    ],
+  },
+]
+
+/** 一级分类（分类键 + 分类名 + 该类条目），供态势屏「新建」的两级菜单直接使用 */
+export const BIZ_GROUPS: BizGroup[] = GROUP_KEYS.map((g) => ({
+  key: g.key,
+  label: g.label,
+  items: g.keys.map((k) => bizEntry(k)).filter((e): e is BizEntry => !!e),
+}))
 
 /** 文本框样式（模块给的三种，界面直接列） */
 export const TEXT_STYLE_OPTIONS: { key: TextStyle; name: string; note: string }[] = TEXT_STYLES

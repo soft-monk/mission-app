@@ -99,7 +99,7 @@ const getStats = async () => (await fetch(`${URL_}/stats`)).json()
 // ---------------------------------------------------------------- WS 事件采集
 //
 // 与 p2-check 同一条纪律：用 addEventListener（Node 的全局 WebSocket 对 onmessage 属性支持不全），
-// 并且**必须自己保活**（hub 判死 = 连续 3 次心跳未见，1.5 s × 3 ≈ 4.5 s）。
+// 并且**必须自己保活**（hub 判死 = 连续 3 次心跳未见，1.5 s x 3 = 4.5 s（2026-09-20 起已调回 15 s x 4 = 60 s））。
 function collectEvents() {
   const seen = []
   const state = { open: false, closed: false, errors: 0, total: 0, error: '', pings: 0 }

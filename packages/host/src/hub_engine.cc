@@ -102,8 +102,15 @@ void HubEngine::configure(const std::string& wsPath, const DrogonTransportOption
     options_ = options;
 
     realtime_hub::HubOptions hubOptions;
-    hubOptions.heartbeatMs = 1500;              // 验收可观测：判死窗口 = 1.5 s × 3 = 4.5 s
-    hubOptions.deadAfterMissedHeartbeats = 3;
+    // 2026-09-20（需求方选 B2）：判死窗 1.5 s x 3 = 4.5 s 对"页面在后台/最小化"太敏感：
+    //   浏览器会节流定时器，心跳发不出去，宿主每隔 8~17 s 就踢一次连接，页面反复弹
+    //   「断线 X s 后已重连」（日志实证：heartbeatClosed 每 8 秒 +1，clientCount 在 1 和 2 之间跳）。
+    //   这里回到**协议默认量级**：15 s 心跳 x 4 = **60 s** 判死窗，连"隐藏 5 分钟后一分钟才跑一次
+    //   定时器"那种极端节流也扛得住。sys.welcome 会把这个值告知客户端（客户端心跳随之变 15 s，
+    //   它自己的判死窗是 3 x 15 s = 45 s），**前端不用改**。
+    //   验收要"确定性制造一次断线"不必等判死：用 POST /ws-close?peer=<片段>。
+    hubOptions.heartbeatMs = 15000;
+    hubOptions.deadAfterMissedHeartbeats = 4;
     hubOptions.sendWelcomeOnConnect = true;
     hubOptions.replyErrorOnUnsupportedUplink = true;
     hub_.configure(hubOptions);

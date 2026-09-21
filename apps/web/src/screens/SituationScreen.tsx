@@ -22,7 +22,7 @@
 //   · 图上是**三维地形底图**，我们只有**二维瓦片** —— 如实写一行小字，**不假装三维**。
 //   · 样式一律 `left/right/top/bottom` 长写（**不用 `inset` 简写**：React 的 style diff 曾把
 //     `top` 连带清掉、整屏塌成 0 高，见 `流程接口冻结.md` §7）。
-import { useCallback, useEffect, useState, type CSSProperties } from 'react'
+import { useCallback, useEffect, useMemo, useState, type CSSProperties } from 'react'
 import { C, panel, panelTitle } from '../theme'
 import type { FlowState } from '../api'
 import type { UseFlow } from '../flow/useFlow'
@@ -32,12 +32,13 @@ import {
 } from '../flow/useSituation'
 import { VerbVerdict } from './VerbVerdict'
 
-import { MapToolbar, ToolModeNote, toolsOf, useMapToolState } from '../shell/MapTools'
-import { BIZ_MENUS, TEXT_STYLE_OPTIONS, bizEntry } from '../biz-catalog'
+import { MapToolbar, ToolModeNote, TOOL_SPECS, useMapToolState, type MapToolSpec } from '../shell/MapTools'
+import { BIZ_GROUPS, TEXT_STYLE_OPTIONS, bizEntry } from '../biz-catalog'
+import { pickModeNow, usePickMode } from '../pick-mode'
 // map-2d：`mapInstance` 取当前地图实例（"落点即创建"要挂 click）；`useInteraction` 取绘制模式
 import { MapDraw, boundStyleOf, boundTextOf, mapCommands, setBoundStyle, setBoundText, useInteraction, type TextStyle } from 'map-2d'
 // ★ 2026-09-18「计划」：计划文件的读写（空地图 + 手动打开计划）
-import { applyPlan, loadPlanConfig, parsePlan, pickPlanToOpen, pickPlanToSave, savableCount, serializePlan } from '../plan-file'
+import { applyPlan, homeView, loadPlanConfig, parsePlan, pickPlanToOpen, pickPlanToSave, savableCount, serializePlan } from '../plan-file'
 // ★ 2026-09-18「规划航线」：A* 按界面上画的集结区/任务区算航线 + 航道
 import { classifyAreas, planAndDrawRoute } from '../route-compute'
 // ★ 2026-09-18：`DiagBox/DiagLine`（`../shell/Diag`）的 import 随"视图声明"浮层一起删掉了 ——
@@ -56,31 +57,52 @@ const SCENES: { id: string; no: string; name: string; accent: string; implemente
 ]
 
 /**
- * 本屏工具条的**版式**（键位/顺序逐字照参考图 T0-1）。
+ * 本屏工具条的**版式**（2026-09-19 用户合并后的版式）。
  *
- * 图上是「选择 / 新建 / 全屏 / 区域 / 3D」；这里保留图上的 5 格，并在其后补上
- * `view.compose` 对 `overview` 模式声明为 available 的 测距·测面·标绘·图层·清屏
- * —— **量算（测距/测面）是用户本轮点名要接的能力**（map-2d 已实现 M2-CTRL-10，
- * 宿主此前从未挂 `DrawLayer`，所以一直是灰的）。补格属于"图上有工具组、模块有能力"的
- * 如实接线，已登记进 README「本轮的已知偏差」。
- * 每一格**能不能点**不看这张表，一律由规则包 `view.compose` 说了算。
+ * 用户原话："态势界面，工具栏中，新建、区域、标绘，合并为一个功能叫「新建」，一级子菜单显示分类，
+ * 二级子菜单才显示当前的内容；测距、测面合并为「量算」；全屏、清屏、复位合并叫「视图」，放在最后面。"
+ *
+ * 顺序：**选择 / 新建 / 量算 / 场景 / 计划 / 图层 / 视图**（新建仍在"选择"之后、量算紧跟新建、视图在末尾）。
+ * 「新建」的一级分类来自 `biz-catalog.ts` 的 `BIZ_GROUPS`（点 / 线 / 面 / 标绘，31 项一个不丢）；
+ * 「量算」= 测距 / 测面（走 map-2d 的绘制模式，选中态由工具条按二级条目判）；
+ * 「视图」= 全屏 / 清屏 / 复位，图标沿用原来的【全屏】（`id: 'fullscreen'` 就是给 `ToolGlyph` 的键）。
+ *
+ * 2026-09-19 用户追加："『不可用就灰』这个行为不需要"，且**只对本屏**：
+ *   末尾统一 `always: true`，本屏这一排一律可点、一律不灰；其他屏仍按规则包 `view.compose` 如实灰置
+ *   （共用组件的灰置判据一行没动）。
  */
-const SH03_TOOLS = toolsOf([
-  'select', 'create', 'fullscreen', 'area', 'measure', 'measureArea', 'draw',
-  // ★ 用户 2026-09-18 第 3 条：「选择场景功能，添加到上方工具栏中，点击后才显示」
-  'scene',
-  // ★ 用户 2026-09-18："功能界面添加，计划，子菜单为，打开计划，保存计划"（先做打开）
-  'plan',
-  'layers', 'clear', 'reset',
-  // ★ 用户 2026-09-18 第 1 条：新建/区域/标绘 三格挂**子菜单**（见 draw-catalog.ts）。
-  //   挂在数据上而不是改 toolsOf —— 菜单内容是"能画什么"，属于本屏的绘制目录。
-]).map((t) => (BIZ_MENUS[t.key] ? { ...t, submenu: BIZ_MENUS[t.key] } : t))
-  // ★★ 2026-09-19（需求方实测："新建和区域功能都无法使用了"）：
-  //   根因**不是**功能坏了 —— 规则包在 T0 阶段没声明 `create`/`area` 可用（`view.compose` 里
-  //   它们是 hidden），界面就如实灰置了；而"画计划"（画集结区/任务区）是**流程之外**的事，
-  //   不该等阶段推进才让画。所以这两格在本屏**常开**（`always: true` 的语义见 `MapToolSpec`）。
-  //   只覆盖本屏 —— 别的屏仍按规则包声明走，不扩大影响面。
-  .map((t) => (t.key === 'create' || t.key === 'area' ? { ...t, always: true } : t))
+const SH03_ITEMS: MapToolSpec[] = [
+  {
+    id: 'create', key: 'create', label: '新建',
+    submenu: BIZ_GROUPS.map((g) => ({
+      key: g.key, label: g.label,
+      items: g.items.map((e) => ({ key: e.key, label: e.label, note: e.note })),
+    })),
+  },
+  {
+    id: 'measure', key: 'measure', label: '量算',
+    submenu: [
+      { key: 'measure-line', label: '测距', mode: 'measure-line', note: '单击落点，双击 / Enter 结束，Esc 取消' },
+      { key: 'measure-area', label: '测面', mode: 'measure-area', note: '单击落点，双击 / Enter 结束，Esc 取消' },
+    ],
+  },
+  TOOL_SPECS.scene,
+  TOOL_SPECS.plan,
+  TOOL_SPECS.layers,
+  {
+    id: 'fullscreen', key: 'view', label: '视图',
+    submenu: [
+      { key: 'fullscreen', label: '全屏', note: '进入 / 退出浏览器全屏' },
+      { key: 'clear', label: '清屏', note: '隐藏各面板浮层、只留地图（Esc 或再点一次退出）' },
+      { key: 'reset', label: '复位', note: '回到本场景的初始中心与缩放' },
+    ],
+  },
+]
+
+/** 本屏工具条里**静态**的那几格（"选择"格随模式变，所以放在组件里动态拼）；一律常开，本屏不灰。 */
+
+// 2026-09-20：原先这里有个 `PICK_OPEN_TEXT_EDITOR` 常量（2026-09-19 用来屏蔽"点图元弹编辑器"）。
+// 现在改成**按选择模式**：只有"编辑"模式下点图元才弹编辑器（见下面那个 useEffect）。常量已移除。
 
 /** 一行计量：名 + 值（值缺失显示"—"，**不补 0**）。 */
 function MetricRow({ m }: { m: Metric }) {
@@ -236,6 +258,25 @@ export function SituationScreen({ state, flow, onGo }: {
   // 「场景」面板开合（用户第 3 条：点了工具栏的【场景】才显示）
   const [sceneOpen, setSceneOpen] = useState(false)
   /**
+   * 2026-09-20 菜单窗口互斥：本屏打开了【场景】面板时，把它 +1，
+   * 工具条据此关掉它那边的子菜单与图层面板（与工具条的 `onMenuOpened` 是一对）。
+   */
+  const [closeSignal, setCloseSignal] = useState(0)
+
+  /** 选择模式：浏览（只拖地图）/ 编辑（点图元  高亮 + 拖拽编辑 + 吸附），默认浏览（见 pick-mode.ts） */
+  const pickMode = usePickMode((s) => s.mode)
+  const setPickMode = usePickMode((s) => s.setMode)
+
+  /** 本屏工具条：第一格是**两态的选择格**（浏览 / 编辑），其余是静态那几格；本屏一律常开 */
+  const SH03_TOOLS: MapToolSpec[] = useMemo(() => [
+    {
+      id: 'select', key: 'select', glyph: pickMode === 'browse' ? 'pan' : 'select',
+      label: pickMode === 'browse' ? '浏览' : '编辑',
+      local: true,     // 由本屏自己处理点击（切模式），工具条不碰绘制模式
+    },
+    ...SH03_ITEMS,
+  ].map((t) => ({ ...t, always: true })), [pickMode])
+  /**
    * **正在改的跟随文本**（用户第 2 条："画完给个输入框 / 点文本可改"）。
    *
    * ★ 2026-09-18 解耦合后：**文本框由模块的 `TextOverlay` 画、绑定关系存在模块里**，
@@ -259,7 +300,11 @@ export function SituationScreen({ state, flow, onGo }: {
       if (!picked) return                       // 用户取消 → 什么都不做
       const { plan, error } = parsePlan(picked.text)
       if (error || !plan) { setPlanMsg(`计划读取失败：${error ?? '未知原因'}`); return }
-      const { drawn, failed } = applyPlan(plan)
+      // 2026-09-20：打开计划**不听文件里的 view**，直接去"家视角"（第一个能定位的元素 + 比例尺 5 km；
+      //   图上没有可定位元素时回配置默认位置）。口径见 plan-file.ts 的「家视角」段。
+      const { drawn, failed } = applyPlan(plan, { applyFileView: false })
+      const home = homeView()
+      mapCommands.setView(home.lng, home.lat, home.zoom, 700)
       setPlanMsg(failed.length
         ? `已打开 ${picked.name}：画了 ${drawn} 个，${failed.length} 个有问题 —— ${failed.join('；')}`
         : `已打开 ${picked.name}：${plan.name ? `「${plan.name}」` : ''}画了 ${drawn} 个图元`)
@@ -299,7 +344,10 @@ export function SituationScreen({ state, flow, onGo }: {
         if (!r.ok) throw new Error(`HTTP ${r.status}`)
         const { plan, error } = parsePlan(await r.text())
         if (error || !plan) throw new Error(error ?? '解析失败')
-        const { drawn } = applyPlan(plan)
+        // 同上（自动打开那条路也走"家视角"）
+        const { drawn } = applyPlan(plan, { applyFileView: false })
+        const home = homeView()
+        mapCommands.setView(home.lng, home.lat, home.zoom, 700)
         if (alive) setPlanMsg(`按配置自动打开了 ${cfg.defaultPlanUrl}（${drawn} 个图元）`)
       } catch (e) {
         if (alive) setPlanMsg(`配置里的 defaultPlanUrl 打不开：${String((e as Error)?.message ?? e)}`)
@@ -355,6 +403,7 @@ export function SituationScreen({ state, flow, onGo }: {
    */
   useEffect(() => {
     const off = MapDraw.on('click', (e) => {
+      if (pickModeNow() !== 'edit') return   // 浏览模式：点图元不弹编辑器（编辑模式才弹）
       const cur = boundTextOf(e.id)
       if (cur === null) return          // 这个图元没绑文本 → 不弹编辑器
       setEditing({ id: e.id, text: cur, style: boundStyleOf(e.id) ?? 'tag' })
@@ -390,18 +439,32 @@ export function SituationScreen({ state, flow, onGo }: {
       {/* 底图不在这里：2026-09-18 起地图由 App 的 MapLayer 统一渲染（所有屏共用一张，清屏才做得干净） */}
 
       {/* ---------------- 左上：地图浮动工具栏 ----------------
-           ★ 上一版这一排是**只读的 `<span>` 摆设**（点了没反应），而 map-2d 里量算/手绘/
-             图层面板/清屏/全屏**早就实现了**。现在统一走 `shell/MapTools`（真能点，
-             可用性由规则包 `view.compose` 说了算）。键位按参考图 T0-1：
-             选择 / 新建 / 全屏 / 区域 / 3D，另按 `view.compose` 的声明补 测距·测面·标绘·图层·清屏
-             （量算是用户明确点名要接的能力，见 README「本轮的已知偏差」）。 ---------------- */}
+           上一版这一排是**只读的 `<span>` 摆设**（点了没反应），而 map-2d 里量算/手绘/
+           图层面板/清屏/全屏**早就实现了**。现在统一走 `shell/MapTools`（真能点）。
+           2026-09-19 起本屏键位 = 用户合并后的版式：
+           选择 / 新建（点 / 线 / 面 / 标绘，两级）/ 量算（测距 / 测面）/ 场景 / 计划 / 图层 / 视图（全屏 / 清屏 / 复位）；
+           本屏**一律不灰**（用户点名要求）；其他屏仍按规则包 `view.compose` 如实灰置。 ---------------- */}
       <MapToolbar
         testid="sh03-toolbar"
         items={SH03_TOOLS}
         state={mt}
         style={{ left: 12, top: 5 }}
         onLocal={(k) => {
-          if (k === 'scene') { setSceneOpen((v) => !v); return }
+          // 2026-09-20 需求：选择 = 两态（浏览 / 编辑） 点一下切换，并把绘制/编辑/选中都收干净
+          if (k === 'select') {
+            mapCommands.cancelInteraction()
+            mapCommands.finishEdit()
+            mapCommands.clearSelection()
+            setPickMode(pickMode === 'browse' ? 'edit' : 'browse')
+            return
+          }
+          if (k === 'scene') {
+            // 2026-09-20 菜单窗口互斥：打开【场景】时，顺手把工具条那边的子菜单 / 图层面板收掉
+            const next = !sceneOpen
+            setSceneOpen(next)
+            if (next) setCloseSignal((n) => n + 1)
+            return
+          }
           // ★ 2026-09-18「计划」子菜单（需求方："打开计划、保存计划，先做打开计划"）
           if (k === 'plan-open') { void openPlanFile(); return }
           if (k === 'plan-save') { savePlanFile(); return }
@@ -430,7 +493,11 @@ export function SituationScreen({ state, flow, onGo }: {
             onDone: (id) => { if (id) setEditing({ id, text: e.label, style: 'tag' }) },
           })
         }}
-        activeKeys={{ scene: sceneOpen }}
+        // 2026-09-20 需求：浏览 / 编辑**两个状态都高亮**（它永远是"当前工具"，换的只是图标与文字）
+        activeKeys={{ scene: sceneOpen, select: true }}
+        // 菜单窗口互斥（2026-09-20）：工具条打开任一菜单/面板  本屏把自己的【场景】面板收掉
+        onMenuOpened={() => setSceneOpen(false)}
+        closeSignal={closeSignal}
       />
       <ToolModeNote state={mt} items={SH03_TOOLS} style={{ left: 12, top: 46 }} />
 

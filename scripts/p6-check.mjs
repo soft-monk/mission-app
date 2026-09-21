@@ -145,7 +145,7 @@ const getState = async () => (await fetch(`${URL_}/api/state`)).json()
 // ---------------------------------------------------------------- WS 事件采集
 //
 // 与 p2–p5 同一条纪律：addEventListener（Node 全局 WebSocket 对 onmessage 支持不全）
-// + **自己保活**（hub 判死 = 1.5 s × 3 ≈ 4.5 s 无消息）。
+// + **自己保活**（hub 判死 = 1.5 s x 3 = 4.5 s（2026-09-20 起已调回 15 s x 4 = 60 s） 无消息）。
 function collectEvents() {
   const seen = []
   const state = { open: false, closed: false, errors: 0, total: 0, error: '', pings: 0 }

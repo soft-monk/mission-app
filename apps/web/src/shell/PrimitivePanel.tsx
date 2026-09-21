@@ -12,7 +12,8 @@
 // 数据全部来自 map-2d 的公开面：`MapDraw.list(kind)` / `isVisible` / `setVisible` /
 // `showAll` / `hideAll` —— 面板自己不存一份镜像（存了就会和地图不同步）。
 import { useCallback, useEffect, useState, type CSSProperties } from 'react'
-import { MapDraw, mapCommands } from 'map-2d'
+import { MapDraw, boundTextOf, draw, mapCommands } from 'map-2d'
+import { bizNameOf } from '../biz-catalog'
 import { C } from '../theme'
 
 
@@ -44,7 +45,7 @@ const KIND_GROUPS: { kind: KindName; name: string }[] = [
 ]
 
 /** 一条图元（面板只关心这三个字段） */
-interface Row { id: string; visible: boolean }
+interface Row { id: string; name: string; visible: boolean }
 
 /**
  * ★ 2026-09-18（需求方："一键删除全部图元，**除了无人机**，因为无人机属于另一套，
@@ -60,10 +61,13 @@ const KEEP_ON_CLEAR: KindName[] = ['drone', 'track']
 /** 读某一类的全部图元；读不到就给空数组（不编） */
 function rowsOf(kind: KindName): Row[] {
   try {
-    const items = (MapDraw.list(kind as never) ?? []) as unknown as { id?: string }[]
+    const items = (MapDraw.list(kind as never) ?? []) as unknown as Record<string, unknown>[]
     return items
       .filter((x) => typeof x.id === 'string')
-      .map((x) => ({ id: x.id as string, visible: MapDraw.isVisible(kind as never, x.id as string) }))
+      .map((x) => {
+        const id = x.id as string
+        return { id, name: nameOf(x, id), visible: MapDraw.isVisible(kind as never, id) }
+      })
   } catch {
     return []
   }
@@ -79,6 +83,12 @@ export function PrimitivePanel({ onClose, left = 12 }: {
   const refresh = useCallback(() => setTick((v) => v + 1), [])
   /** 哪些类型展开了逐条列表 */
   const [open, setOpen] = useState<Record<string, boolean>>({})
+  /**
+   * **待确认的单条删除**（用户 2026-09-19："删除的时候需要二次确认，就像图元清空全部一样，再次点击才能删除"）。
+   * 与「清空全部」同一套口径：点一次只是**变成确认态**，再点才真删；鼠标移开 / 去点别的一条就退回。
+   * 存的是图元 id（同一时刻只允许一行处于确认态）。
+   */
+  const [confirmDel, setConfirmDel] = useState<string | null>(null)
 
   // ★ 2026-09-18：改成**事件驱动** —— map-2d 补了图元变更事件 MapDraw.on('change')，
   //   面板不再每 1.2 秒把全表重读一遍（改造前只能轮询，因为地图不是 React 状态）。
@@ -125,6 +135,21 @@ export function PrimitivePanel({ onClose, left = 12 }: {
     setCleared(`已清空 ${n} 个图元${skipped.length ? `（保留：${skipped.join('、')}）` : ''}`)
     refresh()
   }
+
+  /**
+   * **删一条图元**（用户 2026-09-19："每个图元最后添加删除按钮，点击按钮后直接删除图元"）。
+   *
+   * 走的是模块的**规范删除路径**（`core/selection.ts` 的 `deleteSelection()` 也就这两步）：
+   *    `draw.remove(id)`：几何原语（新建 / 区域 / 标绘 画出来的那些）走这条，**顺带解绑它的文本**；
+   *    返回 false（不是几何原语，如军标 / 脉冲 / 集群）就退回 `MapDraw.remove(kind, id)`。
+   * 删完清一次选中（免得"删除确认条"挂在一个已经没了的图元上）。
+   * 按用户口径：**不弹二次确认、不写任何提示**。
+   */
+  const delRow = useCallback((kind: KindName, id: string) => {
+    if (!draw.remove(id)) MapDraw.remove(kind as never, id)
+    mapCommands.clearSelection()
+    refresh()
+  }, [refresh])
 
   return (
     <div data-testid="primitive-panel" data-ma-noscrollbar="1" style={{ ...panelStyle, left: clampLeft(left) }}>
@@ -179,11 +204,6 @@ export function PrimitivePanel({ onClose, left = 12 }: {
             >{labelsOn ? '全隐' : '全显'}</button>
           </div>
         </div>
-        {groups.length === 0 && (
-          <div style={{ fontSize: 11.5, color: C.textDim, padding: '10px 8px' }}>
-            地图上还没有图元。用【新建 / 区域 / 标绘】画一个，这里就会列出来。
-          </div>
-        )}
         {groups.map((g) => {
           const allOn = g.rows.every((r) => r.visible)
           const expanded = !!open[g.kind]
@@ -206,25 +226,77 @@ export function PrimitivePanel({ onClose, left = 12 }: {
                   title={allOn ? '这一类全部隐藏' : '这一类全部显示'}
                 >{allOn ? '全隐' : '全显'}</button>
               </div>
-              {expanded && g.rows.map((r) => (
-                <label key={r.id} style={itemRowStyle} title={r.id}>
-                  <input
-                    type="checkbox"
-                    data-testid={`prim-item-${r.id}`}
-                    checked={r.visible}
-                    onChange={(e) => { MapDraw.setVisible(g.kind as never, r.id, e.target.checked); refresh() }}
-                  />
-                  <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {shortName(r.id)}
-                  </span>
-                </label>
-              ))}
+              {expanded && g.rows.map((r) => {
+                // 用户 2026-09-19："每个图元最后添加删除按钮，点击按钮后，直接删除图元"。
+                // 删除按钮**不能**放进 <label>（点它会顺带切换显隐），所以整行改成 div：
+                // 左半是原来的 label（勾选框 + 名字），右端才是删除。
+                return (
+                  <div key={r.id} data-testid={`prim-row-${r.id}`} style={itemRowStyle} title={r.id}>
+                    <label style={itemLabelStyle}>
+                      <input
+                        type="checkbox"
+                        data-testid={`prim-item-${r.id}`}
+                        checked={r.visible}
+                        onChange={(e) => { MapDraw.setVisible(g.kind as never, r.id, e.target.checked); refresh() }}
+                      />
+                      <span
+                        data-testid={`prim-name-${r.id}`}
+                        style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                      >
+                        {r.name}
+                      </span>
+                      {r.name !== r.id && (
+                        <span data-testid={`prim-idtail-${r.id}`} style={idTailStyle}>{r.id}</span>
+                      )}
+                    </label>
+                    {confirmDel === r.id ? (
+                      <button
+                        data-testid={`prim-del-confirm-${r.id}`}
+                        onClick={() => { delRow(g.kind, r.id); setConfirmDel(null) }}
+                        onMouseLeave={() => setConfirmDel(null)}
+                        style={delConfirmBtnStyle}
+                        title={`真的删除这个图元（不可撤销）：${r.id}`}
+                      >确认删除？</button>
+                    ) : (
+                      <button
+                        data-testid={`prim-del-${r.id}`}
+                        onClick={() => setConfirmDel(r.id)}
+                        style={delBtnStyle}
+                        title={`删除这个图元（不可撤销）：${r.id}${KEEP_ON_CLEAR.includes(g.kind) ? '（遥测驱动：下一拍可能重建）' : ''}`}
+                      >删除</button>
+                    )}
+                  </div>
+                )
+              })}
             </div>
           )
         })}
       </div>
     </div>
   )
+}
+
+/**
+ * **一条图元在面板里显示的名字**（用户 2026-09-19："名称只显示 id 太难看了，显示为标签名称"）。
+ *
+ * 顺序（取第一个非空）：
+ *    图元自己的字段：绑定文本落在哪个字段**按种类不同**（map-2d 的 `NATIVE_TEXT_FIELD`：
+ *      label 用 `text`；area / shape / route / drone / target / scan / symbol 用 `label`；link / cluster 用 `name`）；
+ *    模块的绑定文本登记表 `boundTextOf(id)`：补 track / annulus / pulse 这三种"只登记、不画字"的；
+ *    业务目录 `bizNameOf(id)`：兜住 `B:ring:1` 这类由 `make` 造出来的业务物件；
+ *    最后退回 `shortName(id)`（`:txt` 特例）与 id 本身，保证永远有字可显示。
+ *
+ * 这个名字**就是图上那个可改的文本**：用户在文本框编辑器里改了名，面板这里会跟着变。
+ */
+function nameOf(item: Record<string, unknown>, id: string): string {
+  const str = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : '')
+  const own = str(item.text) || str(item.label) || str(item.name)
+  if (own) return own
+  try {
+    const bound = str(boundTextOf(id))
+    if (bound) return bound
+  } catch { /* 模块登记表里没有这条，继续往下兜 */ }
+  return bizNameOf(id) ?? shortName(id)
 }
 
 /** 图元 id 太长，面板里显示一个能认出来的短名（id 本身放在 title 里） */
@@ -303,4 +375,27 @@ const clearConfirmStyle: CSSProperties = {
 const itemRowStyle: CSSProperties = {
   display: 'flex', alignItems: 'center', gap: 6, padding: '2px 8px 2px 18px', fontSize: 11, color: C.text,
   cursor: 'pointer',
+}
+
+/** 行内左侧（勾选框 + 名字）：占满剩余宽度，把删除按钮顶到行尾 */
+const itemLabelStyle: CSSProperties = {
+  display: 'flex', alignItems: 'center', gap: 6, flex: 1, minWidth: 0, cursor: 'pointer',
+}
+/** 行尾的「删除」按钮（第一步：点一下变成确认态） */
+const delBtnStyle: CSSProperties = {
+  fontSize: 10.5, padding: '1px 6px', borderRadius: 4, cursor: 'pointer', font: 'inherit',
+  flex: '0 0 auto', whiteSpace: 'nowrap',
+  background: 'transparent', border: '1px solid rgba(248,113,113,.55)', color: '#fca5a5',
+}
+
+/** 行尾的「确认删除？」（第二步：真删；红底实心，与头部「确认清空？」同一观感） */
+const delConfirmBtnStyle: CSSProperties = {
+  fontSize: 10.5, padding: '1px 6px', borderRadius: 4, cursor: 'pointer', font: 'inherit',
+  flex: '0 0 auto', whiteSpace: 'nowrap',
+  background: 'rgba(220,38,38,.85)', border: '1px solid rgba(248,113,113,.9)', color: '#fff',
+}
+
+/** 行里那个小灰字的 id（重名时用来区分：`任务区 + geo:3`；行 hover 的 title 也仍是完整 id） */
+const idTailStyle: CSSProperties = {
+  flex: '0 0 auto', fontSize: 10, color: C.textDim, fontVariantNumeric: 'tabular-nums',
 }

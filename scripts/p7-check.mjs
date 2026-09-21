@@ -125,7 +125,7 @@ function postConcurrent(verb, params = {}) {
 // ---------------------------------------------------------------- WS 事件采集
 //
 // 与 p2–p6 同一条纪律：addEventListener（Node 全局 WebSocket 对 onmessage 支持不全）
-// + **自己保活**（hub 判死 = 1.5 s × 3 ≈ 4.5 s 无消息）。
+// + **自己保活**（hub 判死 = 1.5 s x 3 = 4.5 s（2026-09-20 起已调回 15 s x 4 = 60 s） 无消息）。
 function collectEvents() {
   const seen = []
   const state = { open: false, closed: false, errors: 0, total: 0, error: '', pings: 0 }
@@ -487,7 +487,7 @@ try {
       if (!ok) fails.push(`第1次：${badOf(r.out).join(' / ') || `exit=${r.code}`}`)
       // ★ 已知抖动：`p2-check` 的最后一条断言是"`flow.enter` 之后 **600 ms** 内页面切到步 3"，
       //   而**页面切屏实际靠 `/api/state` 的 500 ms 轮询兜底**（实测换步延迟 670–760 ms；
-      //   页面那条 WS 会在 ~4.5 s 被 hub 判死踢掉 —— 见 docs/P7-一键演示.md 的"已知抖动"）。
+      //   页面那条 WS 会在 ~4.5 s（现为 60 s，2026-09-20 起） 被 hub 判死踢掉 —— 见 docs/P7-一键演示.md 的"已知抖动"）。
       //   这不是 P7 引入的（P7 没动 apps/web 与 hub），也不该让"回归"变成掷骰子 →
       //   **最多重试 2 次**，但每一次的汇总行与失败断言都如实打印（不拿后一次盖掉前一次）。
       while (!ok && attempts < 3) {

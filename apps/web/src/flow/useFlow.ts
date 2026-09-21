@@ -129,12 +129,11 @@ export function useFlow(wsUrl: string): UseFlow {
       channel = createChannel({
         url: wsUrl,
         autoStart: false,
-        // ★ 心跳周期必须跟**宿主**的判死口径对齐：mission-app 的 hub 为了验收可观测，
-        //   把"连续未心跳"判死调成了 1.5 s × 3 ≈ **4.5 s**（见 main.cc 的 transportOptions 注释），
-        //   而 ws-client 默认 15 s 才发一次心跳（`sys.welcome.data.heartbeatMs` 若带值会覆盖它）。
-        //   不对齐的后果不是"断了重连"那么简单：连接被判死踢掉后，事件腿静默失效，
-        //   页面只剩 500 ms 轮询兜底 —— 表现为"看着连着、切屏却慢半拍"（实测 670–760 ms），
-        //   且 `/stats` 的 clientCount 恒为 0（排障时极具误导性）。取 1.2 s 留足余量。
+        // 心跳周期：ws-client 默认 15 s，且 `sys.welcome.data.heartbeatMs` 会**覆盖**这里的值。
+        // 2026-09-20 起宿主判死窗 = **15 s x 4 = 60 s**（见 `ma/hub_engine.cc`），前端不必再对齐；
+        //   这里的 1.2 s 只是"welcome 还没到"那一下的保底值。
+        // 历史：2026-09-20 之前宿主为验收可观测把判死压到 1.5 s x 3 = 4.5 s，页面一旦被浏览器节流
+        //   （后台/最小化）就会反复被踢，左下角反复弹"断线 X s 后已重连"（实测 heartbeatClosed 每 8 s +1）。
         heartbeatMs: 1200,
         onWarn: (m, d) => console.warn(`[ws] ${m}`, d ?? ''),
       })

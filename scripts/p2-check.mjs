@@ -123,8 +123,8 @@ function collectEvents() {
       seen.push({ type: m.type, data: m.data, at: Date.now() })
     } catch { /* 非 JSON 忽略 */ }
   })
-  // ★ 必须自己保活：hub 的判死口径是"连续 3 次心跳未见"，默认 1.5 s × 3 ≈ 4.5 s。
-  //   一条只收不发的连接会在 4.5 s 后被踢掉 —— 启动加载要跑十几秒，不保活就一条都收不全。
+  // ★ 必须自己保活：hub 的判死口径是"连续 3 次心跳未见"，默认 1.5 s x 3 = 4.5 s（2026-09-20 起已调回 15 s x 4 = 60 s）。
+  //   一条只收不发的连接会在 4.5 s 后被踢掉（2026-09-20 起为 60 s） —— 启动加载要跑十几秒，不保活就一条都收不全。
   const ping = setInterval(() => {
     if (sock.readyState !== 1) return
     try {

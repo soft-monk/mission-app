@@ -477,7 +477,7 @@ pwsh -File scripts\acceptance.ps1                     # 结构守卫 + 构建 + 
 
 **写新脚本请照抄这几条纪律**（都踩过）：断言里**打印实测原值**而不是"应为"；
 **拿不到的数据一律留空 + 点名原因**，MUST NOT 编数值、MUST NOT 显示成 0；
-WS 采集器**先建连接再发 HTTP**（Node 的 WebSocket 与 fetch 共用 dispatcher）且**自己发心跳保活**（hub 4.5 s 判死）；
+WS 采集器**先建连接再发 HTTP**（Node 的 WebSocket 与 fetch 共用 dispatcher）且**自己发心跳保活**（hub 判死窗 60 s，2026-09-20 起；此前 4.5 s）；
 截图前 `Emulation.setDeviceMetricsOverride(1280x800)`；
 **CDP 的 page target 必须先 `Page.bringToFront`** —— 后台 tab 的 `requestAnimationFrame` 会被节流到几乎不触发，
 而 MapLibre v4 的样式/数据源装载走的就是 rAF 调度，表现为"地图容器在、canvas 在，但 `getStyle().sources` 为空、
@@ -495,7 +495,7 @@ WS 采集器**先建连接再发 HTTP**（Node 的 WebSocket 与 fetch 共用 di
 → Windows 控制台默认代码页 936，而程序输出 UTF-8。宿主启动时已切 UTF-8；旧二进制请重构。终端字体也要支持中文。
 
 **3) 页面能开，但切屏慢半拍、`/stats` 里 `clientCount` 恒为 0**
-→ 前端事件腿被判死踢掉（hub 判死窗 1.5 s × 3 ≈ **4.5 s**，客户端心跳必须更密）。已在 `apps/web/src/flow/useFlow.ts` 用 `heartbeatMs: 1200` 对齐。
+→ 前端事件腿被判死踢掉（2026-09-20 之前的口径：hub 判死窗 1.5 s x 3 = 4.5 s；**现已调回 60 s**，见 `ma/hub_engine.cc`，页面在后台被节流也不会再反复被踢）。当时在 `apps/web/src/flow/useFlow.ts` 用 `heartbeatMs: 1200` 对齐。
 
 **4) 第二条实例起来了但收不到数据（`packets=0`、启动加载卡在 50%）**
 → 两条实例都绑了同一个 UDP 接入端口（默认 `45500`），Windows 只把报文投给**先绑定**的那个。

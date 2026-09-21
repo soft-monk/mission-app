@@ -104,16 +104,19 @@ export const DEFAULT_MAP_STYLE: MapStyleConfig = {
    * 字段与 `data/scenario-1/map-style.json` 的 `controls` 段**逐字段一致**（两份同步改）。
    */
   controls: {
-    // 鼠标经纬度：**左下角最下一条**，距地图下沿 15px（gap 12 + offset 3）。
-    // 用户 2026-09-18 第 1 条："经纬度与缩放比例尺，都放在左下角，比例尺在经纬度上方，
-    // 排为一列，距离下方移动到 15 像素点，现在看不到"。
-    coords: { show: true, anchor: 'bottom-left', offset: [0, 18] },
+    // 鼠标经纬度：左下角最下一条。★ 2026-09-19 用户："比例尺与鼠标坐标这两个控件再往上移动 5px，
+    // 并且两者之间要有 5px 间隔" → 距底由 offset 18 抬到 23（往上 5px）。
+    coords: { show: true, anchor: 'bottom-left', offset: [0, 28] },
     // 比例尺：**左下角、经纬度上方**，与经纬度排成一列。
     // 经纬度那条高约 33px，所以比例尺从底边往上让 15 + 33 + 6（间距）≈ 54px。
     // 实测：经纬度条高 33px、距底 15px → 它的上沿在 48px；比例尺底边要 ≥ 48+6=54 才不叠。
     // 原生控件的 offset 走 margin（见 map-2d pplyNativeOffset），实测 offset 42 → 距底 42px，
     // 所以这里给 54（实测会落在 54px 处），与经纬度之间正好留 6px。
-    scale: { show: true, anchor: 'bottom-left', offset: [0, 69] },
+    // 比例尺：左下角、经纬度上方，与经纬度排成一列。
+    // 实测：**原生控件的 `offset` 就是"距底像素"**（不是 12+offset），所以
+    // 经纬度条距底 35px、高 33px → 上沿在 **68px**；比例尺底边取 68 + **5（两者间隔）= 73px**
+    // → `offset: [0, 73]`（实测两者间隔正好 5px）。下面几行是 2026-09-18 的旧说明，数字已作废。
+    scale: { show: true, anchor: 'bottom-left', offset: [0, 83] },
     // 指北针：**默认关**。模块缺省把它放在右上角，而本应用每个地图屏的右上角都是右栏面板，
     // 开了会被面板盖住（实测）。要用的话把 show 改 true 并给一个不被遮挡的锚点。
     compass: { show: false, anchor: 'bottom-left', offset: [0, 96] },

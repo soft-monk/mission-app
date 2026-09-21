@@ -22,7 +22,8 @@
 //
 // ⚠️ 这个文件用编辑工具改，**不要过 PowerShell 的 Get-Content/Set-Content**：无 BOM 的 .ts
 //    会被按 ANSI 读，中文变乱码、引号还会被吃掉（本项目已因此损坏过多次）。
-import { draw, MapDraw, mapInstance } from 'map-2d'
+import { distanceMeters, draw, MapDraw, mapInstance } from 'map-2d'
+import { DEFAULT_SCENARIO } from './scenario'
 
 /**
  * 计划里的一条图形（kind 决定用哪个绘制函数）
@@ -68,6 +69,125 @@ const SAVABLE_KINDS = ['area', 'shape', 'route', 'annulus', 'symbol', 'label'] a
 
 /** 「清空全部/打开计划」时**保留**的种类（遥测驱动，删了下一拍就回来） */
 const KEEP_ON_CLEAR = ['drone', 'track', 'target', 'link', 'scan', 'pulse', 'cluster'] as const
+
+// ---------------------------------------------------------------- 「家视角」（2026-09-20 需求）
+//
+// 需求原话："读取文件，或者手动绘制时，直接复位到任意一个元素视角去；如果没有，空白时候
+// 点击复位，是默认去一个配置位置就行。"
+//
+// 口径（三条）：
+//   1. 打开计划后**自动**去这个家；复位按钮也回这个家（所有屏的复位都走这里）。
+//   2. 打开计划**不看文件里的 `view`**：保存计划总会写它（`serializePlan`），听它的这条规则就不生效。
+//   3. 元素是**现算**的（点复位那一刻看图上有啥），所以"刚手画完再点复位"会去手画的那个。
+//
+// "元素"只认**有坐标的**图元：点类用它自己的经纬度；线 / 面类用顶点外接框中心。
+// **`drone` / `track` 不算**，那是遥测那一套，与"读取 / 手绘"的元素分开。
+
+/** 一个"家"：中心 + zoom（zoom 由"比例尺显示 5 km"反算出来） */
+export interface HomeView {
+  lng: number
+  lat: number
+  zoom: number
+}
+
+/** 找元素时的种类顺序（每类内部按地图上的列表顺序） */
+const HOME_KINDS = [
+  ...SAVABLE_KINDS,
+  'target', 'pulse', 'cluster', 'scan', 'link',
+] as const
+
+/** 比例尺条宽度：与 map-2d `core/controls.ts` 的 `ScaleControl({ maxWidth: 120 })` 对齐 */
+const SCALE_BAR_PX = 120
+/** 要的比例尺档位（km）：需求方要的是左下角显示 "5 km" */
+const SCALE_TARGET_KM = 5
+
+/** 从一条图元里取顶点（各 kind 字段不同：polygon / points / ring / lng+lat） */
+function pointsOfItem(item: unknown): [number, number][] {
+  if (!item || typeof item !== 'object') return []
+  const o = item as Record<string, unknown>
+  for (const key of ['polygon', 'points', 'ring']) {
+    const arr = o[key]
+    if (!Array.isArray(arr) || !arr.length) continue
+    const out: [number, number][] = []
+    for (const p of arr) {
+      if (Array.isArray(p) && typeof p[0] === 'number' && typeof p[1] === 'number') out.push([p[0], p[1]])
+    }
+    if (out.length) return out
+  }
+  const lng = o.lng
+  const lat = o.lat
+  if (typeof lng === 'number' && typeof lat === 'number' && Number.isFinite(lng) && Number.isFinite(lat)) return [[lng, lat]]
+  return []
+}
+
+/** 顶点外接框中心 */
+function centerOfPoints(pts: [number, number][]): { lng: number; lat: number } | null {
+  if (!pts.length) return null
+  let minX = pts[0][0], maxX = pts[0][0], minY = pts[0][1], maxY = pts[0][1]
+  for (const [x, y] of pts) {
+    if (x < minX) minX = x
+    if (x > maxX) maxX = x
+    if (y < minY) minY = y
+    if (y > maxY) maxY = y
+  }
+  return { lng: (minX + maxX) / 2, lat: (minY + maxY) / 2 }
+}
+
+/** **图上第一个可定位的元素**（按 `HOME_KINDS` 顺序、每类内按列表顺序）；没有就 null */
+export function firstLocatableOnMap(): { lng: number; lat: number } | null {
+  for (const kind of HOME_KINDS) {
+    let items: unknown[] = []
+    try {
+      items = (MapDraw.list(kind as never) ?? []) as unknown as unknown[]
+    } catch {
+      continue
+    }
+    for (const it of items) {
+      const c = centerOfPoints(pointsOfItem(it))
+      if (c) return c
+    }
+  }
+  return null
+}
+
+/**
+ * **让左下角比例尺显示 5 km 的 zoom**（按地图自身投影反算，不写死纬度公式）。
+ *
+ * 为什么目标取 1.1 倍：maplibre 的比例尺是"取不超过条宽的最大整数档"，
+ * 把 120 px 定到 5.5 km 能让它稳稳落在 "5 km" 档（而不是掉到 2 km / 3 km）。
+ * 验收口径就是**读左下角那行文字等于 "5 km"**（见 scripts/.home-probe.mjs）。
+ */
+function zoomForScale5km(): number | null {
+  const map = mapInstance.current
+  if (!map) return null
+  const canvas = map.getCanvas()
+  const w = Math.min(canvas.clientWidth || SCALE_BAR_PX, SCALE_BAR_PX)
+  const y = (canvas.clientHeight || 0) / 2
+  const a = map.unproject([0, y])
+  const b = map.unproject([w, y])
+  const nowKm = distanceMeters([a.lng, a.lat], [b.lng, b.lat]) / 1000
+  if (!(nowKm > 0)) return null
+  return map.getZoom() + Math.log2(nowKm / (SCALE_TARGET_KM * 1.1))
+}
+
+/** 图上有可定位元素，就是"第一个元素 + 比例尺 5 km"；没有就 null */
+export function currentHomeView(): HomeView | null {
+  const c = firstLocatableOnMap()
+  if (!c) return null
+  const z = zoomForScale5km()
+  if (z === null) return null
+  return { lng: c.lng, lat: c.lat, zoom: z }
+}
+
+/** 配置里的默认位置（图上什么都没有时的家） */
+export function defaultHomeView(): HomeView {
+  return { lng: DEFAULT_SCENARIO.center[0], lat: DEFAULT_SCENARIO.center[1], zoom: DEFAULT_SCENARIO.zoom }
+}
+
+/** 复位 / 打开计划都走它：图上的元素优先，空白时回配置默认位置 */
+export function homeView(): HomeView {
+  return currentHomeView() ?? defaultHomeView()
+}
 
 /** 计划图元的 id 前缀 —— 打开新计划时**只清自己的**，不动用户手画的东西 */
 const PLAN_PREFIX = 'PLAN:'
@@ -133,7 +253,7 @@ export function clearPlan(): void {
  * 两种格式都认：`primitives`（整图快照，保存计划产出的）与 `items`（简写，示例计划文件用）。
  * @returns 画成功的条数与失败明细（失败**如实报出**，不静默跳过）
  */
-export function applyPlan(plan: PlanFile): { drawn: number; failed: string[]; cleared: number } {
+export function applyPlan(plan: PlanFile, opts?: { applyFileView?: boolean }): { drawn: number; failed: string[]; cleared: number } {
   // ① 先清空（需求方要求）
   const cleared = clearAllPrimitives()
 
@@ -183,8 +303,10 @@ export function applyPlan(plan: PlanFile): { drawn: number; failed: string[]; cl
   })
 
   // ④ 视角：文件里带了就跳过去
+  // 2026-09-20：**默认仍然跳**（保持老行为）；打开计划的调用方现在传 `applyFileView: false`，
+  //   改由"家视角"决定看哪儿（第一个元素 + 比例尺 5 km）保存计划总会写 view，听它的这条新规则就永远不生效。
   const v = plan.view
-  if (v?.center && Array.isArray(v.center) && typeof v.zoom === 'number') {
+  if (opts?.applyFileView !== false && v?.center && Array.isArray(v.center) && typeof v.zoom === 'number') {
     mapInstance.current?.jumpTo({ center: v.center, zoom: v.zoom })
   }
   return { drawn: drawn + (plan.primitives ? countSnapshot(plan.primitives) : 0), failed, cleared }

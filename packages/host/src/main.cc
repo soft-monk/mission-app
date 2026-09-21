@@ -541,8 +541,9 @@ int main(int argc, char** argv) {
 
     // ---- 广播腿：WS 路由的三条路径 + /stats 的实时读数
     //
-    // 心跳节拍是**为了验收可观测**刻意调短的：默认 15 s × 4 = 60 s 判死，
-    // 验收等不起；这里 1.5 s × 3 = 4.5 s 无消息判死，维护线程每秒扫一次。
+    // 心跳节拍（2026-09-20 起）：**15 s 心跳 x 4 = 60 s 判死**（协议默认量级，见 hub_engine.cc 的说明）。
+    // 此前为验收可观测刻意压到 1.5 s x 3 = 4.5 s，页面在后台被浏览器节流就会被反复踢、反复弹提示。
+    // 维护线程仍每秒扫一次（扫描节拍与判死窗无关）。
     ma::DrogonTransportOptions transportOptions;
     transportOptions.perConnectionQueueLimit = 512;
     transportOptions.maintenanceIntervalMs = 1000;

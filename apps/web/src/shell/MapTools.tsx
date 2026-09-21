@@ -26,6 +26,40 @@ import { C } from '../theme'
 import { PrimitivePanel } from './PrimitivePanel'
 import type { UseFlow } from '../flow/useFlow'
 import { readCompose, replyText, useVerbOnce } from '../flow/useSituation'
+import { homeView } from '../plan-file'
+
+/** 二级条目：菜单里真正"点一下要画 / 要做的那一条"。 */
+export interface SubmenuLeaf {
+  key: string
+  label: string
+  note?: string
+  /**
+   * 绘制模式（「量算」的测距 / 测面才有）。带它就由**工具条自己**切 `map-2d` 的绘制模式；
+   * 不带就交给所在屏的 `onLocal`（业务图元 / 计划）。
+   */
+  mode?: DrawMode
+}
+
+/**
+ * 子菜单的一级项。
+ *
+ * 带 `items` 的：它是**分类**，点一下在右列展开二级（「新建」= 点 / 线 / 面 / 标绘）；
+ * 不带 `items` 的：它就是可直接执行的条目（「计划」= 打开 / 保存 / 规划航线，老的一级菜单）。
+ */
+export interface SubmenuItem extends SubmenuLeaf {
+  /** 有它 = 这一项是**分类**（点它展开二级）；没有 = 它自己就是可执行条目（例：量算的测距 / 测面） */
+  items?: SubmenuLeaf[]
+}
+
+/**
+ * 一个工具格里的**可执行条目**（点一下真干事的那些）：
+ * 扁平菜单（量算 / 视图 / 计划）= 一级项**自己**；
+ * 两级菜单（新建）= 各分类下的**二级项**。
+ * 「当前工具」提示、选中态、二级条目高亮都走这一个口径，少一处就会漏（2026-09-19 实测踩到过）。
+ */
+function leavesOf(t: MapToolSpec): SubmenuLeaf[] {
+  return (t.submenu ?? []).flatMap((g) => (g.items?.length ? g.items : [g]))
+}
 
 /** 工具条上的一格（**版式**来自参考图：键位与顺序；可用性来自 `view.compose`）。 */
 export interface MapToolSpec {
@@ -41,6 +75,12 @@ export interface MapToolSpec {
   key: string
   /** 键面文字（逐字照图） */
   label: string
+  /**
+   * **图标键**（不给就用 `id` / `key`）。
+   * 用途：同一格两种形态时（例：选择 = 浏览的手掌 / 编辑的箭头），testid 要保持稳定，
+   * 只换图标  2026-09-20 需求。
+   */
+  glyph?: string
   /** 右下角小字（图上"3D"下面的"2D/3D"就是它） */
   sub?: string
   /** 该格对应的绘制模式（量算/手绘类才有） */
@@ -72,7 +112,7 @@ export interface MapToolSpec {
    * 用**子菜单**的方式来确认我到底想画什么"。
    * 带子菜单的格子点一下**先弹菜单**（不直接执行），选中某一项再走 `onLocal(子项key)`。
    */
-  submenu?: { key: string; label: string; note?: string }[]
+  submenu?: SubmenuItem[]
 }
 
 /** 规则包 key → map-2d 的 `MapToolKey`（两套命名不同，这里是唯一的翻译表）。 */
@@ -95,6 +135,8 @@ export function ToolGlyph({ k, size = 16 }: { k: string; size?: number }) {
   }
   switch (k) {
     case 'select': return <svg {...common}><path d="M3 2l10 5-4 1.4L7.6 13z" /></svg>
+    // 浏览模式（拖地图）用手掌图标：2026-09-20 新增
+    case 'pan': return <svg {...common}><path d="M5 8V5.2a1.2 1.2 0 0 1 2.4 0V7m0-.6V4.4a1.2 1.2 0 0 1 2.4 0V7m0-.4V5.2a1.2 1.2 0 0 1 2.4 0V9.6c0 2.6-1.6 4.4-4.2 4.4-2.2 0-3.4-1-4.2-2.6L3.4 9.4a1.1 1.1 0 0 1 1.9-1.1L6 9.4" /></svg>
     case 'measure': return <svg {...common}><path d="M2 11l9-9 3 3-9 9z" /><path d="M5 8l1.6 1.6M7.5 5.5L9 7" /></svg>
     case 'measure-area': return <svg {...common}><path d="M2.5 4.5l5-2 6 3-1 6-6 2-4-3z" /><path d="M5 9.5l2-2 2 1.5" /></svg>
     case 'scene': return <svg {...common}><rect x='2.2' y='3.4' width='11.6' height='9.2' rx='1.2' /><path d='M2.2 6.6h11.6M5.6 3.4v3.2M10.4 3.4v3.2' /></svg>
@@ -146,21 +188,24 @@ export function useMapToolState(flow: UseFlow) {
  *   · 图层     → `useMapUiStore.toggleLayersPanel()`（面板是本应用的 `PrimitivePanel`：逐图元显隐）
  *   · 清屏/全屏 → map-2d 的 `clearMode` / 浏览器全屏 API（与模块工具条同一套语义）
  */
-export function MapToolbar({ items, state, testid, style, onLocal, activeKeys }: {
+export function MapToolbar({ items, state, testid, style, onLocal, activeKeys, onMenuOpened, closeSignal }: {
   items: MapToolSpec[]
   state: ReturnType<typeof useMapToolState>
   testid: string
   style?: CSSProperties
-  /**
-   * **本屏自己处理的工具格**（2026-09-18 新增）。
-   *
-   * `layers` / `clear` 这类工具的行为归 map-2d 的 UI 状态管；而「场景」这种**应用级**面板
-   * 不该塞进地图模块的 store，所以由所在屏传一个回调下来自己开面板。
-   * 传了回调的 key 一眼可辨：`data-tool-active` 由本屏通过 `activeKeys` 提供。
-   */
   onLocal?: (key: string, active: boolean) => void
-  /** 由本屏提供"哪些本屏工具当前是选中的"（用于高亮；缺省全 false） */
   activeKeys?: Record<string, boolean>
+  /**
+   * **工具条这边"打开了一个窗口"**（子菜单 / 图层面板）时通知所在屏。
+   * 2026-09-20 需求："点击一个菜单，弹出该菜单的窗口，其他菜单的窗口都 hide" 
+   * 屏自己的面板（例：态势屏的【场景】）收到这个通知就把自己收起来。
+   */
+  onMenuOpened?: (key: string) => void
+  /**
+   * **所在屏打开了它自己的面板**时，把计数 +1  工具条据此关掉自己的子菜单与图层面板。
+   * 与 `onMenuOpened` 一起构成双向联动（菜单窗口互斥）。
+   */
+  closeSignal?: number
 }) {
   const drawMode = useInteraction((s) => s.mode)
   const setDrawMode = useInteraction((s) => s.setMode)
@@ -173,7 +218,7 @@ export function MapToolbar({ items, state, testid, style, onLocal, activeKeys }:
   const setLayersPanel = useMapUiStore((s) => s.setLayersPanel)
   const setActiveTool = useMapUiStore((s) => s.setActiveTool)
   /** 当前展开的子菜单（工具格的 key + 该格在工具条内的左偏移；null = 都没展开） */
-  const [openMenu, setOpenMenu] = useState<{ key: string; left: number } | null>(null)
+  const [openMenu, setOpenMenu] = useState<{ key: string; left: number; group?: string } | null>(null)
   /**
    * ★ 2026-09-18（需求方："在功能选择左侧，添加个可以收拢和展开的功能，功能菜单已经很长了"）：
    * **工具条收拢开关**，放在工具条**最左侧**。
@@ -192,6 +237,13 @@ export function MapToolbar({ items, state, testid, style, onLocal, activeKeys }:
       return next
     })
   }, [])
+  /** 2026-09-20 菜单窗口互斥的另一半：所在屏开了它自己的面板  把工具条这边的子菜单/图层面板收掉 */
+  useEffect(() => {
+    if (closeSignal === undefined) return
+    setOpenMenu(null)
+    setLayersPanel(false)
+  }, [closeSignal, setLayersPanel])
+
   /** 【图层】那一格在工具条内的左偏移（图元面板要挂到它正下方，与子菜单同一算法） */
   const [layersLeft, setLayersLeft] = useState(0)
   /** 工具条自身的 ref：用来把按钮的位置换算成"工具条内的左偏移" */
@@ -204,13 +256,22 @@ export function MapToolbar({ items, state, testid, style, onLocal, activeKeys }:
       const bar = barRef.current?.getBoundingClientRect()
       const b = btn?.getBoundingClientRect()
       const left = bar && b ? Math.max(0, Math.round(b.left - bar.left)) : 0
-      setOpenMenu((v) => (v?.key === t.key ? null : { key: t.key, left }))
+      // 2026-09-19：两级菜单（新建 / 点 / 线 / 面 / 标绘）默认展开**第一个分类**，
+      //   免得刚点开「新建」时右列是空的；扁平菜单（计划）没有分类，group 为 undefined。
+      const firstGroup = t.submenu.find((g) => g.items?.length)?.key
+      setOpenMenu((v) => (v?.key === t.key ? null : { key: t.key, left, group: firstGroup }))
+      // 2026-09-20 菜单窗口互斥：这次是"打开"（不是再点一下关掉）时，把别的窗口都收掉 
+      //   工具栏这边能直接管的：图层面板；屏自己的面板（例【场景】）走 onMenuOpened 通知。
+      if (openMenu?.key !== t.key) { setLayersPanel(false); onMenuOpened?.(t.key) }
       return
     }
     setOpenMenu(null)
     if (t.key === 'reset') {
-      // 复位视角：回到本场景的初始中心/缩放（宿主的默认视角来自 scenario.ts 的 DEFAULT_SCENARIO）
-      mapCommands.resetView()
+      // 复位视角（2026-09-20 新口径）：图上有可定位图元，就去"第一个元素 + 比例尺 5 km"；
+      //   图上一个都没有（空白地图），就去配置里的默认位置（scenario.ts 的 DEFAULT_SCENARIO）。
+      //   细节与三条口径见 plan-file.ts 的「家视角」段。
+      const h = homeView()
+      mapCommands.setView(h.lng, h.lat, h.zoom, 500)
       return
     }
     if (t.key === 'layers') {
@@ -220,6 +281,8 @@ export function MapToolbar({ items, state, testid, style, onLocal, activeKeys }:
       const b = btn?.getBoundingClientRect()
       setLayersLeft(bar && b ? Math.max(0, Math.round(b.left - bar.left)) : 0)
       toggleLayersPanel()
+      // 同上：这次是"打开图层面板"时通知所在屏把它的面板收起来（子菜单已在上面 setOpenMenu(null) 关掉）
+      if (!layersOpen) onMenuOpened?.('layers')
       return
     }
     if (t.key === 'clear') { setClearMode(!clearMode); return }
@@ -237,7 +300,43 @@ export function MapToolbar({ items, state, testid, style, onLocal, activeKeys }:
     if (m2) setActiveTool(m2)
     if (t.key === 'select') { setDrawMode('none'); setLayersPanel(false); return }
     if (t.mode) setDrawMode(drawMode === t.mode ? 'none' : t.mode)
-  }, [clearMode, drawMode, setActiveTool, setClearMode, setDrawMode, setLayersPanel, toggleLayersPanel, onLocal, activeKeys])
+  }, [clearMode, drawMode, setActiveTool, setClearMode, setDrawMode, setLayersPanel, toggleLayersPanel, onLocal, activeKeys, openMenu, layersOpen, onMenuOpened])
+
+  /**
+   * 二级条目此刻是不是"正在用"（判据与一级工具格**完全一致**：绘制模式 / 清屏模式 / 图层开合 / 模块 activeTool）。
+   *
+   * 为什么要有它：合并后「量算」「视图」自己不带 `mode`，选中态只能看二级条目，
+   * 否则原来"点测距后那一格高亮"的提示就丢了。
+   * 「新建」的业务条目不带 `mode`（走 `mapCommands.setGeometry`），本来就不参与高亮，与合并前一致。
+   */
+  const leafActive = useCallback((it: SubmenuLeaf): boolean => {
+    if (it.mode) return drawMode === it.mode
+    if (it.key === 'clear') return clearMode
+    if (it.key === 'layers') return layersOpen
+    const m2 = MAP2D_KEY[it.key]
+    return m2 ? activeTool === m2 : false
+  }, [drawMode, clearMode, layersOpen, activeTool])
+
+  /**
+   * **点二级条目**：先关菜单，再按条目类型执行。
+   *
+   * 为什么在这里分流（而不是一律丢给 `onLocal`）：「量算」的测距 / 测面就是 map-2d 的绘制模式，
+   * 「视图」的全屏 / 清屏 / 复位就是工具条自己的三个老行为，它们合并前各占一格、走的是上面的 `act()`；
+   * 合并后必须落回**同一套行为**，否则就成了"菜单点了没反应"。
+   * 其余条目（业务图元 / 计划）仍交给所在屏的 `onLocal`，与合并前一致。
+   */
+  const actLeaf = useCallback((it: SubmenuLeaf) => {
+    setOpenMenu(null)
+    if (it.mode) { setDrawMode(drawMode === it.mode ? 'none' : it.mode); return }
+    if (it.key === 'reset') { const h = homeView(); mapCommands.setView(h.lng, h.lat, h.zoom, 500); return }
+    if (it.key === 'clear') { setClearMode(!clearMode); return }
+    if (it.key === 'fullscreen') {
+      if (document.fullscreenElement) void document.exitFullscreen()
+      else void document.documentElement.requestFullscreen().catch(() => undefined)
+      return
+    }
+    onLocal?.(it.key, false)
+  }, [drawMode, clearMode, setClearMode, setDrawMode, onLocal])
 
   return (
     <>
@@ -260,10 +359,17 @@ export function MapToolbar({ items, state, testid, style, onLocal, activeKeys }:
           //   原来的高亮太轻（半透明蓝 + 淡边），看起来跟没选一样。现在：
           //   选中 = 实心蓝底 + 亮蓝描边 + 文字转亮 + 底部一条高亮短线，一眼能分辨。
           const m2 = MAP2D_KEY[t.key]
-          const active = t.key === 'clear'
-            ? clearMode
-            : ((activeKeys ?? {})[t.key] ?? (t.mode ? drawMode === t.mode
-              : (t.key === 'layers' ? layersOpen : (m2 ? activeTool === m2 : false))))
+          // 2026-09-19：合并成菜单的格子（新建 / 量算 / 视图）自己不带 `mode`，
+          //   选中态改看**它的二级条目**里有没有正在用的（例：正在测距时，「量算」高亮）。
+          // 2026-09-20（需求方："点击菜单没有出现选中态变蓝色"）：**菜单正开着**也算选中态；
+          //   同时保留原来的"里面某项正在用"（例：正在测距  量算蓝）。
+          const menuOpen = openMenu?.key === t.key
+          const active = t.submenu?.length
+            ? (menuOpen || ((activeKeys ?? {})[t.key] ?? leavesOf(t).some((it) => leafActive(it))))
+            : (t.key === 'clear'
+              ? clearMode
+              : ((activeKeys ?? {})[t.key] ?? (t.mode ? drawMode === t.mode
+                : (t.key === 'layers' ? layersOpen : (m2 ? activeTool === m2 : false)))))
           const title = on
             ? (t.mode ? `${t.label}：单击落点，双击 / Enter 结束，Esc 取消` : t.label)
             : `${t.label}（不可用）：${reason
@@ -289,37 +395,84 @@ export function MapToolbar({ items, state, testid, style, onLocal, activeKeys }:
                 fontWeight: active ? 600 : 400,
               }}
             >
-              <ToolGlyph k={t.id ?? t.key} size={15} />
+              <ToolGlyph k={t.glyph ?? t.id ?? t.key} size={15} />
               <span style={{ fontSize: 11.5 }}>{t.label}</span>
               {t.sub && <span style={{ fontSize: 9.5, color: on ? C.accentDim : C.unknown }}>{t.sub}</span>}
             </button>
           )
         })}
       </div>
-      {/* ---------------- 子菜单：点了【新建/区域/标绘】才弹，浮在工具条正下方 ----------------
-          用户第 1 条："用子菜单的方式来确认我到底想画什么"。
-          子项点中 → 回调 `onLocal(子项key)`，由所在屏决定是"进入拖画"还是"落点即创建"。 */}
+      {/* ---------------- 子菜单：点了【新建/量算/视图/计划】才弹，浮在工具条正下方 ----------------
+           - 两级（新建）：一级 = 分类（点 / 线 / 面 / 标绘），二级 = 这一类的条目；点二级条目才执行。
+           - 一级（量算 = 测距 / 测面，视图 = 全屏 / 清屏 / 复位，计划 = 打开 / 保存 / 规划航线）：点条目即执行。
+          条目点中后去哪：带 `mode` 的自己切绘制模式；全屏 / 清屏 / 复位的走工具条自己的老行为；
+          其余  回调 `onLocal(子项key)`，由所在屏决定是"进入拖画"还是"落点即创建"。 */}
       {openMenu && (() => {
         const t = items.find((x) => x.key === openMenu.key)
         if (!t?.submenu?.length) return null
-        // 挂在**被点那一格的正下方**；贴近右边缘时往回收，别跑出工具条外面
+        // 2026-09-19：一级项里只要有带 `items` 的，就按**两列**渲染（分类 | 该类条目）；
+        //   否则还是老的一列（「计划」那种扁平菜单）。
+        const nested = t.submenu.some((g) => g.items?.length)
+        const groupKey = openMenu.group ?? t.submenu[0]?.key
+        const group = nested ? t.submenu.find((g) => g.key === groupKey) : null
+        // 挂在**被点那一格的正下方**；贴近右边缘时往回收，别跑出工具条外面（两级菜单更宽）
         const barW = barRef.current?.getBoundingClientRect().width ?? 0
-        const left = barW > 0 ? Math.min(openMenu.left, Math.max(0, barW - 186)) : openMenu.left
+        const menuW = nested ? 300 : 186
+        const left = barW > 0 ? Math.min(openMenu.left, Math.max(0, barW - menuW)) : openMenu.left
         return (
-          <div data-testid={`${testid}-submenu`} style={{ ...submenuStyle, left: 12 + left }}>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
-              {t.submenu.map((it) => (
-                <button
-                  key={it.key}
-                  data-testid={`${testid}-sub-${it.key}`}
-                  title={it.note}
-                  onClick={() => { setOpenMenu(null); onLocal?.(it.key, false) }}
-                  style={submenuItem}
-                >
-                  {it.label}
-                </button>
-              ))}
-            </div>
+          <div
+            data-testid={`${testid}-submenu`}
+            data-submenu-levels={nested ? '2' : '1'}
+            style={{ ...submenuStyle, minWidth: nested ? 292 : 168, left: 12 + left }}
+          >
+            {nested ? (
+              <div style={{ display: 'flex', flexDirection: 'row', gap: 8, alignItems: 'flex-start' }}>
+                {/* 一级：分类。点一下  右列换成这一类的条目 */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 1, minWidth: 88 }}>
+                  {t.submenu.map((g) => (
+                    <button
+                      key={g.key}
+                      data-testid={`${testid}-cat-${g.key}`}
+                      data-cat={g.key}
+                      data-cat-open={g.key === groupKey ? '1' : '0'}
+                      onClick={() => setOpenMenu((v) => (v ? { ...v, group: g.key } : v))}
+                      style={g.key === groupKey ? { ...submenuItem, ...submenuCatOn } : submenuItem}
+                    >{g.label}</button>
+                  ))}
+                </div>
+                {/* 二级：这一类的条目。点中  关菜单 + 执行（绘制模式 / 全屏 / 交给本屏） */}
+                <div style={{
+                  display: 'flex', flexDirection: 'column', gap: 1, minWidth: 176,
+                  maxHeight: 380, overflowY: 'auto',
+                }}>
+                  {(group?.items ?? []).map((it) => (
+                    <button
+                      key={it.key}
+                      data-testid={`${testid}-sub-${it.key}`}
+                      data-sub-active={leafActive(it) ? '1' : '0'}
+                      title={it.note}
+                      onClick={() => actLeaf(it)}
+                      style={leafActive(it) ? { ...submenuItem, ...submenuItemOn } : submenuItem}
+                    >{it.label}</button>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+                {t.submenu.map((it) => (
+                  <button
+                    key={it.key}
+                    data-testid={`${testid}-sub-${it.key}`}
+                    data-sub-active={leafActive(it) ? '1' : '0'}
+                    title={it.note}
+                    onClick={() => actLeaf(it)}
+                    style={leafActive(it) ? { ...submenuItem, ...submenuItemOn } : submenuItem}
+                  >
+                    {it.label}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
         )
       })()}
@@ -359,12 +512,21 @@ export function ToolModeNote({ items, note, style }: {
     if (t.key === 'scene') return false           // 「场景」的选中由它自己的面板开合表达，不再弹一行字
     return MAP2D_KEY[t.key] === activeTool
   })
-  if (!cur && !note) return null
+  // 2026-09-19：合并成菜单后，"当前工具"常常落在**二级条目**上（正在测距 / 正在清屏），
+  //   所以一级格找不到时，再翻一遍各菜单的二级条目：判据与一级格一致，只是一并看进去。
+  //   注意 `!!MAP2D_KEY[it.key]`：叶子键（plan-open / biz:xxx）不在翻译表里，不能拿 undefined 去比，
+  //   否则会和"还没点过任何工具"的 activeTool 撞上、误报一行提示。
+  const leaf = items
+    .flatMap((t) => leavesOf(t))
+    .find((it) => (it.mode ? it.mode === drawMode
+      : (it.key === 'clear' ? clearMode : (!!MAP2D_KEY[it.key] && MAP2D_KEY[it.key] === activeTool))))
+  const one = cur ?? leaf
+  if (!one && !note) return null
   return (
     <div data-testid="map-tool-note" style={{ ...noteStyle, ...style }}>
-      {cur && <>当前工具：<b style={{ color: C.accent }}>{cur.label}</b>
-        {cur.mode ? '（单击落点，双击 / Enter 结束，Esc 退出）' : ''}</>}
-      {cur && note ? '　' : ''}
+      {one && <>当前工具：<b style={{ color: C.accent }}>{one.label}</b>
+        {one.mode ? '（单击落点，双击 / Enter 结束，Esc 退出）' : ''}</>}
+      {one && note ? '　' : ''}
       {note}
     </div>
   )
@@ -446,6 +608,15 @@ const submenuItem: CSSProperties = {
   textAlign: 'left', fontSize: 12, padding: '5px 8px', borderRadius: 5, cursor: 'pointer',
   background: 'transparent', border: '1px solid transparent', color: C.text,
   font: 'inherit', lineHeight: 1.3, whiteSpace: 'nowrap',
+}
+
+/** 一级分类：**当前展开的那一类**（配色与工具格的选中态同一套，一眼能对上） */
+const submenuCatOn: CSSProperties = {
+  background: 'rgba(37,99,235,.38)', border: '1px solid #5fb0ff', color: '#eaf6ff', fontWeight: 600,
+}
+/** 二级条目：**当前正在用的那一条**（例：正在测距） */
+const submenuItemOn: CSSProperties = {
+  background: 'linear-gradient(180deg,#2563eb,#1d4ed8)', border: '1px solid #5fb0ff', color: '#eaf6ff',
 }
 
 /** 供各屏按图声明工具条（键位/顺序/文字逐字照图；可用性一律由规则包给）。 */

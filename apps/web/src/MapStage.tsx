@@ -25,6 +25,7 @@ import { DEFAULT_MAP_STYLE, controlSpecsOf, droneColorOf, groupColorOf, loadMapS
 import { DEFAULT_SCENARIO, drawScenario } from './scenario'
 import { DEFAULT_WS_URL, TelemetryStore, connectTelemetry, type LinkState } from './telemetry'
 import { uavTypeCN } from './flow/useSituation'
+import { pickModeNow } from './pick-mode'
 
 /** 瓦片模板缺省值（与 config.json 的 tiles.template 一致；运行时以宿主 /runtime-config 为准） */
 const DEFAULT_TILE_TEMPLATE = '/tiles/{z}/{x}/{y}.jpg'
@@ -33,6 +34,9 @@ const DEFAULT_TILE_TEMPLATE = '/tiles/{z}/{x}/{y}.jpg'
 const FLUSH_INTERVAL_MS = 120
 /** 超过这么久没有新数据就提示"数据可能已过期" */
 const STALE_AFTER_MS = 5000
+
+// 2026-09-20：原先这里有个 `MAP_PICK_DELETE` 常量（2026-09-19 用来整条屏蔽"点选 + 删除"）。
+// 现在改成**按"选择模式"决定**（浏览 / 编辑，见 `./pick-mode`）常量已移除，行为见下面那个 effect。
 
 interface EngineRow { linked: boolean; instantiated: boolean; ok: boolean; note?: string }
 interface RuntimeConfig {
@@ -234,17 +238,45 @@ export function MapStage({ phase, bottomBar, debug = false }: {
   }, [])
 
   // ---- 装配信息（瓦片模板 + 各引擎是否就绪）----
-  // ★ 2026-09-18：注册"用户按了 Delete"的回调 —— 弹确认条，确认后才调 `deleteSelection()`。
+  /**
+   * **点图元  选中/高亮  编辑**（2026-09-20 需求："选择按钮两个状态：浏览 / 编辑"）。
+   *
+   *  **浏览**（默认）：模块那边"点图元即选中"照旧发生，但这里**一收到就立刻取消** 
+   *   视觉与行为都是"纯看图"（同一条同步链里完成，浏览器不会画出中间那一帧高亮）。
+   *  **编辑**：保留选中（虚线高亮），并让模块进入**编辑态**（顶点手柄 / 拖顶点 / 拖整块 / 吸附）；
+   *   此时按 Delete 才弹确认条（确认后 `deleteSelection()`）。
+   *  点空白处取消选中时：顺手退出编辑态（否则手柄会留在屏幕上）。
+   *
+   * 历史：2026-09-19 需求方曾要求"点图元完全没反应（纯看图）"，当时用一个常量把整条链屏蔽；
+   *      现在改成**按模式**，常量不再需要。
+   */
   useEffect(() => {
     mapCommands.onDeleteRequest((sel) => {
+      if (pickModeNow() !== 'edit') return          // 浏览模式：Delete 不删任何东西
       // 显示名取图元自己的文本/名字，没有就退回 id（面板里也是这么显示的）
       const items = MapDraw.list(sel.kind as never) as unknown as { id?: string; text?: string; label?: string; name?: string }[]
       const it = items.find((x) => x?.id === sel.id)
       const label = it?.text || it?.label || it?.name || sel.id
       setPendingDelete({ kind: sel.kind, id: sel.id, label })
     })
-    // ★ 2026-09-18：点地图空白处会取消选中 → 确认条也要跟着收起（不然它会挂在没有选中对象的画面上）
-    const offSel = mapCommands.onSelectionChange((sel) => { if (!sel) setPendingDelete(null) })
+    const offSel = mapCommands.onSelectionChange((sel) => {
+      if (!sel) {
+        // 点地图空白处：收确认条 + 退出编辑态
+        setPendingDelete(null)
+        if (pickModeNow() === 'edit') mapCommands.finishEdit()
+        return
+      }
+      if (pickModeNow() === 'browse') mapCommands.clearSelection()   // 浏览：点图元没有任何反应
+      else {
+        // 编辑模式：**只有在没画东西的时候**才进编辑态。
+        // 为什么：画多点图形（线/面）时，中途点到已有图元会走"选中  进编辑"，
+        // 而 `startEdit()` 会把正在画的半成品取消掉（实测：面根本画不出来）。
+        const st = useInteraction.getState()
+        const drawing = !!st.geo || st.mode !== 'none'
+        if (drawing) mapCommands.clearSelection()
+        else mapCommands.editPrimitive(sel.kind, sel.id)             // 可拖顶点 / 拖整块
+      }
+    })
     return () => { mapCommands.onDeleteRequest(null); offSel() }
   }, [])
 
