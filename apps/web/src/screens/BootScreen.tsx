@@ -67,7 +67,7 @@ export function BootScreen({ state, onStart, running, onEnterNext }: {
    *
    * 判据刻意收得很窄：**只在"总进度还是 0、一个模块都没动过、也不在跑"时才重发**。
    * 这样既能救回被作废的那一轮，又不会在"某个模块本来就绪不了"（那时进度 > 0，
-   * 例如 80%）的情况下把 30 秒的启动反复重跑。最多重发 3 次，之后交给屏上的【重新加载】。
+   * 例如 80%）的情况下把整轮启动反复重跑。最多重发 3 次，之后交给屏上的【重新加载】。
    */
   const retries = useRef(0)
   const overall0 = boot.progress?.overall ?? boot.overall ?? 0

@@ -20,7 +20,7 @@
 //   产品屏一律 `debug={false}`（它属于开发自证，不该出现在交付界面上）；
 //   `?stage=map` 排障后门传 `debug` 保留原始信息条。
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
-import { CoordReadout, DrawLayer, MapDraw, MapView, draw, mapCommands, mapInstance, useInteraction, type MapData } from 'map-2d'
+import { CoordReadout, DrawLayer, MapDraw, MapView, draftNow, draw, mapCommands, mapInstance, useInteraction, type MapData } from 'map-2d'
 import { DEFAULT_MAP_STYLE, controlSpecsOf, droneColorOf, groupColorOf, loadMapStyle, trackStyleOf } from './map-style'
 import { DEFAULT_SCENARIO, drawScenario } from './scenario'
 import { DEFAULT_WS_URL, TelemetryStore, connectTelemetry, type LinkState } from './telemetry'
@@ -271,8 +271,10 @@ export function MapStage({ phase, bottomBar, debug = false }: {
         // 编辑模式：**只有在没画东西的时候**才进编辑态。
         // 为什么：画多点图形（线/面）时，中途点到已有图元会走"选中  进编辑"，
         // 而 `startEdit()` 会把正在画的半成品取消掉（实测：面根本画不出来）。
+        // ★ 2026-09-21：**草稿态也算"正在画"** —— 合并框开着的时候（收笔已发生、还没确认），
+        //   点图元若进了编辑态，就会把草稿的手柄抢掉（需求要的是"草稿态手柄亮着、框开着"）。
         const st = useInteraction.getState()
-        const drawing = !!st.geo || st.mode !== 'none'
+        const drawing = !!st.geo || st.mode !== 'none' || !!draftNow()
         if (drawing) mapCommands.clearSelection()
         else mapCommands.editPrimitive(sel.kind, sel.id)             // 可拖顶点 / 拖整块
       }

@@ -38,6 +38,15 @@ export interface SubmenuLeaf {
    * 不带就交给所在屏的 `onLocal`（业务图元 / 计划）。
    */
   mode?: DrawMode
+  /**
+   * **第三级**（2026-09-21 需求："把之前的任务区变成二级菜单，点击后出现任务区（手动点位）/
+   * 任务区（自动长宽）"）。
+   *
+   * 带它的二级条目**自己不再执行**，点一下在最右侧展开第三列（两种模式）；
+   * 真正执行的是第三列里的条目（走同一条 `onLocal` 路由）。
+   * 例：`任务区` → [`任务区（手动点位）`, `任务区（自动长宽）`]。
+   */
+  items?: SubmenuLeaf[]
 }
 
 /**
@@ -54,11 +63,12 @@ export interface SubmenuItem extends SubmenuLeaf {
 /**
  * 一个工具格里的**可执行条目**（点一下真干事的那些）：
  * 扁平菜单（量算 / 视图 / 计划）= 一级项**自己**；
- * 两级菜单（新建）= 各分类下的**二级项**。
- * 「当前工具」提示、选中态、二级条目高亮都走这一个口径，少一处就会漏（2026-09-19 实测踩到过）。
+ * 两级菜单（新建）= 各分类下的**二级项**；
+ * ★ 2026-09-21：二级项若自己带 `items`（三级菜单），**真正可执行的是三级项** ——
+ *   这里要一路摊平到第三级，否则"当前工具"提示与条目高亮会认不出它们（历史注释就写着"少一处就会漏"）。
  */
 function leavesOf(t: MapToolSpec): SubmenuLeaf[] {
-  return (t.submenu ?? []).flatMap((g) => (g.items?.length ? g.items : [g]))
+  return (t.submenu ?? []).flatMap((g) => (g.items?.length ? g.items.flatMap((it) => (it.items?.length ? it.items : [it])) : [g]))
 }
 
 /** 工具条上的一格（**版式**来自参考图：键位与顺序；可用性来自 `view.compose`）。 */
@@ -97,6 +107,21 @@ export interface MapToolSpec {
    * 左上那条**工具条**，所以把它变成工具条上的一格。
    */
   always?: boolean
+  /**
+   * **本屏强制禁用这一格**（2026-09-21 新增）。
+   *
+   * 为什么需要它：`always` / 规则包两条路都管不了"按界面模式禁用"这件事 ——
+   * 本屏要求"浏览态禁用【新建】"，而规则包 `view.compose` 对 `create` 的声明是
+   * `enabled: true, state: available`（工具本身没问题，是**此刻这个界面状态**不让用），
+   * 所以不能借规则包来判灰。这个字段把决定权明确交回给所在屏。
+   *
+   * 与 `always` 的关系：`disabled` **优先**（先看它，再谈 `always` 与规则包）。
+   * 表现与规则包判灰**完全一致**：`opacity .42` + `not-allowed` + `disabled` + 点不动，
+   * `title` 显示 `disabledReason`（不写就沿用现有那句"规则包未声明"）。
+   */
+  disabled?: boolean
+  /** 上面那个禁用位的原因（写进 `title`，如实说明"为什么现在不能用"） */
+  disabledReason?: string
   /**
    * **本屏自己处理这一格**（2026-09-18 新增）：点了不走地图模块的行为，而是交给所在屏的
    * `MapToolbar.onLocal` 回调（`scene` 就是这种 —— 它开的是应用级面板，不是地图能力）。
@@ -218,7 +243,7 @@ export function MapToolbar({ items, state, testid, style, onLocal, activeKeys, o
   const setLayersPanel = useMapUiStore((s) => s.setLayersPanel)
   const setActiveTool = useMapUiStore((s) => s.setActiveTool)
   /** 当前展开的子菜单（工具格的 key + 该格在工具条内的左偏移；null = 都没展开） */
-  const [openMenu, setOpenMenu] = useState<{ key: string; left: number; group?: string } | null>(null)
+  const [openMenu, setOpenMenu] = useState<{ key: string; left: number; group?: string; sub?: string } | null>(null)
   /**
    * ★ 2026-09-18（需求方："在功能选择左侧，添加个可以收拢和展开的功能，功能菜单已经很长了"）：
    * **工具条收拢开关**，放在工具条**最左侧**。
@@ -259,7 +284,9 @@ export function MapToolbar({ items, state, testid, style, onLocal, activeKeys, o
       // 2026-09-19：两级菜单（新建 / 点 / 线 / 面 / 标绘）默认展开**第一个分类**，
       //   免得刚点开「新建」时右列是空的；扁平菜单（计划）没有分类，group 为 undefined。
       const firstGroup = t.submenu.find((g) => g.items?.length)?.key
-      setOpenMenu((v) => (v?.key === t.key ? null : { key: t.key, left, group: firstGroup }))
+      // `sub: undefined` = **每次打开菜单都不带第三级**（第三级要用户点了二级分组才出现；
+      //   留着上一次的会让"刚点开就展开某一组"，层级关系看着莫名其妙）
+      setOpenMenu((v) => (v?.key === t.key ? null : { key: t.key, left, group: firstGroup, sub: undefined }))
       // 2026-09-20 菜单窗口互斥：这次是"打开"（不是再点一下关掉）时，把别的窗口都收掉 
       //   工具栏这边能直接管的：图层面板；屏自己的面板（例【场景】）走 onMenuOpened 通知。
       if (openMenu?.key !== t.key) { setLayersPanel(false); onMenuOpened?.(t.key) }
@@ -352,8 +379,9 @@ export function MapToolbar({ items, state, testid, style, onLocal, activeKeys, o
           <span style={{ fontSize: 13, lineHeight: 1 }}>{collapsed ? '»' : '«'}</span>
         </button>
         {!collapsed && items.map((t) => {
-          const on = t.always ? true : state.on(t.key)
-          const reason = state.reason(t.key)
+          // 可用性三档（2026-09-21 起）：**本屏点名禁用** > **宿主自带恒定可点** > **规则包声明**
+          const on = t.disabled ? false : (t.always ? true : state.on(t.key))
+          const reason = t.disabled ? t.disabledReason : state.reason(t.key)
           const undeclared = !state.declared(t.key)
           // ★「点击选中状态」：用户 2026-09-18 反馈"点击选中状态，无选中状态"。
           //   原来的高亮太轻（半透明蓝 + 淡边），看起来跟没选一样。现在：
@@ -415,15 +443,25 @@ export function MapToolbar({ items, state, testid, style, onLocal, activeKeys, o
         const nested = t.submenu.some((g) => g.items?.length)
         const groupKey = openMenu.group ?? t.submenu[0]?.key
         const group = nested ? t.submenu.find((g) => g.key === groupKey) : null
-        // 挂在**被点那一格的正下方**；贴近右边缘时往回收，别跑出工具条外面（两级菜单更宽）
+        /**
+         * **第三级**（2026-09-21 需求："把任务区变成二级菜单，点击后出现手动点位 / 自动长宽"）。
+         *
+         * 二级项自己带 `items` 时，它不再执行、而是在**最右侧再展开一列**（与一级→二级同款）。
+         * 展开的是哪一组由 `openMenu.sub` 记着；没记就默认第一组，免得点开分类时右边空着。
+         */
+        const subGroups = (group?.items ?? []).filter((it) => it.items?.length)
+        const subKey = subGroups.length ? (openMenu.sub ?? subGroups[0].key) : null
+        const subGroup = subKey ? subGroups.find((g) => g.key === subKey) ?? null : null
+        const threeLevels = !!subGroup
+        // 挂在**被点那一格的正下方**；贴近右边缘时往回收，别跑出工具条外面（层级越多越宽）
         const barW = barRef.current?.getBoundingClientRect().width ?? 0
-        const menuW = nested ? 300 : 186
+        const menuW = threeLevels ? 470 : nested ? 300 : 186
         const left = barW > 0 ? Math.min(openMenu.left, Math.max(0, barW - menuW)) : openMenu.left
         return (
           <div
             data-testid={`${testid}-submenu`}
-            data-submenu-levels={nested ? '2' : '1'}
-            style={{ ...submenuStyle, minWidth: nested ? 292 : 168, left: 12 + left }}
+            data-submenu-levels={threeLevels ? '3' : nested ? '2' : '1'}
+            style={{ ...submenuStyle, minWidth: threeLevels ? 462 : nested ? 292 : 168, left: 12 + left }}
           >
             {nested ? (
               <div style={{ display: 'flex', flexDirection: 'row', gap: 8, alignItems: 'flex-start' }}>
@@ -435,27 +473,54 @@ export function MapToolbar({ items, state, testid, style, onLocal, activeKeys, o
                       data-testid={`${testid}-cat-${g.key}`}
                       data-cat={g.key}
                       data-cat-open={g.key === groupKey ? '1' : '0'}
-                      onClick={() => setOpenMenu((v) => (v ? { ...v, group: g.key } : v))}
+                      onClick={() => setOpenMenu((v) => (v ? { ...v, group: g.key, sub: undefined } : v))}
                       style={g.key === groupKey ? { ...submenuItem, ...submenuCatOn } : submenuItem}
                     >{g.label}</button>
                   ))}
                 </div>
-                {/* 二级：这一类的条目。点中  关菜单 + 执行（绘制模式 / 全屏 / 交给本屏） */}
+                {/* 二级：这一类的条目。带 `items` 的（如「任务区」）点一下在右边展开第三列；
+                    其余点中即执行（关菜单 + 绘制模式 / 交给本屏）。 */}
                 <div style={{
                   display: 'flex', flexDirection: 'column', gap: 1, minWidth: 176,
                   maxHeight: 380, overflowY: 'auto',
                 }}>
-                  {(group?.items ?? []).map((it) => (
-                    <button
-                      key={it.key}
-                      data-testid={`${testid}-sub-${it.key}`}
-                      data-sub-active={leafActive(it) ? '1' : '0'}
-                      title={it.note}
-                      onClick={() => actLeaf(it)}
-                      style={leafActive(it) ? { ...submenuItem, ...submenuItemOn } : submenuItem}
-                    >{it.label}</button>
-                  ))}
+                  {(group?.items ?? []).map((it) => {
+                    const isGroup = !!it.items?.length
+                    const on = isGroup ? it.key === subKey : leafActive(it)
+                    return (
+                      <button
+                        key={it.key}
+                        data-testid={`${testid}-sub-${it.key}`}
+                        data-sub-active={on ? '1' : '0'}
+                        data-sub-group={isGroup ? '1' : '0'}
+                        title={it.note}
+                        onClick={() => {
+                          if (isGroup) { setOpenMenu((v) => (v ? { ...v, sub: it.key } : v)); return }
+                          actLeaf(it)
+                        }}
+                        style={on ? { ...submenuItem, ...submenuItemOn } : submenuItem}
+                      >{it.label}{isGroup ? ' ▸' : ''}</button>
+                    )
+                  })}
                 </div>
+                {/* 三级：被展开的那一组的模式（手动点位 / 自动长宽…）。点中即执行、关菜单。 */}
+                {threeLevels && (
+                  <div
+                    data-testid={`${testid}-sub3-${subGroup!.key}`}
+                    style={{ display: 'flex', flexDirection: 'column', gap: 1, minWidth: 168 }}
+                  >
+                    {subGroup!.items!.map((leaf) => (
+                      <button
+                        key={leaf.key}
+                        data-testid={`${testid}-sub-${leaf.key}`}
+                        data-sub-active={leafActive(leaf) ? '1' : '0'}
+                        title={leaf.note}
+                        onClick={() => actLeaf(leaf)}
+                        style={leafActive(leaf) ? { ...submenuItem, ...submenuItemOn } : submenuItem}
+                      >{leaf.label}</button>
+                    ))}
+                  </div>
+                )}
               </div>
             ) : (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
@@ -501,6 +566,13 @@ export function ToolModeNote({ items, note, style }: {
   style?: CSSProperties
 }) {
   const drawMode = useInteraction((s) => s.mode)
+  /**
+   * **提示态**（2026-09-21 新增）：几何原语绘制（【新建】的线 / 面）走 `setGeometry`，
+   * 那条路**不经过 `mode`**（起绘时 `mode` 被有意清成 'none'）→ 所以在这一行里读不到任何工具。
+   * 用户要求："点了【新建】的线 / 面就开始显示 Esc 提示，只出一处、不带『当前工具：xx』前缀"。
+   * 值由 map-2d 的 `hintModeOf()` 按几何种类给（点 / 圆 / 椭圆不给）——**只看提示，不碰绘制**。
+   */
+  const hintMode = useInteraction((s) => s.hintMode)
   const layersOpen = useMapUiStore((s) => s.layersOpen)
   const clearMode = useMapUiStore((s) => s.clearMode)
   const activeTool = useMapUiStore((s) => s.activeTool)
@@ -521,6 +593,21 @@ export function ToolModeNote({ items, note, style }: {
     .find((it) => (it.mode ? it.mode === drawMode
       : (it.key === 'clear' ? clearMode : (!!MAP2D_KEY[it.key] && MAP2D_KEY[it.key] === activeTool))))
   const one = cur ?? leaf
+  /**
+   * **几何原语绘制中的那行提示**（2026-09-21 按需求新增）。
+   *
+   * 用户原话："点了【新建】的线 / 面（开始绘制）就显示「单击落点，双击 / Enter 结束，Esc 取消」，
+   * 位置放在**当前量算提示所在的那个位置**，**只留一处**、**只出括号里那句**（不带『当前工具：xx』）。"
+   * 所以这一支**只渲染那一句**，与下面按 `mode` 判的老路径互不干扰（`hintMode` 只在几何原语绘制时非 none）。
+   * 量算那一行一个字没动：它仍旧走下面的老路径。
+   */
+  if (hintMode !== 'none') {
+    return (
+      <div data-testid="map-tool-note" style={{ ...noteStyle, ...style }}>
+        （单击落点，双击 / Enter 结束，Esc 取消）
+      </div>
+    )
+  }
   if (!one && !note) return null
   return (
     <div data-testid="map-tool-note" style={{ ...noteStyle, ...style }}>
