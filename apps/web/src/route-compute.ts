@@ -174,7 +174,13 @@ export function planAndDrawRoute(assemblyId: string, taskId: string, corridorWid
     lenKm += Math.hypot(dx, dy)
   }
 
-  draw.line({ id: 'PLAN:route', points: line, color: '#38bdf8', widthPx: 2, dashed: false, text: '规划航线' })
+  draw.line({
+    id: 'PLAN:route', points: line, color: '#38bdf8', widthPx: 2, dashed: false, text: '规划航线',
+    // 2026-09-21 需求方："规划航线的标签，放到航线中间，而非末尾"（**只改航线**）
+    //   → 用模块新开的可选提示：`textAnchor: 'mid'` = 标签挂折线中点；`anchorOutPx: 9` = 比默认 6 再外一点。
+    //   别的图元不传这两个字段，行为完全不变。
+    textAnchor: 'mid', anchorOutPx: 9,
+  })
   // ★ 2026-09-21 需求方："出航通道…现在是完全跟踪、把所有的航路都包裹住的，**只需要出集结区后包裹航路 5km 即可**"
   //   → 通道**不再是全程带**：只覆盖**航路起点之后 5 km**（沿航路累计，甲口径）；
   //   **宽度不变**（仍 1000 m），**航路线本身照旧画全程**（上面那行没动）。
