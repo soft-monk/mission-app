@@ -1,4 +1,4 @@
-﻿// mission-app · apps/web/src/scenario.ts
+// mission-app · apps/web/src/scenario.ts
 //
 // 场景几何（区域多边形 / 标注）——**内联为前端默认值**，理由与 map-style.ts 相同：
 // 宿主的 `/` 只托管 apps/web/dist，不托管 `data/scenario-1/`，运行时 fetch 必然 404。
@@ -105,7 +105,7 @@ const THREAT_RECT = rectPolygon(THREAT_CENTER, THREAT_W_KM, THREAT_H_KM)
  *   · 任务区     → `draw.polygon` 红色**实线**，文本「任务区」
  *   · 我方集结区 → `draw.polygon` 绿色**实线**，文本「我方集结区」
  *   · 威胁区     → `draw.polygon` 红色**虚线**，文本「威胁区」
- *   · 出航通道   → A\* 航线扩展 1km 宽的带状面，蓝色**虚线**，文本「出航通道（1000 m）」
+ *   · 出航通道   → A\* 航线扩展 1km 宽的带状面，蓝色**虚线**，文本「出航通道」
  *   · 规划航线   → `draw.line` 蓝色实线，文本「规划航线」
  *
  * 幂等：每条都用固定 id（`SCN:*`），重复调用是**覆盖**而不是叠加。
@@ -140,7 +140,8 @@ export function drawScenario(): void {
       id: 'SCN:corridor', ring: band,
       color: '#3b82f6', fillColor: '#3b82f6', fillOpacity: 0.08,
       strokeWidthPx: 1.4, dashed: true,
-      text: '出航通道（1000 m）',
+      // 2026-09-21：标注只留名字（与活路径 `route-compute.ts` 同步；需求方："删除（1000m）"）
+      text: '出航通道',
     })
   }
 }

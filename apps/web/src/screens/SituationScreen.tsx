@@ -984,7 +984,7 @@ export function SituationScreen({ state, flow, onGo }: {
       taskId: tasks[0].id,
     })
     setPlanMsg(`图上有 ${assemblies.length} 个集结区、${tasks.length} 个任务区，请选择要算哪两个`
-      + `（会自动绕开 ${threats.length} 个威胁区）`)
+      + `（会自动绕开 ${threats.length} 个威胁 / 禁飞区）`)
   }, [runRoutePlan])
 
   /**
@@ -1603,7 +1603,7 @@ export function SituationScreen({ state, flow, onGo }: {
               >{opts(tasks)}</select>
             </label>
             <div style={{ fontSize: 11.5, color: C.textDim, margin: '4px 0 8px' }}>
-              自动绕开 {threats.length} 个「威胁」区域；算出来会画<b>规划航线</b>与 <b>1000 m 宽航道</b>
+              自动绕开 {threats.length} 个「威胁 / 禁飞」区域；算出来会画<b>规划航线</b>与 <b>1000 m 宽航道</b>
             </div>
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
               <button

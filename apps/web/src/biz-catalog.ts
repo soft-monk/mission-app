@@ -311,6 +311,13 @@ const PRESETS: BizEntry[] = [
     menu: 'area', start: { geo: 'polygon', color: '#ef4444', fillColor: '#ef4444', fillOpacity: 0.12, widthPx: 2, dashed: true },
   },
   {
+    // 2026-09-21 新需求："添加和威胁区一样的区域，叫禁飞区" —— **逐字段与威胁区相同**，
+    // 只有 key 与 label（图上默认文本）不同；放「面」类里、威胁区旁边；**只有手动（多点围合）**一种模式。
+    // 它同时是"规划航线要绕开的障碍"：`route-compute.ts` 的障碍判据是**文本子串**「威胁」或「禁飞」。
+    key: 'biz:no-fly-zone', label: '禁飞区', note: '多点围合：红色虚线区域（规划航线会绕开）',
+    menu: 'area', start: { geo: 'polygon', color: '#ef4444', fillColor: '#ef4444', fillOpacity: 0.12, widthPx: 2, dashed: true },
+  },
+  {
     key: 'biz:target-zone', label: '目标区', note: '两下：中心 → 半径（红色实线圆）',
     menu: 'area', start: { geo: 'circle', color: '#ef4444', fillColor: '#ef4444', fillOpacity: 0.12, widthPx: 2, dashed: false },
   },
@@ -452,8 +459,9 @@ const GROUP_KEYS: { key: string; label: string; keys: string[] }[] = [
     key: 'area', label: '面',
     keys: [
       'geo:polygon',
-      // 2026-09-21：这三条里，前两条是**分组**（点开有两个模式可选），第三条是可点条目 —— 见 MODE_GROUPS
-      'biz:task-area', 'biz:assembly', 'biz:threat-area',
+      // 2026-09-21：这三条里，前两条是**分组**（点开有两个模式可选），后两条是可点条目 —— 见 MODE_GROUPS
+      // （禁飞区与威胁区同款单条目，只有手动多点围合）
+      'biz:task-area', 'biz:assembly', 'biz:threat-area', 'biz:no-fly-zone',
     ],
   },
   {
