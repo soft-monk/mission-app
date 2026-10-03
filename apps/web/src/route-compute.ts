@@ -16,6 +16,10 @@
 //   · 画出来两条：`规划航线`（线，**画全程**）+ `出航通道`（带状面，1000 m 宽，
 //     **只跟踪航路前 5 km** —— 2026-09-21 需求方："只需要出集结区后包裹航路 5km 即可"；
 //     标注只写名字、不再带宽度 —— 需求方："只需要出航通道即可，删除（1000m）"）。
+//    ★ 2026-10-03 **按「对」唯一**（需求方：「选一个集结一个任务区，这两个区域之间的航路只有一条，
+//     重新规划也是只有一条，其他对，也是这样」）：id = `PLAN:route:<集结id>__<任务id>` /
+//     `PLAN:corridor:<集结id>__<任务id>`，标签带序号（`规划航线 N` / `出航通道 N`）；
+//     同一对重算 = 覆盖自己那条（号不变），不同对互不覆盖 → 可以同时存在多条航路。
 import { draw, MapDraw } from 'map-2d'
 import { aStar, simplify } from './route-plan'
 import { corridorBand } from './scenario'
@@ -128,10 +132,48 @@ function cumulativeSlice(line: [number, number][], maxKm: number): [number, numb
   return out
 }
 
+// ---------------------------------------------------------------- 多条航路（按「对」唯一 + 序号）
+//
+// ★ 2026-10-03 需求方：「选一个集结一个任务区，这两个区域之间的航路只有一条，重新规划也是只有一条，
+//   其他对，也是这样」→ id 按「对」唯一：同一对重算覆盖自己那一条（号不变），不同对各有一条、可以同时存在；
+//   标注带序号（需求方选的口径）：`规划航线 N` / `出航通道 N`。
+
+/** 航线图元 id 前缀（后面跟「对」的键） */
+const ROUTE_ID_PREFIX = 'PLAN:route:'
+/** 通道图元 id 前缀（与航线同一个键 → 同号） */
+const CORRIDOR_ID_PREFIX = 'PLAN:corridor:'
+
+/** 「对」的稳定键：同一对区域永远得到同一个 id（重算命中自己那条） */
+function pairKey(assemblyId: string, taskId: string): string {
+  return `${assemblyId}__${taskId}`
+}
+
+/**
+ * **这一对航线的序号**：自己已有号 → 沿用（重算号不变）；没有 → 取图上现有最大号 + 1。
+ *
+ * 为什么从图上读而不是用计数器：开计划 / 刷新后计数器会丢，而标签跟着图元走；
+ * 删除某条后新算的号会跳过空号 —— 这是「带序号」口径的已知代价，需求方已确认。
+ */
+function routeNoOf(routeId: string): number {
+  let max = 0
+  let mine: number | undefined
+  for (const it of MapDraw.list('route') as unknown as Record<string, unknown>[]) {
+    const id = typeof it?.id === 'string' ? it.id : ''
+    if (!id.startsWith(ROUTE_ID_PREFIX)) continue
+    const m = /(\d+)\s*$/.exec(typeof it?.label === 'string' ? it.label : '')
+    const n = m ? Number(m[1]) : 0
+    if (id === routeId && n > 0) mine = n
+    if (n > max) max = n
+  }
+  return mine ?? max + 1
+}
+
 /** 规划出来的结果（给界面报数用） */
 export interface RouteResult {
   ok: boolean
   reason?: string
+  /** 这一对的序号（标签「规划航线 N / 出航通道 N」用的就是它） */
+  no?: number
   /** 航路点个数与总长（km） */
   points?: number
   lengthKm?: number
@@ -140,7 +182,8 @@ export interface RouteResult {
 }
 
 /**
- * **算并画出航线 + 航道**（幂等：固定 id `PLAN:route` / `PLAN:corridor`，重算是覆盖）。
+ * **算并画出航线 + 航道**（幂等按「对」：id = `PLAN:route:<集结id>__<任务id>`，重算只覆盖**这一对**，
+ * 别的对不受影响；★ 2026-10-03 需求方：「其他对，也是这样」）。
  * @param assemblyId 集结区图元 id
  * @param taskId 任务区图元 id
  * @param corridorWidthM 航道宽度（默认 1000m，与需求方口径一致）
@@ -151,6 +194,12 @@ export function planAndDrawRoute(assemblyId: string, taskId: string, corridorWid
   const t = tasks.find((x) => x.id === taskId)
   if (!a) return { ok: false, reason: '没找到这个集结区（可能已被删掉）' }
   if (!t) return { ok: false, reason: '没找到这个任务区（可能已被删掉）' }
+
+  // ★ 2026-10-03：id 按「对」唯一 + 取这一对的序号（同一对重算沿用旧号；不同对互不覆盖）
+  const pair = pairKey(assemblyId, taskId)
+  const routeId = ROUTE_ID_PREFIX + pair
+  const corridorId = CORRIDOR_ID_PREFIX + pair
+  const no = routeNoOf(routeId)
 
   const ca = centerOf(a.ring), ct = centerOf(t.ring)
   const start = facingPoint(a.ring, ct)
@@ -175,7 +224,7 @@ export function planAndDrawRoute(assemblyId: string, taskId: string, corridorWid
   }
 
   draw.line({
-    id: 'PLAN:route', points: line, color: '#38bdf8', widthPx: 2, dashed: false, text: '规划航线',
+    id: routeId, points: line, color: '#38bdf8', widthPx: 2, dashed: false, text: `规划航线 ${no}`,
     // 2026-09-21 需求方："规划航线的标签，放到航线中间，而非末尾"（**只改航线**）
     //   → 用模块新开的可选提示：`textAnchor: 'mid'` = 标签挂折线中点；`anchorOutPx: 9` = 比默认 6 再外一点。
     //   别的图元不传这两个字段，行为完全不变。
@@ -187,12 +236,13 @@ export function planAndDrawRoute(assemblyId: string, taskId: string, corridorWid
   const band = corridorBand(cumulativeSlice(line, CORRIDOR_TRACK_KM), corridorWidthM)
   if (band.length >= 3) {
     draw.polygon({
-      id: 'PLAN:corridor', ring: band, color: '#3b82f6', fillColor: '#3b82f6',
+      id: corridorId, ring: band, color: '#3b82f6', fillColor: '#3b82f6',
       fillOpacity: 0.08, strokeWidthPx: 1.4, dashed: true,
       // 2026-09-21 需求方："修改出航通道标注名称，只需要出航通道即可，删除（1000m）"
       //   —— 宽度仍按 1000 m 生效（`corridorWidthM`），只是**不再写进标注**。
-      text: '出航通道',
+      // 2026-10-03：多条航路要能区分 → 标注带**这一对的序号**（与航线同号）
+      text: `出航通道 ${no}`,
     })
   }
-  return { ok: true, points: line.length, lengthKm: lenKm, avoided: obstacles.length }
+  return { ok: true, no, points: line.length, lengthKm: lenKm, avoided: obstacles.length }
 }

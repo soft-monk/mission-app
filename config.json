@@ -78,6 +78,11 @@
 
   "mediaRoot": "data/scenario-1/media",
 
+  "plans": {
+    "basePath": "/plans",
+    "root": "data/plans"
+  },
+
   "tiles": {
     "template": "/tiles/{z}/{x}/{y}.jpg",
     "basePath": "/tiles",

@@ -104,6 +104,13 @@ bool HostConfig::loadFile(const std::string& path, HostConfig& out, std::string&
     // 媒体素材根目录：**空 = 不托管**（合法取值，不是错误）；给了就按锚点规则解析。
     if (!getString(j, "mediaRoot", out.mediaRoot, error)) return false;
 
+    // 计划文件根目录（方案 C）：**空 = /plans/** 不托管**（合法取值）；给了就按锚点规则解析。
+    {
+        const auto& plans = sub(j, "plans", scratch);
+        if (!getString(plans, "basePath", out.plansBasePath, error)) return false;
+        if (!getString(plans, "root", out.plansRoot, error)) return false;
+    }
+
     const auto& mods = sub(j, "modules", scratch);
     if (!getBool(mods, "hub", out.enableHub, error)) return false;
     if (!getBool(mods, "tiles", out.enableTiles, error)) return false;

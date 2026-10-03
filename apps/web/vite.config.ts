@@ -110,6 +110,8 @@ export default defineConfig({
       '/stats': BACKEND,
       '/runtime-config': BACKEND,
       '/tiles': BACKEND,
+      // ★ 2026-10-03 方案 C：计划文件由宿主的 /plans/** 路由托管（构建产物之外），dev 期代理过去
+      '/plans': BACKEND,
     },
   },
   build: {

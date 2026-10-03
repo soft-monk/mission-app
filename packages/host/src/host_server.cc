@@ -545,8 +545,11 @@ void HostServer::registerRoutes() {
                 }
 
                 std::error_code ec;
-                const fs::path rootPath = fs::weakly_canonical(fs::path(root), ec);
-                const fs::path full = fs::weakly_canonical(rootPath / fs::path(rel), ec);
+                // ★ 编码：`rel` 是 URL 解码后的 **UTF-8** 字节；Windows 上 `fs::path(std::string)`
+                //   会按 **ANSI 码页**解释（中文文件名就找不到磁盘文件  实测：ASCII 名 200 / 中文名 404）
+                //   → 统一用 `fs::u8path` 构造；前缀比较用 `native()`（宽字符，不再过一次窄编码）。
+                const fs::path rootPath = fs::weakly_canonical(fs::u8path(root), ec);
+                const fs::path full = fs::weakly_canonical(rootPath / fs::u8path(rel), ec);
                 const std::string fullStr = full.generic_string();
                 const std::string rootStr = rootPath.generic_string();
                 if (fullStr.rfind(rootStr, 0) != 0) {
@@ -725,6 +728,101 @@ void HostServer::registerRoutes() {
                 cb(resp);
             },
             {drogon::Get});
+    }
+
+    // ---- /plans/**：计划文件字节（★ 2026-10-03 方案 C：托管**构建产物之外**的活目录）----
+    //
+    // 为什么要它：计划文件原先放在 `apps/web/public/plans/`，而宿主只托管 `apps/web/dist` —— 
+    //   换文件要重跑 `vite build`（dist 每次构建都会被整体重建），不是热插拔。
+    //   现在改从 `config.json` 的 `plans.root`（= data/plans）读：**换文件即生效**，
+    //   前端 URL 仍是 /plans/…（前端 planUrl 一个字不用改）。
+    //
+    // 与 /media/** 的关系：同款路径安全口径（反斜杠归一 → 逐段拒 `..` → 规范路径前缀比对），
+    //   但**只放行 .json**、不做 Range（计划文件都很小，整读即可）、404 回 JSON。
+    //   刻意不抽公共函数：/media 那段带 Range/206 语义，合并要动它，风险大于收益。
+    if (!cfg_.plansRoot.empty()) {
+        const std::string route = cfg_.plansBasePath.empty() ? "/plans" : cfg_.plansBasePath;
+        const std::string root = cfg_.resolvePath(cfg_.plansRoot);
+        app.registerHandlerViaRegex(
+            route + "(?:/.*)?",
+            [root, route](const drogon::HttpRequestPtr& req,
+                          std::function<void(const drogon::HttpResponsePtr&)>&& cb) {
+                auto fail = [&cb](const std::string& why) {
+                    nlohmann::json body;
+                    body["code"] = 1004;
+                    body["error"] = {{"message", why}};
+                    auto resp = drogon::HttpResponse::newHttpResponse();
+                    resp->setStatusCode(drogon::k404NotFound);
+                    resp->setContentTypeCode(drogon::CT_APPLICATION_JSON);
+                    resp->setBody(body.dump());
+                    cb(resp);
+                };
+                // 取相对路径：用**解码后**的 getPath（中文文件名才能落到磁盘上；与 /media 同款）
+                std::string path = req->getPath();
+                if (path.empty()) path = req->getOriginalPath();
+                const std::string prefix = route + "/";
+                std::string rel = path == route ? std::string()
+                                                : (path.rfind(prefix, 0) == 0 ? path.substr(prefix.size())
+                                                                              : std::string());
+                if (rel.empty()) {
+                    fail("缺文件名：" + route + "/<文件名>.json");
+                    return;
+                }
+                // 反斜杠统一成 '/' 之后逐段拒绝 `..`（Windows 上两种分隔符都要挡）
+                for (char& c : rel) {
+                    if (c == '\\') c = '/';
+                }
+                for (std::size_t i = 0; i < rel.size();) {
+                    const std::size_t slash = rel.find('/', i);
+                    const std::string seg = rel.substr(i, slash == std::string::npos ? slash : slash - i);
+                    if (seg == ".." || seg.empty()) {
+                        fail("非法路径段：" + seg);
+                        return;
+                    }
+                    if (slash == std::string::npos) break;
+                    i = slash + 1;
+                }
+                std::error_code ec;
+                // ★ 编码：`rel` 是 URL 解码后的 **UTF-8** 字节；Windows 上 `fs::path(std::string)`
+                //   会按 **ANSI 码页**解释（中文文件名就找不到磁盘文件  实测：ASCII 名 200 / 中文名 404）
+                //   → 统一用 `fs::u8path` 构造；前缀比较用 `native()`（宽字符，不再过一次窄编码）。
+                const fs::path rootPath = fs::weakly_canonical(fs::u8path(root), ec);
+                const fs::path full = fs::weakly_canonical(rootPath / fs::u8path(rel), ec);
+                const std::wstring fullStr = full.native();
+                const std::wstring rootStr = rootPath.native();
+                if (fullStr.rfind(rootStr, 0) != 0) {
+                    fail("越权路径（不在 plans.root 下）");
+                    return;
+                }
+                if (full.extension() != fs::u8path(".json")) {
+                    fail("只托管 .json 计划文件：" + rel);
+                    return;
+                }
+                if (!fs::exists(full, ec) || !fs::is_regular_file(full, ec)) {
+                    fail("计划文件不存在：" + rel);
+                    return;
+                }
+                std::ifstream in(full, std::ios::binary);
+                if (!in) {
+                    fail("计划文件打不开：" + rel);
+                    return;
+                }
+                std::ostringstream sbuf;
+                sbuf << in.rdbuf();
+                const std::string text = sbuf.str();
+                auto resp = drogon::HttpResponse::newHttpResponse();
+                resp->setStatusCode(drogon::k200OK);
+                // setContentTypeString 是**替换**（newHttpResponse 自带 text/html，追加会出现两条）
+                resp->setContentTypeString("application/json; charset=utf-8");
+                resp->addHeader("Cache-Control", "no-cache");
+                if (req->method() == drogon::Head) {
+                    resp->addHeader("Content-Length", std::to_string(text.size()));
+                } else {
+                    resp->setBody(text);
+                }
+                cb(resp);
+            },
+            {drogon::Get, drogon::Head});
     }
 
     // ---- 静态托管：dist 下的 assets 等（index.html 由上面那条显式返回）

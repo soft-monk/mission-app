@@ -587,8 +587,9 @@ function GeometryEditor(p: {
  * `implemented` 是本轮范围的事实（`个性化需求.txt`：流程先固定只实现**场景一**）——
  * 图上有三张卡，但场景二/三还没有任何一屏，所以点它们只给提示，**不切换**（§9-4/§9-5）。
  */
-const SCENES: { id: string; no: string; name: string; accent: string; implemented: boolean }[] = [
-  { id: 'scenario-1', no: '场景一', name: '敏捷拒止布控', accent: 'rgba(95,176,255,.85)', implemented: true },
+const SCENES: { id: string; no: string; name: string; accent: string; implemented: boolean; planUrl?: string }[] = [
+  // ★ 2026-10-03：这张卡带 planUrl —— **点它时才**读这份计划画到图上；进屏不自动加载（进屏仍是空地图）。
+  { id: 'scenario-1', no: '场景一', name: '敏捷拒止布控', accent: 'rgba(95,176,255,.85)', implemented: true, planUrl: '/plans/态势计划-场景1.json' },
   { id: 'scenario-2', no: '场景二', name: '集群协同突击', accent: 'rgba(34,197,94,.85)', implemented: false },
   { id: 'scenario-3', no: '场景三', name: '立体融合攻坚', accent: 'rgba(245,158,11,.85)', implemented: false },
 ]
@@ -763,7 +764,16 @@ export function SituationScreen({ state, flow, onGo }: {
     : ''
   const activeScene = picked ?? (SCENES.find((s) => s.id === sceneKey)?.id ?? SCENES[0].id)
 
-  const onPickScene = (s: typeof SCENES[number]) => {
+  /**
+   * ★ 2026-10-03 需求方：「默认进入界面为空白界面，我手动点击功能按钮场景，点击场景1才加载场景1json数据」。
+   *
+   * 加载动作挂在**这张卡**上（不是进屏自动读）：
+   *   · 卡上有 `planUrl` → fetch 那份计划 → `parsePlan` 校验 → `applyPlan`（先清掉非遥测图元再画）
+   *     → 跳「家视角」；**画成功了才切 SH-04**；
+   *   · 失败（含「有图元画不出来」）→ **先不切屏**，留在本屏写红字回执 —— 切走了这条红字就看不见了。
+   * 读取 / 校验 / 落图全部复用「计划 → 打开计划」那一套函数，不另写第二份实现。
+   */
+  const onPickScene = async (s: typeof SCENES[number]) => {
     if (!s.implemented) {
       // **不假装切过去**：本轮只实现场景一（个性化需求），场景二/三连屏都还没有
       setNotice(`「${s.no}：${s.name}」本轮未实现（个性化需求：流程先固定只实现场景一），界面未切换`)
@@ -771,7 +781,27 @@ export function SituationScreen({ state, flow, onGo }: {
     }
     setPicked(s.id)
     setNotice(null)
-    onGo?.('SH-04')
+
+    // 没带计划文件的卡：沿用老行为，直接进场景确认界面
+    if (!s.planUrl) { onGo?.('SH-04'); return }
+    try {
+      const r = await fetch(s.planUrl, { cache: 'no-cache' })
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      const { plan, error } = parsePlan(await r.text())
+      if (error || !plan) throw new Error(error ?? '解析失败')
+      const { drawn, failed } = applyPlan(plan, { applyFileView: false })
+      const home = homeView()
+      mapCommands.setView(home.lng, home.lat, home.zoom, 700)
+      if (failed.length) {
+        // 画不出来的条目如实报出，且先不切屏（切走了这条就看不见了）
+        setPlanMsg(`${s.no}计划有 ${failed.length} 条画不出来：${failed.join('；')}`)
+        return
+      }
+      setPlanMsg(`已选${s.no}：画了 ${drawn} 个图元`)
+      onGo?.('SH-04')
+    } catch (e) {
+      setPlanMsg(`${s.no}计划打不开（${s.planUrl}）：${String((e as Error)?.message ?? e)}`)
+    }
   }
 
   // ---- AI任务分析：图上三行等级 + 态势简述 + 建议方向 --------------------
@@ -957,13 +987,20 @@ export function SituationScreen({ state, flow, onGo }: {
    */
   const [routePick, setRoutePick] = useState<{ assemblyId: string; taskId: string } | null>(null)
 
-  /** 算并画，把结果如实写到回执条 */
+  /**
+   * 算并画，把结果如实写到回执条。
+   *
+   * ★ 2026-10-03 需求方：「② 带序号」+「不关，用户自己不选了自己关」：
+   *    算完**不再关框**（关框只由「取消」负责）→ 可以接着选下一对；
+   *    回执里带**这一对的序号**（同一对重算号不变，见 route-compute.ts 的 routeNoOf）。
+   */
   const runRoutePlan = useCallback((assemblyId: string, taskId: string) => {
     const r = planAndDrawRoute(assemblyId, taskId)
-    setRoutePick(null)
+    // ★ 2026-10-03 需求方：「不关，用户自己不选了自己关」—— 算完**不再关框**，可以接着算下一对；
+    //   同一对重算仍是那一条（号不变，见 route-compute.ts）。
     setPlanMsg(r.ok
-      ? `已规划航线：${r.points} 个航路点、约 ${r.lengthKm?.toFixed(1)} km，绕开 ${r.avoided} 个威胁区，并画出 ${1000} m 宽航道`
-      : `规划航线失败：${r.reason ?? '未知原因'}`)
+      ? `已规划航线 ${r.no}：${r.points} 个航路点、约 ${r.lengthKm?.toFixed(1)} km，绕开 ${r.avoided} 个威胁 / 禁飞区，画出 1000 m 宽航道（可继续选下一对；点「取消」关闭）`
+      : `规划航线失败：${r.reason ?? '未知原因'}（图上的航路未改动）`)
   }, [])
 
   const startRoutePlan = useCallback(() => {
@@ -1603,7 +1640,7 @@ export function SituationScreen({ state, flow, onGo }: {
               >{opts(tasks)}</select>
             </label>
             <div style={{ fontSize: 11.5, color: C.textDim, margin: '4px 0 8px' }}>
-              自动绕开 {threats.length} 个「威胁 / 禁飞」区域；算出来会画<b>规划航线</b>与 <b>1000 m 宽航道</b>
+              自动绕开 {threats.length} 个「威胁 / 禁飞」区域；算出来会画<b>规划航线</b>与 <b>1000 m 宽航道</b>（一对一条、带序号；可继续选下一对，点「取消」关闭）
             </div>
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
               <button

@@ -39,6 +39,15 @@ struct HostConfig {
     // 视频文件 = video 通道），字节流走 HostServer 的 /media/** 路由（支持 Range/206）。
     std::string mediaRoot;
 
+    // ---- 计划文件根目录（★ 2026-10-03 方案 C；相对路径同样锚在配置文件旁边）----
+    //
+    // **空 = 不托管 /plans/**；给了就从这里读计划文件。
+    // 为什么要有它：计划文件原先放在 `apps/web/public/plans/`，而宿主只托管 `apps/web/dist` —— 
+    //   换文件必须重跑 `vite build`（dist 每次构建都会被整体重建），不是热插拔。
+    //   改到这里之后：**换文件即生效**，前端 URL 仍是 `/plans/…`（一个字不用改）。
+    std::string plansBasePath = "/plans";
+    std::string plansRoot;
+
     // ---- selfcheck 规则包（可选；文件不存在则跳过装载，如实记 note）
     std::string selfcheckPolicies;
     std::string selfcheckCapabilities;
