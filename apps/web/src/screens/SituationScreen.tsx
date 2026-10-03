@@ -8,7 +8,8 @@
 //           + 左上浮动工具栏（**工具与可用性全部由 `view.compose` 说了算**）
 //   · 右栏 3 面板：**AI任务分析** / **任务信息** / **资源概况**
 //   · 底部：**「请选择任务场景」+ 三张场景入口卡**（场景一：敏捷拒止布控 / 场景二：集群协同突击 /
-//           场景三：立体融合攻坚，各带小地图缩略图位 + 圆形 ▶）
+//           场景三：立体融合攻坚，各带小地图缩略图位）。
+//           ★ 2026-10-03：三张卡右侧的**圆形 ▶ 播放按钮已按需求方要求去掉**（参考图上本来有，这是有意偏离）。
 //
 // ★ 与旧版的三处关键差别（按图改的，别再改回去）：
 //   ① **图上没有【确认场景，进入编组 ≫】** —— 那颗按钮属于 SH-04（场景确认），本屏删掉；
@@ -19,7 +20,8 @@
 // ★ 纪律（与本仓其它屏一致）：
 //   · **不编任何数值**：三面板的每个数都来自 `situation.snapshot` / `view.compose` / 资源台账
 //     （`alloc.inventory`）的回执；取不到就显示"—"并写明缺在哪（G-09）。
-//   · 图上是**三维地形底图**，我们只有**二维瓦片** —— 如实写一行小字，**不假装三维**。
+//   · 图上是**三维地形底图**，我们只有**二维瓦片** —— 原本在面板标题右侧写一行小字如实说明；
+//     ★ 2026-10-03 需求方点名去掉这行小字 → 面板上不再明示，"不是真实底图"改由缩略图的悬停 title 承担。
 //   · 样式一律 `left/right/top/bottom` 长写（**不用 `inset` 简写**：React 的 style diff 曾把
 //     `top` 连带清掉、整屏塌成 0 高，见 `流程接口冻结.md` §7）。
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
@@ -735,11 +737,13 @@ function MiniMapThumb({ accent }: { accent: string }) {
   )
 }
 
-export function SituationScreen({ state, flow, onGo }: {
+export function SituationScreen({ state, flow, onGo, onNotice }: {
   state: FlowState
   flow: UseFlow
   /** 切到另一屏（只改本地屏路由；流程步号归宿主）—— 需求专篇 SH-03 → SH-04 */
   onGo?: (id: string) => void
+  /** 全局提示（App 那条提示条）：场景卡的后台加载结果走它 —— 本屏切走后已卸载，planMsg 用不了 */
+  onNotice?: (msg: string | null) => void
 }) {
   const snap = useVerbOnce(flow, 'situation.snapshot', {}, true)
   const compose = useVerbOnce(flow, 'view.compose', {}, true)
@@ -764,16 +768,19 @@ export function SituationScreen({ state, flow, onGo }: {
     : ''
   const activeScene = picked ?? (SCENES.find((s) => s.id === sceneKey)?.id ?? SCENES[0].id)
 
-  /**
+    /**
    * ★ 2026-10-03 需求方：「默认进入界面为空白界面，我手动点击功能按钮场景，点击场景1才加载场景1json数据」。
    *
-   * 加载动作挂在**这张卡**上（不是进屏自动读）：
-   *   · 卡上有 `planUrl` → fetch 那份计划 → `parsePlan` 校验 → `applyPlan`（先清掉非遥测图元再画）
-   *     → 跳「家视角」；**画成功了才切 SH-04**；
-   *   · 失败（含「有图元画不出来」）→ **先不切屏**，留在本屏写红字回执 —— 切走了这条红字就看不见了。
-   * 读取 / 校验 / 落图全部复用「计划 → 打开计划」那一套函数，不另写第二份实现。
+   * 加载动作挂在**这张卡**上（不是进屏自动读）；读取 / 校验 / 落图全部复用「计划 → 打开计划」那一套函数。
+   *
+   * ★ 2026-10-03 二次修订（需求方实测："点击场景1后，等待了3秒左右，才变成下一个界面"） 方案 B：**先切屏、后加载**：
+   *    点卡 → **立刻** `onGo('SH-04')`：切屏与宿主快慢解耦（原来 `onGo` 写在 `await fetch` 之后，
+   *     宿主只有 2 个工作线程、被 `view.compose`（约 790 ms）与字形分片占满时，那个 fetch 要排队，于是整屏卡住几秒）；
+   *    取计划 / 画图放在**后台 async** 里跑 —— 地图是所有屏**共用**的，SH-04 上照样看得到画出来的图元；
+   *    结果走 App 的**全局提示条**（`onNotice`）：本屏切走后已卸载，不能再写本屏的 `planMsg`；
+   *    代价（需求方已知并接受）：**失败时人已经在 SH-04 了**。
    */
-  const onPickScene = async (s: typeof SCENES[number]) => {
+  const onPickScene = (s: typeof SCENES[number]) => {
     if (!s.implemented) {
       // **不假装切过去**：本轮只实现场景一（个性化需求），场景二/三连屏都还没有
       setNotice(`「${s.no}：${s.name}」本轮未实现（个性化需求：流程先固定只实现场景一），界面未切换`)
@@ -781,29 +788,27 @@ export function SituationScreen({ state, flow, onGo }: {
     }
     setPicked(s.id)
     setNotice(null)
+    onGo?.('SH-04')          // ★ 方案 B：先切屏；下面才是后台加载
+    if (!s.planUrl) return
 
-    // 没带计划文件的卡：沿用老行为，直接进场景确认界面
-    if (!s.planUrl) { onGo?.('SH-04'); return }
-    try {
-      const r = await fetch(s.planUrl, { cache: 'no-cache' })
-      if (!r.ok) throw new Error(`HTTP ${r.status}`)
-      const { plan, error } = parsePlan(await r.text())
-      if (error || !plan) throw new Error(error ?? '解析失败')
-      const { drawn, failed } = applyPlan(plan, { applyFileView: false })
-      const home = homeView()
-      mapCommands.setView(home.lng, home.lat, home.zoom, 700)
-      if (failed.length) {
-        // 画不出来的条目如实报出，且先不切屏（切走了这条就看不见了）
-        setPlanMsg(`${s.no}计划有 ${failed.length} 条画不出来：${failed.join('；')}`)
-        return
+    const url = s.planUrl
+    void (async () => {
+      try {
+        const r = await fetch(url, { cache: 'no-cache' })
+        if (!r.ok) throw new Error(`HTTP ${r.status}`)
+        const { plan, error } = parsePlan(await r.text())
+        if (error || !plan) throw new Error(error ?? '解析失败')
+        const { drawn, failed } = applyPlan(plan, { applyFileView: false })
+        const home = homeView()
+        mapCommands.setView(home.lng, home.lat, home.zoom, 700)
+        onNotice?.(failed.length
+          ? `${s.no}计划有 ${failed.length} 条画不出来：${failed.join('；')}`
+          : `已选${s.no}：画了 ${drawn} 个图元`)
+      } catch (e) {
+        onNotice?.(`${s.no}计划打不开（${url}）：${String((e as Error)?.message ?? e)}`)
       }
-      setPlanMsg(`已选${s.no}：画了 ${drawn} 个图元`)
-      onGo?.('SH-04')
-    } catch (e) {
-      setPlanMsg(`${s.no}计划打不开（${s.planUrl}）：${String((e as Error)?.message ?? e)}`)
-    }
+    })()
   }
-
   // ---- AI任务分析：图上三行等级 + 态势简述 + 建议方向 --------------------
   // 三行的取值**只认快照里的 analysis 段**（键/名里出现威胁/防御/干扰才算）；
   // 宿主目前没有这一段 → 三行都显示"—"并写明缺在哪（**不拿目标威胁去凑区域威胁等级**，
@@ -1656,16 +1661,18 @@ export function SituationScreen({ state, flow, onGo }: {
 
       {/* ---------------- 「请选择任务场景」：**点了工具栏的【场景】才弹** ----------------
            用户 2026-09-18 第 3 条："选择场景功能，添加到上方工具栏中，点击后才显示"。
-           原来它常驻屏幕底部（一直占 152px 高）；现在收进工具条，弹在工具条正下方，
-           不点就不占地方 —— 地图也因此多出 152px 可视高度。 ---------------- */}
+           ★ 2026-10-03 需求方："点击场景按钮，弹出的三个场景，需要高度扩大，并且弹窗显示放在最下方，
+           不和功能按钮放在一起" → 面板从工具条正下方挪回**地图区最下方**（height 152 → 260，含标题栏）。
+           几何口径：bottom: 56 = 全局底部状态条（BOTTOM_H = 34）上方 56px，**不压那条常驻栏**；
+           左右仍是 left: 12 / right: 292（右栏宽 264 + 右边距 12，完全不碰）。
+           ★ 2026-10-03 实修：外层容器**必须带 `display: 'flex'`** —— 否则内层 `flex: 1` 失效，
+           内层高度只剩内容高（约 120px），`height: 260` 看着就像没生效（需求方实测："高度依旧没有变化"）。
+           底部两条按需提示（场景二/三提示 324、计划回执 366）已抬到面板顶边之上，避免叠压。 ---------------- */}
       {sceneOpen && (
-      <div style={{ position: 'absolute', left: 12, right: 292, top: 46, height: 152, zIndex: 22 }}>
+      <div style={{ position: 'absolute', left: 12, right: 292, bottom: 56, height: 260, zIndex: 22, display: 'flex' }}>
         <div style={{ ...panel, flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
           <div style={panelTitle}>
             请选择任务场景
-            <span style={{ float: 'right', fontSize: 11, color: C.textDim }}>
-              底图为二维瓦片（图上是三维地形）
-            </span>
           </div>
           <div style={{ display: 'flex', gap: 10, padding: 9, flex: 1, minHeight: 0 }}>
             {SCENES.map((s) => {
@@ -1695,13 +1702,10 @@ export function SituationScreen({ state, flow, onGo }: {
                     </span>
                     {!s.implemented && <span style={notImplChip}>未实现</span>}
                   </div>
-                  <div style={{ display: 'flex', gap: 6, flex: 1, minHeight: 0 }}>
+                  <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
+                    {/* ★ 2026-10-03 需求方："不需要右侧像播放按钮一样的按钮，去除这个播放按钮" ——
+                        参考图上三张卡右侧本来有圆形 ▶，这里**有意不画**（别再照着参考图补回来）。 */}
                     <MiniMapThumb accent={s.accent} />
-                    <span style={{
-                      alignSelf: 'center', flex: '0 0 auto', width: 30, height: 30, borderRadius: '50%',
-                      border: `1px solid ${s.accent}`, background: 'rgba(4,24,47,.8)', color: '#eaf4ff',
-                      display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12,
-                    }}>▶</span>
                   </div>
                 </button>
               )
@@ -1864,13 +1868,13 @@ const displayModeSelect: CSSProperties = {
   cursor: 'pointer', outline: 'none',
 }
 const noticeStyle: CSSProperties = {
-  position: 'absolute', left: 12, bottom: 216, zIndex: 24, maxWidth: 560,
+  position: 'absolute', left: 12, bottom: 324, zIndex: 24, maxWidth: 560,
   fontSize: 12, color: C.text, background: 'rgba(120,60,10,.94)',
   border: '1px solid rgba(245,158,11,.6)', borderRadius: 8, padding: '6px 10px', cursor: 'pointer',
 }
 /** ★「计划」结果回执（打开/保存后的一条短提示，点一下关掉） */
 const planMsgStyle: CSSProperties = {
-  position: 'absolute', left: 12, bottom: 258, zIndex: 25, maxWidth: 620,
+  position: 'absolute', left: 12, bottom: 366, zIndex: 25, maxWidth: 620,
   fontSize: 12, color: C.text, background: 'rgba(8,40,70,.96)',
   border: '1px solid rgba(95,176,255,.55)', borderRadius: 8, padding: '6px 10px', cursor: 'pointer',
 }

@@ -296,6 +296,7 @@ export function App() {
               setPlanId={setPlanId}
               strikePlanId={strikePlanId}
               setStrikePlanId={setStrikePlanId}
+        onNotice={setNotice}
             />
           </AppShell>
           <MicBall open={voiceOpen} onToggle={() => setVoiceOpen((v) => !v)} />
@@ -382,10 +383,12 @@ function ScreenBody(p: {
   setPlanId: (v: string | null) => void
   strikePlanId: string | null
   setStrikePlanId: (v: string | null) => void
+  /** 2026-10-03：全局提示条 setter；必须由 App() 显式传进来（直接写 setNotice 是跨组件作用域引用，运行时会 ReferenceError 白屏） */
+  onNotice: (msg: string | null) => void
 }) {
   const { id, state, flow, goto, go } = p
   switch (id) {
-    case 'SH-03': return <SituationScreen state={state} flow={flow} onGo={go} />
+    case 'SH-03': return <SituationScreen state={state} flow={flow} onGo={go} onNotice={p.onNotice} />
     case 'SH-04': return <SceneConfirmScreen state={state} flow={flow} onGo={go} goto={goto} />
     case 'SH-05': return <GroupingScreen state={state} flow={flow} onSelectPlan={p.setPlanId} onGo={go} />
     case 'SH-06': return <GroupConfirmScreen state={state} flow={flow} selectedPlanId={p.planId} onPickPlan={p.setPlanId} onGo={go} goto={goto} />

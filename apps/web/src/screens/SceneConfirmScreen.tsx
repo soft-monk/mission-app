@@ -27,6 +27,8 @@ import {
 } from '../flow/useSituation'
 import { useLabels, voiceLine } from '../shell/VoiceStrip'
 import { MapToolbar, ToolModeNote, toolsOf, useMapToolState } from '../shell/MapTools'
+// ★ 2026-10-03：退回场景选择时要把已加载的场景图元清掉（口径见下面那颗按钮的注释）
+import { clearAllPrimitives } from '../plan-file'
 
 type Labels = Record<string, string>
 
@@ -195,8 +197,13 @@ export function SceneConfirmScreen({ state, flow, onGo, goto }: {
           >
             进入任务执行 <span style={{ fontSize: 14, letterSpacing: -1 }}>»</span>
           </button>
-          {/* 图上按钮逐字：【返回场景选择】 */}
-          <button data-testid="sh04-back" style={ghostBtn} onClick={() => onGo?.('SH-03')}>
+          {/* 图上按钮逐字：【返回场景选择】。
+              ★ 2026-10-03 需求方："点击进入场景后，再次点击返回场景选择需要清除加载的场景文件"。
+              口径（方案 B，需求方选定）：退回场景选择 = 取消这次场景选择 → 先把非遥测图元**一刀清空**
+              （与「打开计划时先清空」同一套 clearAllPrimitives()），再切回 SH-03；
+              无人机 / 航迹 / 目标 / 链路等遥测类保留（它们由数据流每拍重灌，删了也会回来）。
+              代价（已知并接受）：用户后来手绘的图元也会一起被清掉。 */}
+          <button data-testid="sh04-back" style={ghostBtn} onClick={() => { clearAllPrimitives(); onGo?.('SH-03') }}>
             返回场景选择
           </button>
         </div>
