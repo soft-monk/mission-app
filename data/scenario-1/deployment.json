@@ -80,6 +80,7 @@
                          "altM":  300,
                          "speedMps":  25,
                          "battery":  100,
+                         "loop":  true,
                          "payload":  [
                                          "camera"
                                      ],
@@ -97,6 +98,7 @@
                          "altM":  300,
                          "speedMps":  25,
                          "battery":  100,
+                         "loop":  true,
                          "payload":  [
                                          "camera"
                                      ],
@@ -114,6 +116,7 @@
                          "altM":  320,
                          "speedMps":  24,
                          "battery":  100,
+                         "loop":  true,
                          "payload":  [
                                          "camera"
                                      ],
@@ -131,6 +134,7 @@
                          "altM":  320,
                          "speedMps":  24,
                          "battery":  100,
+                         "loop":  true,
                          "payload":  [
                                          "camera"
                                      ],
@@ -148,6 +152,7 @@
                          "altM":  400,
                          "speedMps":  22,
                          "battery":  100,
+                         "loop":  true,
                          "payload":  [
                                          "sar"
                                      ],
@@ -165,6 +170,7 @@
                          "altM":  400,
                          "speedMps":  22,
                          "battery":  100,
+                         "loop":  true,
                          "payload":  [
                                          "sar"
                                      ],
@@ -182,6 +188,7 @@
                          "altM":  500,
                          "speedMps":  20,
                          "battery":  100,
+                         "loop":  true,
                          "payload":  [
                                          "relay"
                                      ],
@@ -199,6 +206,7 @@
                          "altM":  350,
                          "speedMps":  23,
                          "battery":  100,
+                         "loop":  true,
                          "payload":  [
                                          "jammer"
                                      ],
@@ -216,6 +224,7 @@
                          "altM":  350,
                          "speedMps":  23,
                          "battery":  100,
+                         "loop":  true,
                          "payload":  [
                                          "jammer"
                                      ],
@@ -233,6 +242,7 @@
                          "altM":  300,
                          "speedMps":  26,
                          "battery":  100,
+                         "loop":  true,
                          "payload":  [
                                          "camera"
                                      ],

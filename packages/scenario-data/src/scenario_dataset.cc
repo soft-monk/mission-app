@@ -392,6 +392,7 @@ void readDeployment(const std::string& path, ScenarioData& out, std::vector<std:
                 }
             }
             if (rc.has("payload")) a.payload = rc.readStringArray(rc.at("payload"), p + ".payload");
+            a.loop = rc.optBool("loop", false);
             if (a.deviceId.empty()) continue;
             if (a.altM <= 0.0) rc.bad(p + ".altM", "必须 > 0（巡航高度）");
             if (a.speedMps < 0.0) rc.bad(p + ".speedMps", "必须 >= 0");
@@ -921,6 +922,7 @@ bool ScenarioData::toSimScenario(SimScenario& out, LoadReport& report) const {
         p.altM = a.altM;
         p.speedMps = a.speedMps;
         p.battery = a.battery;
+        p.loop = a.loop;          // ★ 2026-10-05：循环飞（引擎原来对平台写死 false）
         p.startOffset.rightM = a.offsetEastM;
         p.startOffset.fwdM = a.offsetNorthM;
         out.platforms.push_back(std::move(p));

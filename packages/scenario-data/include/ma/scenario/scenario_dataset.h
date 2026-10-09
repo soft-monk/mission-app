@@ -110,6 +110,9 @@ struct AircraftSpec {
     double speedMps = 0.0;
     double battery = 100.0;
     std::vector<std::string> payload;
+    /// 是否循环飞（deployment.json · aircraft[].loop；缺省 false = 飞到任务区就停）。
+    /// ★ 2026-10-05 需求方："无人机按固定路径循环飞 + 画尾迹" —— 这条一路带到 sim_source::Platform.loop。
+    bool loop = false;
     /// 站位相对部署区质心的偏移（米，东 / 北）—— 上路前由 toSimScenario 填。
     double offsetEastM = 0.0;
     double offsetNorthM = 0.0;
